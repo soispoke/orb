@@ -28,6 +28,7 @@ import {createPlanProgress, type PlanProgressData} from "./PlanProgress";
 import { nativeComposerDrop } from "./composerDrop";
 import { SideQuestions, type SideQuestionsHandle } from "./SideQuestionPanel";
 import {Subagents} from "./Subagents";
+import {BackgroundPanel} from "./BackgroundPanel";
 import { AgentActivity, activityShouldCollapse } from "./AgentActivity";
 import { startLocalOrigin, localRunKnown, localAgentForLaunch } from "./localAgents";
 import { ChangeMachine, preloadMachineDestinations } from "./ChangeMachine";
@@ -3386,7 +3387,12 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   };
 
   return (
-    <>
+    <BackgroundPanel tasks={<>
+            <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
+              <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
+            </Show>
+            <Subagents missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
+    </>}>
       <div
         class="scroll"
         ref={scroller}
@@ -3426,10 +3432,6 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
                 <Show when={row().state==='error'}><button onClick={()=>void deliverResend()}>Retry</button></Show>
               </div>
             </div>}</Show>
-            <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
-              <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
-            </Show>
-            <Subagents missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} onSend={text => sendMsg(text, [], [])} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={busy() || localQueueActive() || (!clientPlaced() && (remoteQueuedIds().length > 0 || items().some(i => i.kind === "user" && i.queued)))} error={clientPlaced() ? localFailure(p.id) : undefined} onResume={resume} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
@@ -3513,6 +3515,6 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
           <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} onFork={p.onFork} />
         </div>
       </div>
-    </>
+    </BackgroundPanel>
   );
 }

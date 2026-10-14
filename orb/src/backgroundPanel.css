@@ -1,0 +1,22 @@
+.background-layout { display:flex; flex:1; min-height:0; min-width:0; overflow:hidden; container-type:inline-size; }
+.background-conversation { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; }
+.background-toolbar { display:flex; justify-content:flex-end; padding:4px 24px; flex:none; }
+.background-toolbar button, .background-panel header button { border:0; background:transparent; color:var(--fg-2); cursor:pointer; font:inherit; border-radius:6px; padding:6px 8px; }
+.background-toolbar button { font-size:12px; }
+.background-toolbar button:hover, .background-panel header button:hover { background:var(--hover); }
+.background-toolbar button:focus-visible, .background-panel header button:focus-visible { outline:2px solid var(--blue); }
+.background-panel { display:flex; flex-direction:column; width:clamp(300px,32%,460px); flex:none; min-height:0; border-left:1px solid var(--stroke); background:var(--bg); color:var(--fg-2); }
+.background-panel[hidden] { display:none; }
+.background-panel header { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--stroke); font-size:13px; }
+.background-panel header button { font-size:20px; line-height:1; }
+.background-panel-body { flex:1; min-height:0; overflow-y:auto; overflow-anchor:none; padding:0 12px 16px; }
+.background-panel-empty { font-size:12px; line-height:1.6; color:var(--fg-3); padding:16px 4px; }
+.background-panel-body:has(.subagents, .agent-activity) .background-panel-empty { display:none; }
+.background-panel .subagent-description { white-space:normal; }
+@container (max-width:760px) {
+ .background-panel { width:280px; }
+}
+@media (max-width:700px) {
+ .background-layout { flex-direction:column; }
+ .background-panel { width:auto; max-height:40%; border-left:0; border-top:1px solid var(--stroke); }
+}

@@ -19,3 +19,22 @@ test('subagents stay stable, readable, and keyboard accessible as they finish',a
  expect(await dot.evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
  await page.screenshot({path:testInfo.outputPath('subagents-mobile.png')});
 });
+
+test('side panel preserves disclosures and leaves conversation scroll alone',async({page},testInfo)=>{
+ await page.goto('/tests/subagents.html?panel');
+ const scroll=page.locator('.background-conversation .scroll');
+ await scroll.evaluate(el=>el.scrollTop=400);
+ const row=page.getByRole('button',{name:/Inspect the parser/});
+ await row.click();
+ expect(await scroll.evaluate(el=>el.scrollTop)).toBe(400);
+ await page.getByRole('button',{name:'Close background tasks'}).click();
+ await expect(page.getByRole('complementary',{name:'Background tasks'})).toBeHidden();
+ await page.getByRole('button',{name:/Background tasks/}).click();
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(page.getByText('Reading token boundaries in parser.ts')).toBeVisible();
+ await page.screenshot({path:testInfo.outputPath('side-panel.png')});
+ await page.setViewportSize({width:390,height:844});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ await expect(row).toBeVisible();
+ await page.screenshot({path:testInfo.outputPath('side-panel-mobile.png')});
+});

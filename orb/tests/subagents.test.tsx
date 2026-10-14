@@ -114,8 +114,26 @@ it('does not restart Workflow polling when mission metadata refreshes with the s
   render(()=><Subagents items={[receipt]} missionId={mission().id} workspaceId={mission().workspace_id}/>);
   const row=await screen.findByRole('button',{name:/Metadata stable/});
   fireEvent.click(row);
+  expect(fetcher).toHaveBeenCalledTimes(2); // journal + the expanded child transcript
   setMission({id:'m',workspace_id:'w',status:'idle'});
   expect(screen.getByRole('button',{name:/Metadata stable/})).toBe(row);
   expect(row.getAttribute('aria-expanded')).toBe('true');
-  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(fetcher).toHaveBeenCalledTimes(2);
+});
+
+it('loads child activity only when expanded and keeps lifecycle status from the journal', async () => {
+ const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/.claude/subagents/workflows/live\nRun ID: live'};
+ const fetcher=vi.fn(async(url:string)=>new Response(url.includes('journal.jsonl')
+   ? JSON.stringify({type:'started',agentId:'agent1',label:'Live child'})
+   : JSON.stringify({type:'assistant',timestamp:'2026-10-14T17:00:00Z',message:{model:'test-model',content:[{type:'tool_use',name:'Bash',input:{description:'Checking proof results'}}]}})));
+ vi.stubGlobal('fetch',fetcher);
+ const view=render(()=><Subagents items={[receipt]} missionId="m" workspaceId="w"/>);
+ const row=await screen.findByRole('button',{name:/Live child/});
+ expect(fetcher).toHaveBeenCalledTimes(1);
+ fireEvent.click(row);
+ expect(await screen.findByText('Bash: Checking proof results')).toBeTruthy();
+ expect(screen.getByText(/Last recorded activity:/)).toBeTruthy();
+ expect(row.textContent).toContain('Working');
+ expect(fetcher.mock.calls[1][0]).toContain('agent-agent1.jsonl');
+ view.unmount();
 });
