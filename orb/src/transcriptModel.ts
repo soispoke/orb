@@ -85,6 +85,17 @@ export class TranscriptReducer {
     }
     this.bubbles.clear();
   }
+  private beginUserTurn() {
+    // Delivery can happen while the harness is still processing the previous
+    // response. Only a producer completion settles its text and tools. Keep
+    // live bubble identities so a cumulative snapshot cannot repeat that reply
+    // below the follow-up, or mark a still-running command as finished.
+    for (const [bubble, index] of this.bubbles) {
+      const item = this.items[index];
+      if (item?.kind !== "text" || !item.live) this.bubbles.delete(bubble);
+    }
+    this.lastFinal = undefined;
+  }
   apply(ev: StreamEvent) {
     this.identity=ev.eventId??(ev.storedId!==undefined?`stored:${ev.storedId}`:ev.sequence!==undefined?`seq:${ev.sequence}`:undefined);this.nextForEvent=0;
     // The persisted text snapshot keeps its row/event ID as its sequence advances.
@@ -118,7 +129,7 @@ export class TranscriptReducer {
           if (previous.receipt && d.receipt !== true) this.put(index, { ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, receipt: false });
           return;
         }
-        this.close(); this.lastFinal = undefined;
+        this.beginUserTurn();
         // A queued row may precede text that arrived while it was waiting.
         // Delivery places it after that response without changing its identity.
         this.items.splice(index, 1);
@@ -129,7 +140,7 @@ export class TranscriptReducer {
         this.items.push({ ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, queued: false, receipt: d.receipt === true });
         return;
       }
-      if (!queued) { this.close(); this.lastFinal = undefined; }
+      if (!queued) { this.beginUserTurn(); }
       if (messageId) this.users.set(messageId, this.items.length);
       this.items.push({ kind: "user", key: messageId ? `user:${messageId}` : this.key("user"), text: str(d.content), messageId, source, queued, attached: d.attached === true, receipt: d.receipt === true });
       return;

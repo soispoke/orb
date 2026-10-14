@@ -11,7 +11,7 @@ describe("message identity and queue lifecycle",()=>{
     expect(items.filter(i=>i.kind==="text")).toMatchObject([{text:"Still working",live:true}]);
   });
   it("a delivered event replaces the queued row after its preceding response",()=>{
-    let items=buildTranscript([message("a",true),delta("Response before delivery"),message("b",true)]);
+    let items=buildTranscript([message("a",true),delta("Response before delivery"),message("b",true),{type:"assistant_message",data:{id:"finished",content:"Response before delivery"}}]);
     items=applyStreamEvent(items,message("a",false));
     expect(items.filter(i=>i.kind!=="user"||!i.queued).map(i=>i.kind)).toEqual(["text","user"]);
     expect(items.filter(i=>i.kind==="user")).toHaveLength(2);
