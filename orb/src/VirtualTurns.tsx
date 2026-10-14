@@ -1,3 +1,4 @@
+import {frameResizeObserver} from "./frameResizeObserver";
 import {For,createEffect,createMemo,createSignal,onCleanup,onMount,type JSX} from 'solid-js';
 import {matchOffsets} from './searchIndex';
 import { timed } from "./diagnostics";
@@ -60,7 +61,7 @@ export function VirtualTurns<T extends {key:string}>(p:{items:T[];text:(item:T)=
   onMount(()=>{
    if(!props.segment.item)return;
    const key=props.segment.key;nodes.set(key,element);
-   const observer=new ResizeObserver(()=>timed("turn resized",()=>{
+   const observer=frameResizeObserver(()=>timed("turn resized",()=>{
     const rect=element.getBoundingClientRect(),height=rect.height;if(height<=0||sizes.get(key)===height)return;
     // Unmeasured rows were laid out at the 300px estimate; correct from that too,
     // or older turns paged in above the viewport push the reader's place down.

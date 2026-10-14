@@ -1,3 +1,4 @@
+import {frameResizeObserver} from "./frameResizeObserver";
 import {CodexSpeedPicker, missionSpeed, requireSpeedSupport} from './CodexSpeedPicker';
 import type {CodexServiceTier} from './api';
 import { Picker } from "./Picker";
@@ -677,7 +678,7 @@ export function Composer(p: {
   };
   onMount(() => {
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(([entry]) => { if (!multiline()) compactWidth = entry.contentRect.width; });
+    const observer = frameResizeObserver(([entry]) => { if (!multiline()) compactWidth = entry.contentRect.width; });
     observer.observe(ta);
     onCleanup(() => observer.disconnect());
   });
@@ -1229,7 +1230,7 @@ export function floatingDock(el: HTMLDivElement) {
       "--composer-bottom-space", `${bounds.bottom - composer.getBoundingClientRect().bottom}px`,
     );
   };
-  const observer = new ResizeObserver(update);
+  const observer = frameResizeObserver(update);
   queueMicrotask(() => { parent = el.parentElement; update(); observer.observe(el); });
   onCleanup(() => { observer.disconnect(); parent?.style.removeProperty("--dock-height"); el.closest<HTMLElement>(".app")?.style.removeProperty("--composer-bottom-space"); });
 }
@@ -2832,6 +2833,9 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
+  // Layout scroll events must not release the initial tail pin before paint.
+  let openingAtLatest = true;
+  const beginManualScroll = () => { openingAtLatest = false; };
   createEffect(()=>{if(p.id)cacheRemember(`m:${p.id}`);});
 
   const scrollIfPinned = () => {
@@ -2840,9 +2844,11 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   // Resize notifications run after streaming Markdown has changed layout.
   onMount(() => {
     if (!scroller) return;
-    const older=()=>{if(scroller!.scrollTop<800&&peekReadyTranscript(p.id)?.hasOlder)void loadOlder().catch(e=>setError(String(e)));};
+    const older=()=>{if(!openingAtLatest&&scroller!.scrollTop<800&&peekReadyTranscript(p.id)?.hasOlder)void loadOlder().catch(e=>setError(String(e)));};
     scroller.addEventListener('scroll',older,{passive:true});onCleanup(()=>scroller?.removeEventListener('scroll',older));
-    const observer = new ResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
+    const initialFrame = requestAnimationFrame(scrollIfPinned);
+    onCleanup(() => cancelAnimationFrame(initialFrame));
+    const observer = frameResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
     const content = scroller.querySelector(".col");
     if (content) observer.observe(content);
     onCleanup(() => observer.disconnect());
@@ -3396,8 +3402,12 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
       <div
         class="scroll"
         ref={scroller}
+        onWheel={beginManualScroll}
+        onTouchMove={beginManualScroll}
+        onPointerDown={beginManualScroll}
+        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) beginManualScroll(); }}
         onScroll={() => {
-          if(scroller?.dataset.panelResizing)return;
+          if(openingAtLatest || scroller?.dataset.panelResizing)return;
           nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
         }}
       >

@@ -221,3 +221,17 @@ it('never leaks an in-flight Send now retry to another mission when the selected
 
 
 
+
+it('opens at the latest message despite initial layout scroll events, then respects manual scrolling', async () => {
+ const {fireEvent}=await import('@solidjs/testing-library');
+ vi.stubGlobal('fetch',vi.fn(async()=>Response.json([])));
+ const view=render(()=><NativeMissionView id="" launch={{messageKey:'scroll:open',prompt:'Latest message',nodeId:'core',destination:'Core'}}/>);
+ const scroller=view.container.querySelector('.scroll') as HTMLElement;
+ Object.defineProperties(scroller,{scrollHeight:{configurable:true,value:4000},clientHeight:{configurable:true,value:600}});
+ fireEvent.scroll(scroller);
+ await waitFor(()=>expect(scroller.scrollTo).toHaveBeenCalledWith({top:4000}));
+ vi.mocked(scroller.scrollTo).mockClear();
+ fireEvent.wheel(scroller,{deltaY:-200});fireEvent.scroll(scroller);
+ await new Promise(resolve=>setTimeout(resolve,40));
+ expect(scroller.scrollTo).not.toHaveBeenCalled();
+});
