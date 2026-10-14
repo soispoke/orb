@@ -188,3 +188,25 @@ test("OpenCode / Cursor-styled tool components, diff badges, collapsible & dismi
   await page.locator(".tasks-dismiss").click();
   await expect(page.locator(".mission-tasks")).toHaveCount(0);
 });
+
+test('a delivered follow-up does not repeat the streaming reply or close a running tool',async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>(window as any).transcriptHarness.reset([
+  {type:'text_delta',data:{content:'I will update the runner.'}},
+  {type:'tool_call',data:{tool_call_id:'runner',name:'Bash',args:{command:'check-runner'}}},
+ ]));
+ await page.locator('.st-work-head').click();
+ await page.locator('.st-tool-head').click();
+ await page.evaluate(()=>{
+  const harness=(window as any).transcriptHarness;
+  const followup={type:'user_message',data:{id:'followup',content:'Explain simply'}};
+  harness.apply(followup);harness.apply(followup);
+  harness.apply({type:'text_delta',data:{content:'I will update the runner.'}});
+ });
+ await expect(page.locator('.st-text')).toHaveCount(1);
+ await expect(page.locator('.user')).toHaveCount(1);
+ await expect(page.locator('.st-tool-detail')).toBeVisible();
+ await page.evaluate(()=>(window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'runner',result:'RUNNER_OK'}}));
+ await expect(page.locator('.st-tool-detail')).toContainText('RUNNER_OK');
+});

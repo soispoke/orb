@@ -156,8 +156,12 @@ const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "A
 export type HarnessPick = { backend: string; model: string; effort?: string; service_tier?: CodexServiceTier };
 const PICK_KEY = "orb.harnessPick";
 // Personal defaults for this desktop installation; explicit model picks still work.
-const preferredModel = (backend: string, fallback: string): string =>
-  ({ codex: "gpt-6-astra", claudecode: "claude-opus-5-5" } as Record<string, string>)[backend] ?? fallback;
+const preferredModel = (backend: string, fallback: string, available?: readonly {value: string}[]): string => {
+  const preferred = ({ codex: "gpt-6-astra", claudecode: "claude-opus-5-5" } as Record<string, string>)[backend];
+  // A default must be launchable on this destination. Explicit saved choices
+  // remain unchanged and are validated separately before launch.
+  return preferred && (!available || available.some(model => model.value === preferred)) ? preferred : fallback;
+};
 const DEFAULTS_REVISION_KEY = "orb.personalDefaults.astra-opus55-auto.v1";
 const loadPick = (): HarnessPick | null => {
   try {
@@ -214,7 +218,7 @@ const effectivePick = (machine = "core"): HarnessPick | null => {
     return { ...stored, effort: effort ?? undefined };
   }
   const first = choices.find((c) => c.backend.id === "claudecode") ?? choices[0];
-  return { backend: first.backend.id, model: preferredModel(first.backend.id, first.models[0].value) };
+  return { backend: first.backend.id, model: preferredModel(first.backend.id, first.models[0].value, first.models) };
 };
 const pickLabel = (pick: HarnessPick | null): string => {
   if (!pick) return "Choose model";
@@ -979,7 +983,7 @@ export function Composer(p: {
                 onClose={() => setWhich(null)} onSelect={id => {
                   const c = harnessChoices(p.uploadTarget).find(c => c.backend.id === id);
                   if (c && id !== pick()?.backend) {
-                    const model = preferredModel(id,c.models[0].value);
+                    const model = preferredModel(id,c.models[0].value,c.models);
                     const effort = normalizeEffort(pick()?.effort, id, c.models.find(m => m.value === model)?.efforts);
                     setHarnessPick({backend:id,model,...(effort ? {effort} : {})});
                   }
