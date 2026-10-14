@@ -1,9 +1,11 @@
-import {For, Show, createMemo, createSignal} from 'solid-js';
+import {For, Show, createMemo, createSignal, createEffect, onCleanup} from 'solid-js';
 import {anchoredDisclosure} from './anchoredDisclosure';
 import type {StreamItem} from './transcriptModel';
 import type {LocalActivity} from './localAgents';
 import './subagents.css';
 import {ElapsedTime} from './ElapsedTime';
+import {workflowJournals, parseWorkflowJournal} from './workflowAgents';
+import {connectionVersion, getApiUrl, getJwt} from './api';
 
 export interface Subagent {
   id: string;
@@ -61,8 +63,56 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
 }
 const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', unknown:'Status unavailable'};
 
-export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean}) {
-  const agents = createMemo(() => collectSubagents(p.items, p.local));
+export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean; missionId?: string; workspaceId?: string}) {
+  const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([]);
+  const [workflowError, setWorkflowError] = createSignal(false);
+  const journals = createMemo(() => workflowJournals(p.items), [], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
+  createEffect(() => {
+    const paths = journals(), mission = p.missionId, workspace = p.workspaceId;
+    connectionVersion();
+    setWorkflowRows([]); setWorkflowError(false);
+    if (!paths.length || !mission || !workspace) return;
+    const controller = new AbortController();
+    const cache = new Map<string, Subagent[]>();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      let failed = false;
+      for (const path of paths) {
+        if (controller.signal.aborted) break;
+        const request = new AbortController();
+        const abort = () => request.abort();
+        controller.signal.addEventListener('abort', abort, {once:true});
+        const timeout = setTimeout(abort, 10000);
+        try {
+          const query = new URLSearchParams({path, mission_id: mission, workspace_id: workspace});
+          const response = await fetch(`${getApiUrl()}/api/fs/download?${query}`, {headers: {Authorization: `Bearer ${getJwt()}`}, signal: request.signal});
+          if (!response.ok) throw new Error('Journal unavailable');
+          // Bound journal downloads even when the server omits Content-Length.
+          const reader = response.body?.getReader();
+          if (!reader) throw new Error('Missing journal body');
+          const decoder = new TextDecoder(); let content = '', size = 0;
+          try {
+            while (true) {
+              const chunk = await reader.read(); if (chunk.done) break;
+              size += chunk.value.byteLength;
+              if (size > 2 * 1024 * 1024) throw new Error('Journal too large');
+              content += decoder.decode(chunk.value, {stream: true});
+            }
+            content += decoder.decode();
+          } finally { await reader.cancel().catch(() => {}); }
+          cache.set(path, parseWorkflowJournal(content, path));
+        } catch { failed = true; }
+        finally { clearTimeout(timeout); controller.signal.removeEventListener('abort', abort); }
+      }
+      if (controller.signal.aborted) return;
+      setWorkflowRows([...cache.values()].flat().map(agent => failed && agent.status === 'running' ? {...agent, status: 'unknown'} : agent));
+      setWorkflowError(failed);
+      timer = setTimeout(poll, failed ? 10000 : 3000);
+    };
+    void poll();
+    onCleanup(() => {controller.abort(); clearTimeout(timer);});
+  });
+  const agents = createMemo(() => [...collectSubagents(p.items, p.local), ...workflowRows()]);
   const [expanded, setExpanded] = createSignal(true);
   const [showAll, setShowAll] = createSignal(false);
   const anchored = anchoredDisclosure();
@@ -78,13 +128,14 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
     return ids;
   }, new Set());
   const visible = () => agents().filter((agent, index) => showAll() || index < 6 || revealed().has(agent.id)).map(a => a.id);
-  return <Show when={agents().length}><section class="subagents" aria-label="Subagents">
+  return <Show when={agents().length || journals().length}><section class="subagents" aria-label="Subagents">
     <button class="subagents-heading" ref={toggle} aria-expanded={expanded()} onClick={() => anchored(toggle, () => setExpanded(v => !v))}>
       <span class="subagents-chevron" data-open={expanded()} aria-hidden="true">›</span>
       <span>Subagents</span><span class="subagents-count">{agents().length}</span>
       <span class="subagents-summary">{working() ? `${working()} working` : 'Activity'}{failed() ? ` · ${failed()} failed` : ''}</span>
     </button>
     <div hidden={!expanded()} class="subagents-list">
+      <Show when={workflowError()}><div role="status">Workflow updates unavailable. Retrying…</div></Show>
       <div class="subagents-overview"><span>{agents().length} agents</span><span>{working()} working</span><span>{completed()} finished</span></div>
       <For each={visible()}>{id => {
         const agent = () => agents().find(a => a.id === id)!;
