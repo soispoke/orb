@@ -1,0 +1,16 @@
+# Personal Core build; reuse the installed runtime and keep its CLI versions.
+FROM rust:1.91-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src/ src/
+COPY shared/ shared/
+COPY catalog/ catalog/
+COPY scripts/ scripts/
+ENV CARGO_PROFILE_DEV_DEBUG=0
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --locked -j 1 --bin sandboxed-sh \
+    && cp target/debug/sandboxed-sh /sandboxed-sh
+FROM orb-base:75993d90
+RUN npm install -g @openai/codex@0.162.1 && codex --version
+COPY --from=builder /sandboxed-sh /usr/local/bin/sandboxed-sh

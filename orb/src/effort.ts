@@ -1,11 +1,11 @@
 /** Reasoning effort accepted by Core and each native harness. */
 export const EFFORT_LADDER = ["low", "medium", "high", "xhigh", "max"] as const;
-export type Effort = (typeof EFFORT_LADDER)[number];
+export type Effort = (typeof EFFORT_LADDER)[number] | "ultracode";
 
 export const EFFORT_BY_HARNESS: Readonly<Record<string, readonly Effort[]>> = {
   antigravity: ["low", "medium", "high"],
   codex: EFFORT_LADDER,
-  claudecode: EFFORT_LADDER,
+  claudecode: [...EFFORT_LADDER, "ultracode"],
 };
 
 /** The efforts this harness accepts. Empty when it ignores effort entirely. */
@@ -37,6 +37,7 @@ const LABELS: Record<Effort, string> = {
   high: "High",
   xhigh: "XHigh",
   max: "Max",
+  ultracode: "Ultracode",
 };
 
 /** Menu/chip text. Unset means the backend's own default, never a guessed level. */

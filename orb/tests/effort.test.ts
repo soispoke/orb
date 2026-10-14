@@ -85,3 +85,10 @@ it("Antigravity offers only native efforts and makes the required default explic
  expect(effortLabel(null,"antigravity","agy-demo")).toBe("Default (High)");
  expect(effortLabel("low","antigravity","agy-demo")).toBe("Low");
 });
+
+ it("offers Ultracode only for Claude and preserves saved selections", () => {
+   expect(normalizeEffort(" Ultracode ", "claudecode")).toBe("ultracode");
+   expect(effortLabel("ultracode", "claudecode")).toBe("Ultracode");
+   expect(normalizeEffort("ultracode", "codex")).toBeNull();
+   expect(normalizeEffort("ultracode", "antigravity")).toBeNull();
+ });

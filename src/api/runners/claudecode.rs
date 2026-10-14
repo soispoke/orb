@@ -1140,6 +1140,13 @@ pub fn run_claudecode_turn<'a>(
             args.push("--dangerously-skip-permissions".to_string());
         }
 
+        // Ultracode is a workflow mode, not a valid effort environment value.
+        // Pass the native CLI flag; stream sessions also receive its explicit
+        // on/off state through apply_flag_settings on launch and live changes.
+        if model_effort == Some("ultracode") {
+            args.extend(["--effort".to_string(), "ultracode".to_string()]);
+        }
+
         // Claude Code settings and MCP config are loaded via CLAUDE_CONFIG_DIR
         // which points to the per-mission .claude directory. Claude Code auto-discovers
         // settings.local.json and mcp.json from that directory.
@@ -1151,8 +1158,16 @@ pub fn run_claudecode_turn<'a>(
         if settings_path.exists() {
             match std::fs::read_to_string(&settings_path) {
                 Ok(json_content) => {
+                    let mut settings: serde_json::Value = match serde_json::from_str(&json_content)
+                    {
+                        Ok(serde_json::Value::Object(settings)) => {
+                            serde_json::Value::Object(settings)
+                        }
+                        _ => return AgentResult::failure("Invalid Claude settings object", 0),
+                    };
+                    settings["ultracode"] = serde_json::json!(model_effort == Some("ultracode"));
                     args.push("--settings".to_string());
-                    args.push(json_content);
+                    args.push(settings.to_string());
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1163,6 +1178,12 @@ pub fn run_claudecode_turn<'a>(
                     );
                 }
             }
+        }
+        if !settings_path.exists() {
+            args.push("--settings".to_string());
+            args.push(
+                serde_json::json!({"ultracode": model_effort == Some("ultracode")}).to_string(),
+            );
         }
         let mcp_config_path = work_dir.join(".claude").join("mcp.json");
         if mcp_config_path.exists() {
@@ -1190,8 +1211,8 @@ pub fn run_claudecode_turn<'a>(
             args.push(bare.to_string());
         }
 
-        // Note: model_effort is set via CLAUDE_CODE_EFFORT_LEVEL env var below,
-        // not as a CLI flag (Claude Code CLI does not have an --effort flag).
+        // Ordinary effort uses the environment or live control channel below;
+        // Ultracode additionally uses its native workflow flag above.
 
         // For continuation turns, use --resume to resume existing session.
         // For first turn, use --session-id to create new session with that ID.
@@ -1385,7 +1406,15 @@ pub fn run_claudecode_turn<'a>(
             // The variable outranks a later change of effort, so a session
             // that takes input receives its effort over stdin instead.
             if !stream_input || native_plan {
-                env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
+                env.insert(
+                    "CLAUDE_CODE_EFFORT_LEVEL".to_string(),
+                    if effort == "ultracode" {
+                        "xhigh"
+                    } else {
+                        effort
+                    }
+                    .to_string(),
+                );
             }
 
             // CLAUDE_CODE_EFFORT_LEVEL only nudges adaptive reasoning, which

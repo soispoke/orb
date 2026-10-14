@@ -489,7 +489,7 @@ export function startLocalQueueWorker(){
       if(!stored||stored.state!=='dispatching'||!valid()||stopping.has(runKey))return;
       // Read effort at dispatch, not enqueue: changes made while a turn is
       // running apply to its next follow-up, including a cleared override.
-      const effort = row.request.harness === 'antigravity'
+      const effort = ['antigravity', 'claudecode'].includes(row.request.harness)
        ? normalizeEffort(mission.model_effort, row.request.harness) ?? undefined
        : row.request.effort;
       return {pending:startLocal({...row.request,effort,service_tier:row.request.harness==='codex' ? mission.service_tier ?? (mission.fast_mode ? 'fast' : 'standard') : undefined,prompt:row.autoResumed?resumedPrompt(row.request.prompt,row.cut):row.request.prompt,sessionId:localBinding(row.mission)?.sessionId})};

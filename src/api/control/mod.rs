@@ -8978,6 +8978,7 @@ fn normalize_model_effort(raw: &str) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
+        "ultracode" => Some("ultracode".to_string()),
         // Codex-only (gpt-6-astra, gpt-5.6-sol/terra): maximum reasoning with
         // automatic task delegation.
         "ultra" => Some("ultra".to_string()),
@@ -8989,7 +8990,9 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
     let normalized = normalize_model_effort(raw)?;
     match (backend, normalized.as_str()) {
         (Some("antigravity"), "low" | "medium" | "high") => Some(normalized),
-        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
+        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max" | "ultracode") => {
+            Some(normalized)
+        }
         // Codex app-server accepts the GPT reasoning-effort values and passes
         // them through as `reasoningEffort`.
         (Some("codex"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
@@ -9000,7 +9003,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("antigravity") => "low, medium, high",
-        Some("claudecode") => "low, medium, high, xhigh, max",
+        Some("claudecode") => "low, medium, high, xhigh, max, ultracode",
         Some("codex") => "low, medium, high, xhigh, max, ultra",
         _ => "none",
     }
@@ -38748,6 +38751,22 @@ And the report:
         assert_eq!(
             normalize_model_effort_for_backend(Some("claudecode"), "max"),
             Some("max".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ultracode_is_claude_only() {
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("claudecode"), " Ultracode "),
+            Some("ultracode".to_string())
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "ultracode"),
+            None
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("antigravity"), "ultracode"),
+            None
         );
     }
 

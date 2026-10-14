@@ -1439,6 +1439,12 @@ fn spawn_claude(
             "--verbose",
             "--include-partial-messages",
         ]);
+    if let Some(effort) = request.effort.as_deref().filter(|e| !e.is_empty()) {
+        cmd.arg("--effort").arg(effort);
+    }
+    // Explicitly clear workflows when moving back to a normal effort level.
+    cmd.arg("--settings")
+        .arg(json!({"ultracode": request.effort.as_deref() == Some("ultracode")}).to_string());
     if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
         let bare = model.strip_prefix("anthropic/").unwrap_or(model);
         cmd.arg("--model").arg(bare);

@@ -150,10 +150,22 @@ const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "A
  * harness does not accept that level (see `effort.ts`). */
 export type HarnessPick = { backend: string; model: string; effort?: string; service_tier?: CodexServiceTier };
 const PICK_KEY = "orb.harnessPick";
+// Personal defaults for this desktop installation; explicit model picks still work.
+const preferredModel = (backend: string, fallback: string): string =>
+  ({ codex: "gpt-6-astra", claudecode: "claude-opus-5-5" } as Record<string, string>)[backend] ?? fallback;
+const DEFAULTS_REVISION_KEY = "orb.personalDefaults.astra-opus55-auto.v1";
 const loadPick = (): HarnessPick | null => {
   try {
     const raw = localStorage.getItem(PICK_KEY);
-    return raw ? (JSON.parse(raw) as HarnessPick) : null;
+    const pick = raw ? (JSON.parse(raw) as HarnessPick) : null;
+    if (!localStorage.getItem(DEFAULTS_REVISION_KEY)) {
+      const initial = pick ?? { backend: "claudecode", model: "claude-opus-5-5" };
+      const updated = { ...initial, model: preferredModel(initial.backend, initial.model) };
+      localStorage.setItem(PICK_KEY, JSON.stringify(updated));
+      localStorage.setItem(DEFAULTS_REVISION_KEY, "1");
+      return updated;
+    }
+    return pick;
   } catch {
     return null;
   }
@@ -197,7 +209,7 @@ const effectivePick = (machine = "core"): HarnessPick | null => {
     return { ...stored, effort: effort ?? undefined };
   }
   const first = choices.find((c) => c.backend.id === "claudecode") ?? choices[0];
-  return { backend: first.backend.id, model: first.models[0].value };
+  return { backend: first.backend.id, model: preferredModel(first.backend.id, first.models[0].value) };
 };
 const pickLabel = (pick: HarnessPick | null): string => {
   if (!pick) return "Choose model";
@@ -963,7 +975,7 @@ export function Composer(p: {
                   const c = harnessChoices(p.uploadTarget).find(c => c.backend.id === id);
                   if (c && id !== pick()?.backend) {
                     const effort = normalizeEffort(pick()?.effort, id);
-                    setHarnessPick({backend:id,model:c.models[0].value,...(effort ? {effort} : {})});
+                    setHarnessPick({backend:id,model:preferredModel(id,c.models[0].value),...(effort ? {effort} : {})});
                   }
                   setWhich(null);
                 }}/>
@@ -1762,9 +1774,9 @@ export default function App() {
     const body = { title, prompt: imagePrompt(typed, imagePaths, images), project: projectSlug, tags: folderTags(projectSlug), backend: pick.backend, model_override: pick.model, placement: "client" as const, working_directory: root, ...(effort ? { model_effort: effort } : {}) };
     const signature = JSON.stringify({...body, cyber_access:selectedCyber});
     if (launchAttempt?.signature !== signature) launchAttempt = { signature, key: crypto.randomUUID() };
-    const m=await startLocalOrigin({harness:pick.backend,bin:row.path,cwd:root,prompt:sent,model:pick.model,effort:pick.backend === "antigravity" ? effort ?? undefined : undefined,cyber_access:pick.backend === "codex" ? selectedCyber : undefined,service_tier:pick.backend === "codex" ? pick.service_tier??"standard" : undefined,imagePaths}, {key:launchAttempt.key,title,project:projectSlug,prompt:body.prompt,tags:body.tags});
+    const m=await startLocalOrigin({harness:pick.backend,bin:row.path,cwd:root,prompt:sent,model:pick.model,effort:["antigravity", "claudecode"].includes(pick.backend) ? effort ?? undefined : undefined,cyber_access:pick.backend === "codex" ? selectedCyber : undefined,service_tier:pick.backend === "codex" ? pick.service_tier??"standard" : undefined,imagePaths}, {key:launchAttempt.key,title,project:projectSlug,prompt:body.prompt,tags:body.tags});
     launchAttempt = undefined;
-    setDraftCyber("standard");
+    setDraftCyber("automatic");
     setAttachChips([]);
     rememberLaunch(m.id, {messageKey:launchPreview()?.messageKey,prompt:imagePrompt(typed,imagePaths,images),images,nodeId:"local",destination:"This computer"});
     launchedViewKeys.set(m.id, launchViewKey());
@@ -1825,7 +1837,7 @@ export default function App() {
         if (launchAttempt?.signature !== signature) launchAttempt = {signature,key:crypto.randomUUID()};
         const m = await createMission({...body,idempotency_key:launchAttempt.key});
         launchAttempt = undefined;
-        setDraftCyber("standard");
+        setDraftCyber("automatic");
         setAttachChips([]);
         rememberLaunch(m.id, {...receipt,prompt:sentPrompt});
         if (machine === "dgx-spark-admin") chooseMachine("core");
@@ -3182,7 +3194,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
         const sent = imagePrompt(bindWorkspace(plan.prompt, binding.cwd), imagePaths, images);
         if(connectionVersion()!==sendVersion||staleMission()||p.id!==sendMission)throw new Error("Conversation changed. Your draft is kept.");
         if (!optimisticList().some(item => item.id === attemptId)) return true;
-        await enqueueLocalMessage({id:sendMission,harness:binding.harness,bin:binding.bin,cwd:binding.cwd,prompt:sent,model:mission()?.model_override ?? binding.model,effort:binding.harness === "antigravity" ? normalizeEffort(mission()?.model_effort,binding.harness) ?? undefined : undefined,service_tier:binding.harness === "codex" ? missionSpeed(mission()??{}) : undefined,imagePaths},imagePrompt(text,imagePaths,images),{id:attemptId,replace,waiting:explicitId ? busy() : optEntry?.waiting??busy()});
+        await enqueueLocalMessage({id:sendMission,harness:binding.harness,bin:binding.bin,cwd:binding.cwd,prompt:sent,model:mission()?.model_override ?? binding.model,effort:["antigravity", "claudecode"].includes(binding.harness) ? normalizeEffort(mission()?.model_effort,binding.harness) ?? undefined : undefined,service_tier:binding.harness === "codex" ? missionSpeed(mission()??{}) : undefined,imagePaths},imagePrompt(text,imagePaths,images),{id:attemptId,replace,waiting:explicitId ? busy() : optEntry?.waiting??busy()});
         setOptimisticList(prev => prev.filter(item => item.id !== attemptId));
         if (chips === followAttach()) setFollowAttach([]);
         return true;

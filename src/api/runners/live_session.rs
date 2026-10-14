@@ -115,7 +115,7 @@ pub(crate) fn effort_request(effort: Option<&str>) -> Value {
     serde_json::json!({
         "type": "control_request",
         "request_id": format!("orb-effort-{}", Uuid::new_v4()),
-        "request": { "subtype": "apply_flag_settings", "settings": { "effortLevel": effort } }
+        "request": { "subtype": "apply_flag_settings", "settings": { "effortLevel": if effort == Some("ultracode") { Some("xhigh") } else { effort }, "ultracode": effort == Some("ultracode") } }
     })
 }
 
@@ -251,6 +251,14 @@ mod tests {
         assert_eq!(request["request"]["subtype"], "apply_flag_settings");
         assert_eq!(request["request"]["settings"]["effortLevel"], "xhigh");
         assert!(effort_request(None)["request"]["settings"]["effortLevel"].is_null());
+        let ultra = effort_request(Some("ultracode"));
+        assert_eq!(ultra["request"]["settings"]["effortLevel"], "xhigh");
+        assert_eq!(ultra["request"]["settings"]["ultracode"], true);
+        assert_eq!(request["request"]["settings"]["ultracode"], false);
+        assert_eq!(
+            effort_request(None)["request"]["settings"]["ultracode"],
+            false
+        );
     }
 
     #[test]
