@@ -1,5 +1,4 @@
 import { hasOverlay } from "./overlayLayer";
-import { nativeInvoke } from "./clientRuns";
 import * as TreeIcon from "./sidebarIcons";
 import {
   lazy,
@@ -716,11 +715,10 @@ export function FilePanelProvider(p: {
   const [downloads, setDownloads] = createSignal<
     Record<string, { received: number; total: number; abort: AbortController }>
   >({});
-  // Files saved this session, keyed by identity + size + mtime so a changed
-  // file can be downloaded again. A second click reveals the saved copy.
-  const [downloaded, setDownloaded] = createSignal<Record<string, true>>({});
-  const downloadKey = (ref: NonNullable<ReturnType<typeof selected>>) => `${identity(ref)}:${content()?.size ?? ""}:${content()?.modified ?? ""}`;
+  const [downloadedKey, setDownloadedKey] = createSignal<string>();
+  let downloadedTimer: ReturnType<typeof setTimeout> | undefined;
   onCleanup(() => {
+    if (downloadedTimer) clearTimeout(downloadedTimer);
     for (const item of Object.values(downloads())) item.abort.abort();
   });
   const formatBytesShort = (bytes: number) =>
@@ -735,17 +733,11 @@ export function FilePanelProvider(p: {
   });
   const isDownloaded = createMemo(() => {
     const ref = selected();
-    return !!ref && !!downloaded()[downloadKey(ref)];
+    return !!ref && downloadedKey() === identity(ref);
   });
   async function download() {
     const ref = selected();
     if (!ref) return;
-    const invoke = nativeInvoke();
-    if (isDownloaded() && invoke) {
-      try { await invoke("reveal_download", { name: ref.name }); }
-      catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-      return;
-    }
     const key = identity(ref);
     const existing = downloads()[key];
     if (existing) {
@@ -793,7 +785,11 @@ export function FilePanelProvider(p: {
       a.download = ref.name;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setDownloaded((prev) => ({ ...prev, [downloadKey(ref)]: true }));
+      setDownloadedKey(key);
+      if (downloadedTimer) clearTimeout(downloadedTimer);
+      downloadedTimer = setTimeout(() => {
+        setDownloadedKey((curr) => (curr === key ? undefined : curr));
+      }, 1800);
     } catch (e) {
       if (!abort.signal.aborted) {
         setError((e as Error).message);
@@ -1094,7 +1090,7 @@ export function FilePanelProvider(p: {
                               : activeDownload()
                                 ? `Downloading ${Math.min(100, Math.round((activeDownload()!.received / Math.max(1, activeDownload()!.total)) * 100))}% · ${formatBytesShort(activeDownload()!.received)} / ${formatBytesShort(activeDownload()!.total)}`
                                 : isDownloaded()
-                                  ? nativeInvoke() ? "Downloaded ✓ · Show in Finder" : "Downloaded ✓"
+                                  ? "Downloaded ✓"
                                   : "Download full file"}
                           </button>
                         </p>
@@ -1133,7 +1129,7 @@ export function FilePanelProvider(p: {
                                   : activeDownload()
                                     ? `Downloading ${Math.min(100, Math.round((activeDownload()!.received / Math.max(1, activeDownload()!.total)) * 100))}% · ${formatBytesShort(activeDownload()!.received)} / ${formatBytesShort(activeDownload()!.total)}`
                                     : isDownloaded()
-                                      ? nativeInvoke() ? "Downloaded ✓ · Show in Finder" : "Downloaded ✓"
+                                      ? "Downloaded ✓"
                                       : "Download file"}
                               </span>
                             </button>

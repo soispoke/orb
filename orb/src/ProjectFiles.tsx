@@ -1,5 +1,4 @@
 import { useTooltip } from "./Tooltip";
-import { ErrorToast } from "./toast";
 import {nativeComposerDrop} from "./composerDrop";
 import {importProjectFiles} from "./projectFileImport";
 import {backgroundUploads,cancelBackgroundUpload,formatFileSize,pauseBackgroundUpload,resumeBackgroundUpload,type UploadSource} from "./uploads";
@@ -2012,7 +2011,7 @@ export function LiveProjectsSection(p: {
         <span class="row-label">{d.label}</span>
         <Show when={!row.expanded && currentMission()?.project === d.slug}><span class="current-location-label">Open</span></Show>
       </button>
-      <Show when={row.expanded}><ContextBadge slug={d.slug} compact/></Show>
+      <Show when={row.expanded}><ContextBadge slug={d.slug}/></Show>
       <button class="row-action" aria-label={`Project actions for ${d.label}`} title="Project actions"
         onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
         onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
@@ -2090,7 +2089,7 @@ export function LiveProjectsSection(p: {
       <Show when={error()}>
         <div class="row note">{error()} <button class="text-btn" onClick={() => refresh(true)}>Retry</button></div>
       </Show>
-      <ErrorToast error={cronWarning()} onDismiss={() => setCronWarning(null)} />
+      <Show when={cronWarning()}><ErrorNotice error={cronWarning()!} /></Show>
       <Show when={!deleteTargets().length && actionError()}>{error => <ErrorDialog error={error()} onClose={() => setActionError(null)} />}</Show>
       <Show when={importStatus()}><div class="row note" role="status">{importStatus()}</div></Show>
       <For each={backgroundUploads().filter(t => t.scope?.startsWith("project:"))}>

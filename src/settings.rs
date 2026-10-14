@@ -3,6 +3,8 @@
 //! Persists user-configurable settings to disk at `{working_dir}/.sandboxed-sh/settings.json`.
 //! Environment variables are used as initial defaults when no settings file exists.
 
+pub mod ssh_hosts;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -90,23 +92,6 @@ pub struct AuthSettings {
     pub password_changed_at: Option<String>,
 }
 
-/// Bitwarden Secrets Manager (`bws`) integration settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BitwardenSettings {
-    /// AES-256-GCM encrypted Machine Account access token (`<encrypted v="1">...</encrypted>`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_access_token: Option<String>,
-    /// Optional custom Bitwarden server URL (`BWS_SERVER_URL`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_url: Option<String>,
-    /// Default Bitwarden project UUID selected in the Secrets UI (defaults to `paloma`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_project_id: Option<String>,
-    /// Mapping from Paloma project slug (e.g. `paloma`) to Bitwarden project UUID.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub project_bindings: std::collections::BTreeMap<String, String>,
-}
-
 /// Global application settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
@@ -160,14 +145,12 @@ pub struct Settings {
     /// When None, every harness uses its built-in default behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_versions: Option<HarnessVersionPolicy>,
-    /// Bitwarden Secrets Manager (`bws`) integration settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bitwarden: Option<BitwardenSettings>,
 }
 
 /// In-memory store for global settings with disk persistence.
 #[derive(Debug)]
 pub struct SettingsStore {
+    pub ssh_hosts: ssh_hosts::Store,
     settings: RwLock<Settings>,
     storage_path: PathBuf,
 }
@@ -207,6 +190,7 @@ impl SettingsStore {
 
         Self {
             settings: RwLock::new(settings),
+            ssh_hosts: ssh_hosts::Store::new(working_dir),
             storage_path,
         }
     }
@@ -240,26 +224,7 @@ impl SettingsStore {
             ask_assistant_model: std::env::var("ASK_ASSISTANT_MODEL").ok(),
             metadata_model: None,
             harness_versions: None,
-            bitwarden: None,
         }
-    }
-
-    /// Get the current Bitwarden settings.
-    pub async fn get_bitwarden(&self) -> BitwardenSettings {
-        self.settings
-            .read()
-            .await
-            .bitwarden
-            .clone()
-            .unwrap_or_default()
-    }
-
-    /// Update the Bitwarden settings and persist to disk.
-    pub async fn set_bitwarden(&self, bitwarden: BitwardenSettings) -> Result<(), std::io::Error> {
-        let mut settings = self.settings.write().await;
-        settings.bitwarden = Some(bitwarden);
-        drop(settings);
-        self.save_to_disk().await
     }
 
     /// Effective harness version policy (empty policy when unset).

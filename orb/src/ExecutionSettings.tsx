@@ -1,5 +1,4 @@
 import { ErrorNotice } from "./ErrorNotice";
-import { ErrorToast } from "./toast";
 import { Show, createSignal, onCleanup } from "solid-js";
 import { pollWhileVisible } from "./poll";
 import { getGlobalSettings, isConnected, updateGlobalSettings, type GlobalSettings } from "./api";
@@ -119,7 +118,9 @@ export function ExecutionSettings(p: { onOpenPage?: (id: string) => void; inline
                 </div>
               </Show>
             </div>
-            <ErrorToast error={saveError()} title="Couldn’t save execution settings" onDismiss={() => setSaveError(null)} />
+            <Show when={saveError()}>
+              <ErrorNotice error={saveError()!} />
+            </Show>
             <Show when={saved()}>
               <p class="ps-saved" role="status">Saved. Only the backend-wide limit changed.</p>
             </Show>

@@ -28,14 +28,10 @@ struct OrbSettingsHome: View {
                 }.accessibilityIdentifier("settings.backend")
                 NavigationLink { OrbProvidersSettings() } label: { Label("Providers", systemImage: "key.horizontal") }
                     .accessibilityIdentifier("settings.providers")
-                NavigationLink { OrbBitwardenSettings() } label: { Label("Secrets", systemImage: "lock.shield") }
-                    .accessibilityIdentifier("settings.secrets")
                 NavigationLink { OrbMachinesSettings() } label: { Label("Machines", systemImage: "desktopcomputer") }
                     .accessibilityIdentifier("settings.machines")
                 NavigationLink { OrbInboxSettingsView() } label: { Label("Inbox", systemImage: "tray.full") }
                     .accessibilityIdentifier("settings.inbox")
-                NavigationLink { OrbDictationSettingsView() } label: { Label("Dictation", systemImage: "mic") }
-                    .accessibilityIdentifier("settings.dictation")
             }
             .scrollContentBackground(.hidden).background(OrbStyle.background)
             .navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)

@@ -1,5 +1,4 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
-import { ErrorToast } from "./toast";
 import { connectionVersion, getApiUrl, isConnected } from "./api";
 import { ConfirmDialog } from "./Dialog";
 import { ErrorNotice } from "./ErrorNotice";
@@ -215,7 +214,7 @@ export function ProxyApiKeys() {
         </div>
       </div>
     </Show>
-    <ErrorToast error={error()} onDismiss={() => setError("")} />
+    <Show when={error()}><ErrorNotice error={error()} /></Show>
     <Show when={listError()}><ErrorNotice error={`Could not load proxy API keys: ${listError()}`} /></Show>
     <Show when={!loading() && !listError() && !keys().length}><p class="routing-muted">No API keys yet. Create one to connect external tools.</p></Show>
     <div class="s-card proxy-key-list" aria-busy={loading()}>

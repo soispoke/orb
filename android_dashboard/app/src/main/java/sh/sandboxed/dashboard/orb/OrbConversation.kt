@@ -295,7 +295,7 @@ object OrbTimelineBuilder {
             val (uText, uTs) = pair
             val alreadyInHistory = deduplicatedMessages.any {
                 val r = (it.str("role", "sender", "author") ?: "").lowercase()
-                (r == "user" || r == "operator" || r == "human") && (it.str("content", "text", "message")?.trim() == uText.trim())
+                (r == "user" || r == "operator" || r == "human") && (it.str("content", "text", "message") == uText)
             }
             if (!alreadyInHistory) {
                 if (isControllerWake(uText)) {
@@ -702,13 +702,12 @@ fun OrbConversationPage(
                 val formattedText = OrbAttachmentUploader.formatPrompt(baseText, uploaded)
                 val finalPrompt = composeMode.wrapPrompt(formattedText)
 
-                // Optimistic user message: the exact text Core will store, so the
-                // copy that comes back in events replaces it instead of doubling it.
+                // Optimistic user message
                 val optimistic = OrbRow(
                     "local-${UUID.randomUUID()}",
                     mapOf(
                         "role" to "user",
-                        "content" to finalPrompt.trim(),
+                        "content" to formattedText,
                         "created_at" to java.time.Instant.now().toString()
                     )
                 )

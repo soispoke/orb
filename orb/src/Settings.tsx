@@ -1,5 +1,4 @@
 import { cloudAccounts, cloudNames, type CloudAccount } from "./cloudAgentApi";
-import { ErrorToast } from "./toast";
 import { ExecutionSettings } from "./ExecutionSettings";
 import { Select } from "./Select";
 import { ErrorNotice } from "./ErrorNotice";
@@ -68,7 +67,7 @@ function CloudAccountsCard(p: { onOpenPage?: (id: string) => void }) {
     <Row title="Connected services" desc="Cloud agents use accounts connected to Core. Connecting an account does not start work.">
       <button class="s-btn" disabled={busy()} onClick={() => void refresh()}>{busy() ? "Checking…" : "Refresh accounts"}</button>
     </Row>
-    <ErrorToast error={error()} title="Couldn’t refresh cloud accounts" onDismiss={() => setError("")} />
+    <Show when={error()}><p role="alert">{error()}</p></Show>
     <For each={accounts()}>{a => <Row title={`${cloudNames[a.provider]} · ${a.label}`} desc={a.reason}>
       <span>{a.available ? "Available" : "Unavailable"}{a.experimental ? " · Experimental" : ""}</span>
       <Show when={a.provider === "hermes" && p.onOpenPage}><button class="s-btn" onClick={() => p.onOpenPage?.("hermes-settings")}>Configure</button></Show>
@@ -205,7 +204,7 @@ export function Settings(p: { onOpenPage?: (id: string) => void } = {}) {
   return (
     <div class="s-body settings-body">
       <div class="s-inner">
-        <h2>General</h2>
+        <h2>Client</h2>
         <BackendTab />
         <LocalAgentsCard />
         <CloudAccountsCard onOpenPage={p.onOpenPage} />

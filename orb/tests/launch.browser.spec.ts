@@ -423,7 +423,7 @@ test("context picks preserve multiline whitespace and land at the caret",async({
  await expect(input).toHaveValue("Before @notes/foo.md inserted after");
 });
 
-test("disk refusal shows a notification clear of the draft with details, an action and a dismiss button",async({page})=>{
+test("disk refusal stays below the draft with readable details and a dismiss action",async({page})=>{
  await setup(page);
  const raw="mission needs an estimated 64 GiB scratch plus a 64 GiB emergency floor (128 GiB required), but only 127 GiB is free at /root (filesystem statvfs:7321850625438636562); select a remote node or free space";
  await page.route("**/api/control/missions",async route=>{
@@ -432,14 +432,13 @@ test("disk refusal shows a notification clear of the draft with details, an acti
  });
  const input=composerInput(page);await input.fill("Summarize the Pareto audit progress");await input.press("Enter");
  const alert=page.getByRole("alert");await expect(alert).toContainText("Not enough disk space");await expect(input).toHaveValue("Summarize the Pareto audit progress");
- const composer=await page.locator(".composer").boundingBox(),notice=await alert.boundingBox();expect(notice!.y>=composer!.y+composer!.height||notice!.y+notice!.height<=composer!.y).toBe(true);
- await expect(alert.getByRole("button",{name:"Choose machine"})).toBeVisible();
- await expect(alert.locator("pre")).toBeHidden();await alert.getByText("Details").click();await expect(alert.locator("pre")).toHaveText(raw);await alert.getByText("Details").click();
- await page.screenshot({path:"test-results/error-toast-dark.png"});
+ const composer=await page.locator(".composer").boundingBox(),notice=await alert.boundingBox();expect(notice!.y).toBeGreaterThanOrEqual(composer!.y+composer!.height);
+ await expect(alert.locator("pre")).toBeHidden();await alert.getByText("Technical details").click();await expect(alert.locator("pre")).toHaveText(raw);await alert.getByText("Technical details").click();
+ await page.screenshot({path:"test-results/error-notice-dark.png"});
  await page.setViewportSize({width:480,height:850});
  await page.getByRole("button", {name:"Close sidebar", exact:true}).click();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
- await alert.getByRole("button",{name:"Dismiss"}).click();await expect(alert).toHaveCount(0);await expect(input).toHaveValue("Summarize the Pareto audit progress");
+ await alert.getByRole("button",{name:"Dismiss error"}).click();await expect(alert).toHaveCount(0);await expect(input).toHaveValue("Summarize the Pareto audit progress");
 });
 
 test('follow-up composer does not alternate layouts while typing wrapped text',async({page})=>{
@@ -462,14 +461,9 @@ test('follow-up composer does not alternate layouts while typing wrapped text',a
 });
 
 test("unsupported Cyber route keeps the draft and never submits a remote mission",async({page})=>{
- const state=await setup(page,{capability:{...typedCapability,harnesses:["grok","codex"]}});
+ const state=await setup(page,{cyberRefusal:true,capability:{...typedCapability,harnesses:["grok","codex"]}});
  state.releasePost();state.releaseHistory();await chooseRemote(page);
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("option",{name:/^Codex/}).click();
- // Personal defaults use Automatic. Exercise a deliberate Standard selection
- // before the server loses support, rather than relying on the initial default.
- await page.getByRole("button",{name:"Cyber program: Automatic"}).click();
- await page.getByRole("menuitemradio",{name:/Standard/}).click();
- await page.route("**/api/control/cyber-capabilities**",route=>route.fulfill({json:{version:2,route_supported:false,refusal:"unsupported_access_program: Choose Automatic explicitly. No mission was launched."}}));
  const input=composerInput(page);await input.fill(objective);await input.press("Enter");
  await expect(page.getByRole("alert")).toContainText("Choose Automatic explicitly");
  await expect(input).toHaveValue(objective);expect(state.posts).toHaveLength(0);

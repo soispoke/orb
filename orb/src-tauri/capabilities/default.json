@@ -13,7 +13,6 @@
     "allow-open-url",
     "allow-local-agents",
     "allow-local-metrics",
-    "allow-diagnostics",
-    "allow-biometrics"
+    "allow-diagnostics"
   ]
 }

@@ -42,7 +42,7 @@ import { backgroundUploads, cancelBackgroundUpload, encoded, formatFileSize, HAR
 import { readComposerDraft, saveComposerDraft } from "./composerDrafts";
 import { readImagePaste, imagePrompt, stageLocalImages, stageRemoteImages, IMAGE_COUNT, type DraftImage } from "./imageAttachments";
 import { FilePanelProvider, FilePanelButton } from "./FilePanel";
-import { ErrorToast } from "./toast";
+import { ErrorNotice } from "./ErrorNotice";
 import { MissionFailure, LaunchStatus, MissionPending, missionPhase, phaseIsQuiet, rememberLaunch, recalledLaunch, missionDestination, withInitialPrompt, launchError, launchRefusal, nodeLabel, isAdministrationNode, remoteLaunchPreflight, remoteHarnessSupport, remoteLaunchUnconfirmed, missionGoal, missionSettingsIdle, dockModelLabel, type LaunchReceipt, type LaunchRefusal, type RemoteSupport } from "./missionLaunch";
 import { goalDraft, goalObjective, goalPrompt, planObjective, missionTitle, displayTitle, GoalTag, EMPTY_GOAL_ERROR, absorbGoalPrefix, composerModes, filterSlash, slashQuery, modePrompt, ModeChip, type ComposerMode } from "./goal";
 import { atQuery, browseAttachItems, chipToAttachment, filterAttach, folderPrefixFromQuery, insertMention, loadAttachItems, mentionedChips, type AttachChip, type AttachItem } from "./attach";
@@ -138,7 +138,6 @@ import {
 } from "./api";
 const HermesSettings = lazy(() => import("./HermesSettings").then(module => ({ default: module.HermesSettings })));
 const SkillsSettings = lazy(() => import("./SkillsSettings").then(module => ({ default: module.SkillsSettings })));
-const BitwardenSettings = lazy(() => import("./BitwardenSettings").then(module => ({ default: module.BitwardenSettings })));
 import { InboxPage } from "./Inbox";
 import { requestInboxDigest } from "./inboxDigest";
 import { countUnreadInboxMissions, listUnreadInboxCandidates } from "./inboxModel";
@@ -146,7 +145,7 @@ import { InboxSettings, inboxConfig } from "./inboxSettings";
 import { pendingMissionInteraction } from "./missionAttention";
 import { markMissionRead, unreadVersion } from "./missionUnread";
 
-const PAGES = new Set(["inbox", "cloud-agent", "settings", "inbox-settings", "btw-settings", "hermes-settings", "skills-settings", "bitwarden-settings", "routing", "machines", "providers", "execution"]);
+const PAGES = new Set(["inbox", "cloud-agent", "settings", "inbox-settings", "btw-settings", "hermes-settings", "skills-settings", "routing", "machines", "providers", "execution"]);
 
 const MODELS = ["Orb Lorem 4.6 High Fast", "Ipsum 5 Max", "Dolor 4.5 Sonnet", "Auto"];
 
@@ -1101,6 +1100,7 @@ export function Composer(p: {
       {slashMenu}
       {atMenu}
       <Show when={uploading()}><div class="composer-upload-status" role="status">Attaching file…</div></Show>
+      <Show when={uploadError()}><div class="composer-upload-status error" role="alert">{uploadError()}</div></Show>
       <Show when={pendingLargeUploads().length > 0}>
         <div class="composer-large-confirm" role="alertdialog" aria-label="Confirm large file upload" onClick={(e) => e.stopPropagation()}>
           <div class="composer-large-confirm-text">
@@ -1144,7 +1144,6 @@ export function Composer(p: {
           }}</For>
         </div>
       </Show>
-      <ErrorToast error={uploadError()} title="Couldn’t upload the file" onDismiss={() => setUploadError(null)} />
       <Show when={mode()}>{m => <ModeChip mode={m()} onClear={clearMode} />}</Show>
       <Show when={!mode() && p.editingQueued}>{editing => <span class="mode-chip edit-queued" role="status" aria-label="Editing a queued message">
         <Ic.PencilIcon size={12} /><span class="mode-chip-label">Edit Queued</span>
@@ -1152,7 +1151,7 @@ export function Composer(p: {
       </span>}</Show>
       <div class="composer-field">
         <Show when={images().length}><div class="composer-images"><For each={images()}>{image => <div class="composer-image"><img src={image.dataUrl} alt={image.reference ? `Image #${image.reference}` : "Attached image"} title="Open preview" onClick={e => { e.stopPropagation(); setViewing(images().indexOf(image)); }} /><Show when={image.reference}><span class="composer-image-reference">#{image.reference}</span></Show><button class="icon-btn" aria-label="Remove image" title="Remove image" onClick={e => { e.stopPropagation(); setImages(current => current.filter(item => item.id !== image.id)); if (image.reference) { const value = text().replaceAll(`[Image #${image.reference}]`, ""); setText(value); ta.value = value; resize(); } }}><Ic.CloseIcon size={12}/></button></div>}</For></div></Show><Show when={viewing() !== null && images().length}><Lightbox items={draftLightbox(images())} index={viewing()!} onClose={() => setViewing(null)} /></Show>
-        <ErrorToast error={imageError()} title="Couldn’t add the image" onDismiss={() => setImageError(null)} />
+        <Show when={imageError()}><span class="image-paste-error" role="alert">{imageError()}</span></Show>
         <textarea readOnly={sendingLocked()}
           ref={ta}
           onPaste={event => void pasteImages(event)}
@@ -1647,14 +1646,14 @@ export default function App() {
       context: previewContext()?.id === id ? previewContext()?.pct : null };
   });
 
-  const onSettings = () => selected() === "settings" || selected() === "execution" || selected() === "routing" || selected() === "inbox-settings" || selected() === "btw-settings" || selected() === "hermes-settings" || selected() === "skills-settings" || selected() === "bitwarden-settings";
+  const onSettings = () => selected() === "settings" || selected() === "execution" || selected() === "routing" || selected() === "inbox-settings" || selected() === "btw-settings" || selected() === "hermes-settings" || selected() === "skills-settings";
   const openSettings = () => {
     open("settings");
   };
   const leaveSettings = () => {
     const h = history();
     for (let i = hIdx() - 1; i >= 0; i--) {
-      if (h[i] !== "settings" && h[i] !== "routing" && h[i] !== "inbox-settings" && h[i] !== "btw-settings" && h[i] !== "hermes-settings" && h[i] !== "skills-settings" && h[i] !== "bitwarden-settings") {
+      if (h[i] !== "settings" && h[i] !== "routing" && h[i] !== "inbox-settings" && h[i] !== "btw-settings" && h[i] !== "hermes-settings" && h[i] !== "skills-settings") {
         if (selected() === "routing" && !confirmLeaveRouting(() => { if (open(h[i], false)) setHIdx(i); })) return;
         if (open(h[i], false)) setHIdx(i);
         return;
@@ -2091,16 +2090,12 @@ export default function App() {
               <span class="row-label">Back</span>
             </button>
             <div class="settings-nav-gap" />
-            <button class={`row ${selected() === "settings" ? "active" : ""}`} onClick={() => open("settings")}><span class="row-ico"><Ic.GearIcon /></span><span class="row-label">General</span></button>
-            <div class="settings-nav-group-gap" />
-            <button class={`row ${selected() === "routing" ? "active" : ""}`} onClick={() => open("routing")}><span class="row-ico"><Ic.CubeIcon /></span><span class="row-label">Models &amp; Routing</span></button>
-            <button class={`row ${selected() === "hermes-settings" ? "active" : ""}`} onClick={() => open("hermes-settings")}><span class="row-ico"><Ic.TargetIcon /></span><span class="row-label">Coordinator</span></button>
-            <button class={`row ${selected() === "btw-settings" ? "active" : ""}`} onClick={() => open("btw-settings")}><span class="row-ico"><MessageCircle size={16} /></span><span class="row-label">Side Questions</span></button>
-            <div class="settings-nav-group-gap" />
+            <button class={`row ${selected() === "settings" ? "active" : ""}`} onClick={() => open("settings")}><span class="row-ico"><Ic.GearIcon /></span><span class="row-label">Client</span></button>
             <button class={`row ${selected() === "skills-settings" ? "active" : ""}`} onClick={() => open("skills-settings")}><span class="row-ico"><Ic.SkillsIcon /></span><span class="row-label">Skills</span></button>
-            <button class={`row ${selected() === "bitwarden-settings" ? "active" : ""}`} onClick={() => open("bitwarden-settings")}><span class="row-ico"><Ic.KeyIcon /></span><span class="row-label">Secrets</span></button>
-            <div class="settings-nav-group-gap" />
-            <button class={`row ${selected() === "inbox-settings" ? "active" : ""}`} onClick={() => open("inbox-settings")}><span class="row-ico"><Ic.BellIcon /></span><span class="row-label">Notifications</span></button>
+            <button class={`row ${selected() === "inbox-settings" ? "active" : ""}`} onClick={() => open("inbox-settings")}><span class="row-ico"><Ic.InboxIcon /></span><span class="row-label">Inbox</span></button>
+            <button class={`row ${selected() === "hermes-settings" ? "active" : ""}`} onClick={() => open("hermes-settings")}><span class="row-ico"><ProviderLogo type="hermes" /></span><span class="row-label">Hermes</span></button>
+            <button class={`row ${selected() === "btw-settings" ? "active" : ""}`} onClick={() => open("btw-settings")}><span class="row-ico"><MessageCircle size={16} /></span><span class="row-label">Btw</span></button>
+            <button class={`row ${selected() === "routing" ? "active" : ""}`} onClick={() => open("routing")}><span class="row-ico"><Ic.BranchIcon /></span><span class="row-label">Routing</span></button>
           </Show>
         </nav>
         <div class="sb-foot">
@@ -2136,14 +2131,13 @@ export default function App() {
         <div class="tb-title" data-tauri-drag-region>
           <Switch>
             <Match when={selected() === "settings" || selected() === "execution"}>
-              <span>Settings · General</span>
+              <span>Settings · Client</span>
             </Match>
             <Match when={selected() === "skills-settings"}><span>Settings · Skills</span></Match>
-            <Match when={selected() === "bitwarden-settings"}><span>Settings · Secrets</span></Match>
-            <Match when={selected() === "inbox-settings"}><span>Settings · Notifications</span></Match>
-            <Match when={selected() === "hermes-settings"}><span>Settings · Coordinator</span></Match>
-            <Match when={selected() === "btw-settings"}><span>Settings · Side Questions</span></Match>
-            <Match when={selected() === "routing"}><span>Settings · Models &amp; Routing</span></Match>
+            <Match when={selected() === "inbox-settings"}><span>Settings · Inbox</span></Match>
+            <Match when={selected() === "hermes-settings"}><span>Settings · Hermes</span></Match>
+            <Match when={selected() === "btw-settings"}><span>Settings · Btw</span></Match>
+            <Match when={selected() === "routing"}><span>Settings · Routing</span></Match>
             <Match when={selected() === "machines"}>
               <span>Machines</span>
             </Match>
@@ -2384,9 +2378,30 @@ export default function App() {
                   onAttachments={setAttachChips}
                 />
                 <Show when={newMachine() === "local" && localAgentsScanning()}><div class="local-scan-status" role="status"><Ic.Spinner size={12} /> Checking local agents…</div></Show>
-                <ErrorToast error={createError()} title="Couldn’t start the mission" onDismiss={() => setCreateError(null)}
-                  action={/GiB required.*GiB is free/.test(createError() ?? "") ? { label: "Choose machine", run: () => setEnvOpen("machine") }
-                    : createRefusal()?.project ? { label: "Open project settings", run: () => open(`ps:${createRefusal()!.project}`) } : undefined} />
+                <Show when={createError()}>
+                  <ErrorNotice error={createError()!} title="Couldn’t start the mission" onDismiss={() => setCreateError(null)}>
+                    <Show when={/GiB required.*GiB is free/.test(createError()!)}><button class="s-btn sm" onClick={() => setEnvOpen("machine")}>Choose machine</button></Show>
+                    <Show when={createRefusal()}>
+                      {(r) => (
+                        <div class="launch-refusal-actions">
+                          <Show when={r().refusal.kind === "project_cap" && r().project}>
+                            <span class="launch-refusal-meta">
+                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).active} of{" "}
+                              {(r().refusal as Extract<LaunchRefusal, { kind: "project_cap" }>).cap} unfinished
+                            </span>
+                          </Show>
+                          <Show when={r().project}>
+                            {(slug) => (
+                              <button class="s-btn sm" onClick={() => open(`ps:${slug()}`)}>
+                                Open project settings
+                              </button>
+                            )}
+                          </Show>
+                        </div>
+                      )}
+                    </Show>
+                  </ErrorNotice>
+                </Show>
                 </div>
               </div>
             </div>
@@ -2424,7 +2439,6 @@ export default function App() {
               onCreated={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }} />
           </Match>
           <Match when={selected() === "skills-settings"}><SkillsSettings onOpenPage={open} /></Match>
-          <Match when={selected() === "bitwarden-settings"}><BitwardenSettings /></Match>
           <Match when={selected() === "inbox-settings"}><InboxSettings /></Match>
           <Match when={selected() === "hermes-settings"}><HermesSettings /></Match>
           <Match when={selected() === "btw-settings"}><BtwSettings/></Match>
@@ -3454,11 +3468,11 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
             projectSlug={mission()?.project ?? undefined}
             onAttachments={setFollowAttach}
           />
-          <ErrorToast title="Couldn’t send your message" error={p.launchError} action={p.onRetryLaunch ? { label: "Retry", run: p.onRetryLaunch } : undefined} />
+          <Show when={p.launchError}><ErrorNotice title="Couldn’t send your message" error={p.launchError!}><button onClick={p.onRetryLaunch}>Retry</button></ErrorNotice></Show>
           <Show when={mission()?.local_sync_pending}><div class="dim" role="status">{mission()?.local_sync_error || "Saved on this computer · syncing to Core…"}</div></Show>
-          <ErrorToast error={sendError()} title="Couldn’t send your message" onDismiss={() => setSendError(null)}
-            action={optimistic() ? { label: "Retry", run: () => { const draft = optimistic(); if (draft?.retry) draft.retry(); else if (draft) void sendMsg(draft.text, draft.images, followAttach(), draft.id); } } : undefined} />
-          <ErrorToast error={error() || queueError()} title="Couldn’t load the conversation" onDismiss={() => { setError(null); setQueueError(null); }} />
+          <Show when={sendError() || error() || queueError()}>
+            <ErrorNotice error={(sendError() || error() || queueError())!} title={sendError() ? "Couldn’t send your message" : "Couldn’t load the conversation"} onDismiss={sendError() ? undefined : () => { setError(null); setQueueError(null); }}><Show when={sendError()&&optimistic()}><button onClick={()=>{const draft=optimistic();if(draft?.retry)draft.retry();else if(draft)void sendMsg(draft.text,draft.images,followAttach(),draft.id);}}>Retry</button></Show></ErrorNotice>
+          </Show>
           <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} onFork={p.onFork} />
         </div>
       </div>

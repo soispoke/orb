@@ -27,7 +27,6 @@
 		3481363ED532A70935FA6B9E /* ChatHistoryReducer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F77025B7F25E968FE5757E18 /* ChatHistoryReducer.swift */; };
 		382AC983DA8881DF18A6F5A6 /* OrbDictationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98CD2374A807C1FF479EFE74 /* OrbDictationTests.swift */; };
 		3A706E457E3E27DA1B69E152 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 750C4C8090EAD0168794EEE4 /* Assets.xcassets */; };
-		3C7BD46FB1BA888A750CA564 /* OrbBitwardenSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3B499BE2EC4EB4545CB79EC /* OrbBitwardenSettings.swift */; };
 		40C09530EC6F9C083B5474C4 /* GlassButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = D81DFFD4B67ABE07FB546B2B /* GlassButton.swift */; };
 		42EB1014A46E016216A63172 /* OrbQuiz.swift in Sources */ = {isa = PBXBuildFile; fileRef = 273DF8C1DD6EDF4D4D8627A0 /* OrbQuiz.swift */; };
 		45E3B02A9F7E3B159E60CA3F /* OrbRichTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4734279056A622F4537AFA07 /* OrbRichTextTests.swift */; };
@@ -207,7 +206,6 @@
 		D17889CB07B4A4285DD87C30 /* PhosphorIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhosphorIcon.swift; sourceTree = "<group>"; };
 		D1EF1D3FCDDC536A1D824359 /* MessageBubbles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessageBubbles.swift; sourceTree = "<group>"; };
 		D2E4AC8C92D9F496B8152B8F /* ControlView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlView.swift; sourceTree = "<group>"; };
-		D3B499BE2EC4EB4545CB79EC /* OrbBitwardenSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbBitwardenSettings.swift; sourceTree = "<group>"; };
 		D4015786D778B76973EA06D5 /* ProjectsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectsView.swift; sourceTree = "<group>"; };
 		D81DFFD4B67ABE07FB546B2B /* GlassButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassButton.swift; sourceTree = "<group>"; };
 		D9E023EEFFFA9B1092B66006 /* ANSIParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ANSIParser.swift; sourceTree = "<group>"; };
@@ -333,7 +331,6 @@
 			isa = PBXGroup;
 			children = (
 				C623C7A6712001F7E32CA623 /* OrbAttachments.swift */,
-				D3B499BE2EC4EB4545CB79EC /* OrbBitwardenSettings.swift */,
 				3E2A5583F19E1A058C7F0C73 /* OrbConversation.swift */,
 				717FFF091D1EDB3F27D08712 /* OrbCore.swift */,
 				94B98C32C31466233A2EFB2B /* OrbDictation.swift */,
@@ -652,7 +649,6 @@
 				110C67FF7A62B86FB7AD4CD0 /* NetworkMonitor.swift in Sources */,
 				D0646F9EE2D2E984F0446C57 /* NewMissionSheet.swift in Sources */,
 				226AFC0BA710210493AF4569 /* OrbAttachments.swift in Sources */,
-				3C7BD46FB1BA888A750CA564 /* OrbBitwardenSettings.swift in Sources */,
 				AA2F722EE90CC2C4E182861E /* OrbConversation.swift in Sources */,
 				86C9D56D2E0A4F576734B3F1 /* OrbCore.swift in Sources */,
 				FA899996474B9DD43915EC48 /* OrbDictation.swift in Sources */,
