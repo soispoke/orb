@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { render } from "@solidjs/testing-library";
 import { Transcript, buildTranscript } from "../src/Transcript";
 import type { StreamEvent } from "../src/stream";
+import { resumePrompt } from "../src/messagePresentation";
 
 const ev = (type: string, data: Record<string, unknown>): StreamEvent => ({ type, data });
 
@@ -156,8 +157,19 @@ describe('automatic provider recovery',()=>{
   expect(disclosure.textContent).toContain('Agent resumed automatically');
   expect(disclosure.textContent).toContain(prompt);
  });
+ it('collapses the Resume button prompt instead of repeating it as a user turn',()=>{
+  const {container}=render(()=><Transcript items={buildTranscript([ev('user_message',{id:'resume',content:resumePrompt})])}/>);
+  expect(container.querySelector('.user')).toBeNull();
+  expect(container.querySelector('details')!.textContent).toContain('Resumed after interruption');
+ });
  it('keeps a deliberate user Resume request as an ordinary message',()=>{
   const {container}=render(()=><Transcript items={buildTranscript([ev('user_message',{id:'user',content:'Your previous turn was interrupted. Please resume.'})])}/>);
   expect(container.querySelector('.user')).not.toBeNull();
  });
+});
+
+it('does not turn uploads quoted in a fork history into thumbnails',()=>{
+ const prompt='Continue the work from this conversation in a fresh native session.\n<fork_context>\n'+JSON.stringify({source_mission_id:'m1',source_title:'Yukon',messages:[{role:'user',content:'see [Uploaded: /tmp/old.png]'}]})+'\n</fork_context>';
+ const {container}=render(()=><Transcript items={[{kind:'user',key:'u',text:prompt}]}/>);
+ expect(container.querySelector('.message-images')).toBeNull();
 });

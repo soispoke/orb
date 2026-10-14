@@ -375,7 +375,7 @@ test("Inbox surfaces Needs You and Ready for Review while keeping working agents
   await page.keyboard.press("e");
   await expect(doneRow).toBeHidden();
   await expect(page.locator('.inbox-row.focused .inbox-row-title-btn')).toBeFocused();
-  await expect(page.locator(".inbox-undo-toast")).toContainText("Fix sidebar scroll thumb");
+  await expect(page.locator(".toast")).toContainText("Fix sidebar scroll thumb");
   await expect.poll(() => statusUpdates.at(-1)).toEqual({
     id: "m-done",
     status: "acknowledged",
@@ -392,7 +392,7 @@ test("Inbox surfaces Needs You and Ready for Review while keeping working agents
   const modelPill = page.locator(".inbox-model-pill");
   await expect(modelPill).toHaveAttribute("aria-label", "Inbox settings (AI · builtin/smart)");
   await modelPill.click();
-  await expect(page.locator(".settings-body h2")).toHaveText("Inbox");
+  await expect(page.locator(".settings-body h2")).toHaveText("Notifications");
   await expect(page.getByLabel("Inbox summary model")).toHaveValue("builtin/smart");
 });
 

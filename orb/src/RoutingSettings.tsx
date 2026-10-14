@@ -1,4 +1,5 @@
 import { Select } from "./Select";
+import { ErrorToast } from "./toast";
 import { RoutingPicker } from "./RoutingPicker";
 import { ProxyApiKeys } from "./ProxyApiKeys";
 import {
@@ -576,7 +577,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
     <div class="s-body settings-body">
       <div class="s-inner routing-page">
         <div class="routing-heading">
-          <h2>Routing</h2>
+          <h2>Models &amp; Routing</h2>
           <Show when={tab() !== "keys"}>
           <button
             class="s-btn"
@@ -665,9 +666,7 @@ export function RoutingSettings(p: { onOpenClient: () => void }) {
                 </article>
               )}
             </For>
-            <Show when={actionError()}>
-              <ErrorNotice error={actionError()} />
-            </Show>
+            <ErrorToast error={actionError()} onDismiss={() => setActionError("")} />
           </section>
           </Show>
           <Show when={tab() === "health"}>

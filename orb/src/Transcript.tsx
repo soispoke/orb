@@ -1,5 +1,6 @@
 import {ElapsedTime} from "./ElapsedTime";
 import {AutomaticReminder, reminderMessages} from "./AutomaticReminder";
+import { ErrorToast } from "./toast";
 import {PromptEditor} from "./PromptEditor";
 import {VirtualTurns} from "./VirtualTurns";
 import type { JSX } from "solid-js";
@@ -19,7 +20,7 @@ import { markdownText, MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
 import { goalDraft, planObjective } from "./goal";
 
-import { messagePresentation, isAutomaticRecovery } from "./messagePresentation";
+import { messagePresentation, isAutomaticRecovery, isResumePrompt } from "./messagePresentation";
 import { computeDiffStats, latestChecklist, parseChecklist, toolArgs, toolName, workKind, workSummary, type DiffStats, type TaskItem } from "./workModel";
 import { visibleTranscript, type StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
@@ -246,7 +247,8 @@ export function UserTurn(p: { text: string; images?: DraftImage[]; source?: stri
   const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
   const images = createMemo(() => messageImages(presentation().text));
-  const thumbnails = createMemo(() => images().paths.length
+  // A fork's history quotes old uploads; those markers are not this turn's images.
+  const thumbnails = createMemo(() => fork() ? [] : images().paths.length
     ? images().paths.map((path,index)=>({path,reference:images().references[index]}))
     : (p.images ?? []).map((image,index)=>({path:image.dataUrl,reference:image.reference ?? index+1})));
   const goal = createMemo(() => goalDraft(images().text));
@@ -282,7 +284,7 @@ export function UserTurn(p: { text: string; images?: DraftImage[]; source?: stri
     });
   };
   return (
-    <Show when={isAutomaticRecovery(p.text)} fallback={
+    <Show when={isAutomaticRecovery(p.text) || isResumePrompt(p.text)} fallback={
     <div ref={bubble} onDblClick={() => { if (!editing()) edit(); }} class={`user ${editing() ? "editing" : ""} ${goal().kind === "goal" ? "goal" : ""} ${plan() !== null ? "plan" : ""} ${p.pending ? "pending" : ""}`}>
       <Show when={thumbnails().length}><div class="message-images"><For each={thumbnails()}>{(image,i)=><MessageImage path={image.path} index={image.reference} onUrl={url=>setImageUrls(prev=>({...prev,[image.path]:url}))} onOpen={()=>setViewing(i())}/>}</For></div></Show>
       <Show when={viewing()!==null}><Lightbox items={thumbnails().map(image=>({src:imageUrls()[image.path]??null,label:`Image #${image.reference}`}))} index={viewing()!} onClose={()=>setViewing(null)}/></Show>
@@ -305,11 +307,11 @@ export function UserTurn(p: { text: string; images?: DraftImage[]; source?: stri
           <span role="status">{copyState()}</span>
           <Show when={p.onSend}><button class="send" aria-label={sending() ? "Sending follow-up" : "Send again"} title="Adds a new message at the end of this conversation (⌘/Ctrl+Enter)" disabled={sending() || !draft().trim()} onClick={() => void submit()}><Ic.ArrowUpIcon size={14}/></button></Show>
         </div>
-        <Show when={sendError()}><ErrorNotice error={sendError()} /></Show>
+        <ErrorToast error={sendError()} title="Couldn’t send your message" onDismiss={() => setSendError("")} />
       </Show>
     </div>
     }><details class="background-wake">
-      <summary><Ic.CmdIcon size={12}/><span>Agent resumed automatically</span></summary>
+      <summary><Ic.CmdIcon size={12}/><span>{isResumePrompt(p.text) ? "Resumed after interruption" : "Agent resumed automatically"}</span></summary>
       <div class="background-wake-body"><p>{p.text}</p></div>
     </details></Show>
   );

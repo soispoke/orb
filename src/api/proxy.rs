@@ -3173,52 +3173,99 @@ pub(crate) async fn chat_completions_inner(
 
         if use_google_oauth_adapter || use_google_api_adapter {
             if is_stream && status.is_success() {
-                let mut response_headers = HeaderMap::new();
-                response_headers.insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static(TEXT_EVENT_STREAM),
-                );
-                response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_CACHE));
+                match peek_google_sse_stream(upstream_resp.bytes_stream()).await {
+                    Ok((peek_buf, rest_stream)) => {
+                        let mut response_headers = HeaderMap::new();
+                        response_headers.insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static(TEXT_EVENT_STREAM),
+                        );
+                        response_headers
+                            .insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_CACHE));
 
-                let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-                let stream_created = chrono::Utc::now().timestamp();
-                let model_id = entry.model_id.clone();
-                let response_stream = transform_google_sse_to_openai(
-                    upstream_resp.bytes_stream(),
-                    stream_id,
-                    stream_created,
-                    model_id,
-                );
+                        let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+                        let stream_created = chrono::Utc::now().timestamp();
+                        let model_id = entry.model_id.clone();
+                        let peek_stream = futures::stream::once(async move {
+                            Ok::<_, reqwest::Error>(bytes::Bytes::from(peek_buf))
+                        });
+                        let combined = peek_stream.chain(rest_stream);
+                        let response_stream = transform_google_sse_to_openai(
+                            combined,
+                            stream_id,
+                            stream_created,
+                            model_id,
+                        );
 
-                let ttft_ms = request_start.elapsed().as_millis() as u64;
-                state
-                    .health_tracker
-                    .record_latency(entry.account_id, ttft_ms)
-                    .await;
-                let account_id = entry.account_id;
-                let health_tracker = state.health_tracker.clone();
-                let tracked_stream = track_stream_health(
-                    response_stream,
-                    health_tracker,
-                    account_id,
-                    None,
-                    entry.subscription_key.clone(),
-                    Some(proxy_usage_sink(state.clone(), proxy_usage_model(entry))),
-                    liveness_mission_id,
-                );
+                        let ttft_ms = request_start.elapsed().as_millis() as u64;
+                        state
+                            .health_tracker
+                            .record_latency(entry.account_id, ttft_ms)
+                            .await;
+                        let account_id = entry.account_id;
+                        let health_tracker = state.health_tracker.clone();
+                        let tracked_stream = track_stream_health(
+                            response_stream,
+                            health_tracker,
+                            account_id,
+                            None,
+                            entry.subscription_key.clone(),
+                            Some(proxy_usage_sink(state.clone(), proxy_usage_model(entry))),
+                            liveness_mission_id,
+                        );
 
-                let success_provider = entry.provider_id.clone();
-                for evt in &mut pending_fallback_events {
-                    if evt.to_provider.is_none() {
-                        evt.to_provider = Some(success_provider.clone());
+                        let success_provider = entry.provider_id.clone();
+                        for evt in &mut pending_fallback_events {
+                            if evt.to_provider.is_none() {
+                                evt.to_provider = Some(success_provider.clone());
+                            }
+                        }
+                        for evt in pending_fallback_events {
+                            state.health_tracker.record_fallback_event(evt).await;
+                        }
+
+                        return (status, response_headers, Body::from_stream(tracked_stream))
+                            .into_response();
+                    }
+                    Err((reason, detail)) => {
+                        let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                        tracing::warn!(
+                            provider = %entry.provider_id,
+                            account_id = %entry.account_id,
+                            model = %entry.model_id,
+                            reason = %reason,
+                            detail = %detail,
+                            "Google SSE stream failed or returned empty completion before first content chunk; trying next entry"
+                        );
+                        let cooldown = state
+                            .health_tracker
+                            .record_entry_failure(entry, reason, None)
+                            .await;
+                        pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                            timestamp: chrono::Utc::now(),
+                            chain_id: chain_id.clone(),
+                            from_provider: entry.provider_id.clone(),
+                            from_model: entry.model_id.clone(),
+                            from_account_id: entry.account_id,
+                            reason,
+                            cooldown_secs: Some(cooldown.as_secs_f64()),
+                            to_provider: None,
+                            latency_ms: Some(elapsed_ms),
+                            attempt_number: (entry_idx + 1) as u32,
+                            chain_length,
+                        });
+                        match reason {
+                            CooldownReason::RateLimit
+                            | CooldownReason::QuotaExhausted
+                            | CooldownReason::Overloaded => rate_limit_count += 1,
+                            CooldownReason::AuthError | CooldownReason::ClientError => {
+                                client_error_count += 1
+                            }
+                            _ => server_error_count += 1,
+                        }
+                        continue;
                     }
                 }
-                for evt in pending_fallback_events {
-                    state.health_tracker.record_fallback_event(evt).await;
-                }
-
-                return (status, response_headers, Body::from_stream(tracked_stream))
-                    .into_response();
             }
 
             let response_headers = upstream_resp.headers().clone();
@@ -3649,182 +3696,100 @@ pub(crate) async fn chat_completions_inner(
         if is_stream && status.is_success() {
             // Extract headers before consuming the response with bytes_stream()
             let upstream_headers = upstream_resp.headers().clone();
-            // Peek at the first SSE data line to detect in-stream errors.
-            // Some providers (e.g. MiniMax) return HTTP 200 but send an error
-            // payload as the first SSE event.
-            let mut byte_stream = Box::pin(upstream_resp.bytes_stream());
-            let mut peek_buf = Vec::new();
-            let mut is_stream_error = false;
+            match peek_openai_sse_stream(upstream_resp.bytes_stream()).await {
+                Ok((peek_buf, byte_stream)) => {
+                    // Record time-to-first-token latency (time until we confirmed a valid stream)
+                    let ttft_ms = request_start.elapsed().as_millis() as u64;
+                    state
+                        .health_tracker
+                        .record_latency(entry.account_id, ttft_ms)
+                        .await;
 
-            // Read enough of the stream to find the first data line
-            let mut peek_failed = false;
-            'peek: while peek_buf.len() < 4096 {
-                match byte_stream.next().await {
-                    Some(Ok(chunk)) => {
-                        peek_buf.extend_from_slice(&chunk);
-                        // Check if we have a complete data line with valid JSON
-                        if let Ok(text) = std::str::from_utf8(&peek_buf) {
-                            for line in text.lines() {
-                                if let Some(json_str) = line.strip_prefix("data: ") {
-                                    // Only break when the JSON parses successfully.
-                                    // A partial JSON (split across chunks) will fail
-                                    // to parse, and we'll keep reading more data.
-                                    if let Ok(v) =
-                                        serde_json::from_str::<serde_json::Value>(json_str)
-                                    {
-                                        if v.get("type").and_then(|t| t.as_str()) == Some("error")
-                                            || v.get("error").is_some()
-                                        {
-                                            is_stream_error = true;
-                                        }
-                                        break 'peek;
-                                    }
-                                }
-                            }
+                    // Set to_provider on any pending fallback events from this request
+                    let success_provider = entry.provider_id.clone();
+                    for evt in &mut pending_fallback_events {
+                        if evt.to_provider.is_none() {
+                            evt.to_provider = Some(success_provider.clone());
                         }
                     }
-                    Some(Err(e)) => {
-                        tracing::warn!(
-                            provider = %entry.provider_id,
-                            account_id = %entry.account_id,
-                            error = %e,
-                            "Stream peek failed (network error), trying next entry"
-                        );
-                        peek_failed = true;
-                        break;
+                    for evt in pending_fallback_events {
+                        state.health_tracker.record_fallback_event(evt).await;
                     }
-                    None => {
-                        tracing::warn!(
-                            provider = %entry.provider_id,
-                            account_id = %entry.account_id,
-                            "Stream ended before first data chunk, trying next entry"
-                        );
-                        peek_failed = true;
-                        break;
+
+                    // Don't record success yet — defer until the stream finishes
+                    // so that mid-stream failures don't incorrectly clear cooldown.
+                    let account_id = entry.account_id;
+                    let health_tracker = state.health_tracker.clone();
+
+                    // Extract rate-limit snapshot to record after stream completes
+                    let rate_limit_snapshot =
+                        extract_rate_limit_snapshot(&upstream_headers, provider_type);
+
+                    let mut response_headers = HeaderMap::new();
+                    response_headers
+                        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+                    response_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+
+                    // Prepend the peeked bytes, then stream the rest
+                    let peek_stream = futures::stream::once(async {
+                        Ok::<_, reqwest::Error>(bytes::Bytes::from(peek_buf))
+                    });
+                    let combined = peek_stream.chain(byte_stream);
+                    let byte_stream = normalize_sse_stream(combined, strip_thinking);
+
+                    // Wrap the stream to record success/failure on completion.
+                    let tracked_stream = track_stream_health(
+                        byte_stream,
+                        health_tracker,
+                        account_id,
+                        rate_limit_snapshot,
+                        entry.subscription_key.clone(),
+                        Some(proxy_usage_sink(state.clone(), proxy_usage_model(entry))),
+                        liveness_mission_id,
+                    );
+
+                    return (status, response_headers, Body::from_stream(tracked_stream))
+                        .into_response();
+                }
+                Err((reason, detail)) => {
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        model = %entry.model_id,
+                        reason = %reason,
+                        detail = %detail,
+                        "OpenAI SSE stream failed or returned empty completion before first content chunk; trying next entry"
+                    );
+                    let cooldown = state
+                        .health_tracker
+                        .record_entry_failure(entry, reason, None)
+                        .await;
+                    pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                        timestamp: chrono::Utc::now(),
+                        chain_id: chain_id.clone(),
+                        from_provider: entry.provider_id.clone(),
+                        from_model: entry.model_id.clone(),
+                        from_account_id: entry.account_id,
+                        reason,
+                        cooldown_secs: Some(cooldown.as_secs_f64()),
+                        to_provider: None,
+                        latency_ms: Some(elapsed_ms),
+                        attempt_number: (entry_idx + 1) as u32,
+                        chain_length,
+                    });
+                    match reason {
+                        CooldownReason::RateLimit
+                        | CooldownReason::QuotaExhausted
+                        | CooldownReason::Overloaded => rate_limit_count += 1,
+                        CooldownReason::AuthError | CooldownReason::ClientError => {
+                            client_error_count += 1
+                        }
+                        _ => server_error_count += 1,
                     }
+                    continue;
                 }
             }
-
-            if peek_failed {
-                let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                let cooldown = state
-                    .health_tracker
-                    .record_entry_failure(entry, CooldownReason::ServerError, None)
-                    .await;
-                pending_fallback_events.push(crate::provider_health::FallbackEvent {
-                    timestamp: chrono::Utc::now(),
-                    chain_id: chain_id.clone(),
-                    from_provider: entry.provider_id.clone(),
-                    from_model: entry.model_id.clone(),
-                    from_account_id: entry.account_id,
-                    reason: CooldownReason::ServerError,
-                    cooldown_secs: Some(cooldown.as_secs_f64()),
-                    to_provider: None,
-                    latency_ms: Some(elapsed_ms),
-                    attempt_number: (entry_idx + 1) as u32,
-                    chain_length,
-                });
-                server_error_count += 1;
-                continue;
-            }
-
-            if is_stream_error {
-                let elapsed_ms = request_start.elapsed().as_millis() as u64;
-                // Parse the peeked data to classify the error type.
-                let reason = std::str::from_utf8(&peek_buf)
-                    .ok()
-                    .and_then(|text| {
-                        text.lines()
-                            .find_map(|line| line.strip_prefix("data: "))
-                            .and_then(|json_str| {
-                                serde_json::from_str::<serde_json::Value>(json_str).ok()
-                            })
-                    })
-                    .map(|v| classify_embedded_error(&v))
-                    .unwrap_or(CooldownReason::ServerError);
-                tracing::warn!(
-                    provider = %entry.provider_id,
-                    account_id = %entry.account_id,
-                    model = %entry.model_id,
-                    reason = %reason,
-                    "Upstream returned in-stream error, trying next entry"
-                );
-                let cooldown = state
-                    .health_tracker
-                    .record_entry_failure(entry, reason, None)
-                    .await;
-                pending_fallback_events.push(crate::provider_health::FallbackEvent {
-                    timestamp: chrono::Utc::now(),
-                    chain_id: chain_id.clone(),
-                    from_provider: entry.provider_id.clone(),
-                    from_model: entry.model_id.clone(),
-                    from_account_id: entry.account_id,
-                    reason,
-                    cooldown_secs: Some(cooldown.as_secs_f64()),
-                    to_provider: None,
-                    latency_ms: Some(elapsed_ms),
-                    attempt_number: (entry_idx + 1) as u32,
-                    chain_length,
-                });
-                match reason {
-                    CooldownReason::RateLimit
-                    | CooldownReason::QuotaExhausted
-                    | CooldownReason::Overloaded => rate_limit_count += 1,
-                    CooldownReason::AuthError => client_error_count += 1,
-                    _ => server_error_count += 1,
-                }
-                continue;
-            }
-
-            // Record time-to-first-token latency (time until we confirmed a valid stream)
-            let ttft_ms = request_start.elapsed().as_millis() as u64;
-            state
-                .health_tracker
-                .record_latency(entry.account_id, ttft_ms)
-                .await;
-
-            // Set to_provider on any pending fallback events from this request
-            let success_provider = entry.provider_id.clone();
-            for evt in &mut pending_fallback_events {
-                if evt.to_provider.is_none() {
-                    evt.to_provider = Some(success_provider.clone());
-                }
-            }
-            for evt in pending_fallback_events {
-                state.health_tracker.record_fallback_event(evt).await;
-            }
-
-            // Don't record success yet — defer until the stream finishes
-            // so that mid-stream failures don't incorrectly clear cooldown.
-            let account_id = entry.account_id;
-            let health_tracker = state.health_tracker.clone();
-
-            // Extract rate-limit snapshot to record after stream completes
-            let rate_limit_snapshot = extract_rate_limit_snapshot(&upstream_headers, provider_type);
-
-            let mut response_headers = HeaderMap::new();
-            response_headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
-            response_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
-
-            // Prepend the peeked bytes, then stream the rest
-            let peek_stream = futures::stream::once(async {
-                Ok::<_, reqwest::Error>(bytes::Bytes::from(peek_buf))
-            });
-            let combined = peek_stream.chain(byte_stream);
-            let byte_stream = normalize_sse_stream(combined, strip_thinking);
-
-            // Wrap the stream to record success/failure on completion.
-            let tracked_stream = track_stream_health(
-                byte_stream,
-                health_tracker,
-                account_id,
-                rate_limit_snapshot,
-                entry.subscription_key.clone(),
-                Some(proxy_usage_sink(state.clone(), proxy_usage_model(entry))),
-                liveness_mission_id,
-            );
-
-            return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
         }
 
         // Non-streaming: read full body before recording success, so a
@@ -7001,13 +6966,23 @@ fn translate_google_json_to_openai(
             }
         }
     }
-    let finish_reason = finish_reason_from_google(
-        candidate
-            .get("finishReason")
-            .and_then(|v| v.as_str())
-            .or(Some("STOP")),
-    );
+    let finish_reason_raw = candidate.get("finishReason").and_then(|v| v.as_str());
+    let finish_reason = finish_reason_from_google(finish_reason_raw.or(Some("STOP")));
     let has_tool_calls = !tool_calls.is_empty();
+    if content.is_empty() && !has_tool_calls {
+        let detail = finish_reason_raw
+            .or_else(|| {
+                response
+                    .get("promptFeedback")
+                    .and_then(|pf| pf.get("blockReason"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("empty_parts");
+        return Err(format!(
+            "Google response contained no text or tool calls ({})",
+            detail
+        ));
+    }
 
     let prompt_tokens = response
         .get("usageMetadata")
@@ -7061,6 +7036,233 @@ fn translate_google_json_to_openai(
     Ok((bytes, Some((prompt_tokens, completion_tokens))))
 }
 
+fn google_sse_payload_has_output(resp: &serde_json::Value) -> bool {
+    resp.get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| !t.is_empty())
+                    || part.get("functionCall").is_some()
+            })
+        })
+}
+
+async fn peek_google_sse_stream<S, E>(
+    inner: S,
+) -> Result<(Vec<u8>, std::pin::Pin<Box<S>>), (CooldownReason, String)>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    let mut stream = Box::pin(inner);
+    let mut peek_buf = Vec::<u8>::new();
+    let mut scanned = 0usize;
+    let mut last_empty_reason: Option<String> = None;
+
+    const MAX_PEEK_BYTES: usize = 64 * 1024;
+    while peek_buf.len() < MAX_PEEK_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                peek_buf.extend_from_slice(&chunk);
+                while let Some(rel) = peek_buf[scanned..].iter().position(|&b| b == b'\n') {
+                    let line_end = scanned + rel;
+                    let line = &peek_buf[scanned..=line_end];
+                    scanned = line_end + 1;
+                    let trimmed = line
+                        .strip_suffix(b"\r\n")
+                        .or_else(|| line.strip_suffix(b"\n"))
+                        .unwrap_or(line);
+                    let Some(payload) = trimmed.strip_prefix(b"data: ") else {
+                        continue;
+                    };
+                    if payload == b"[DONE]" {
+                        return Err((
+                            CooldownReason::ServerError,
+                            last_empty_reason
+                                .unwrap_or_else(|| "DONE before any candidate output".to_string()),
+                        ));
+                    }
+                    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(payload) else {
+                        continue;
+                    };
+                    if parsed.get("error").is_some() {
+                        let reason = classify_google_error_reason(payload)
+                            .unwrap_or_else(|| classify_embedded_error(&parsed));
+                        let msg = parsed
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("google sse error")
+                            .to_string();
+                        return Err((reason, msg));
+                    }
+                    let resp = parsed.get("response").unwrap_or(&parsed);
+                    if let Some(block_reason) = resp
+                        .get("promptFeedback")
+                        .and_then(|pf| pf.get("blockReason"))
+                        .and_then(|v| v.as_str())
+                    {
+                        return Err((
+                            CooldownReason::ServerError,
+                            format!("promptFeedback.blockReason={}", block_reason),
+                        ));
+                    }
+                    if google_sse_payload_has_output(resp) {
+                        return Ok((peek_buf, stream));
+                    }
+                    if let Some(fr) = resp
+                        .get("candidates")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|c| c.get("finishReason"))
+                        .and_then(|v| v.as_str())
+                    {
+                        last_empty_reason = Some(format!("empty candidate finishReason={}", fr));
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                return Err((
+                    CooldownReason::ServerError,
+                    format!("stream read error: {}", e),
+                ));
+            }
+            None => {
+                return Err((
+                    CooldownReason::ServerError,
+                    last_empty_reason.unwrap_or_else(|| {
+                        "stream closed with zero text or tool parts".to_string()
+                    }),
+                ));
+            }
+        }
+    }
+    Ok((peek_buf, stream))
+}
+
+fn openai_sse_payload_has_output(parsed: &serde_json::Value) -> bool {
+    parsed
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                let Some(delta) = choice.get("delta") else {
+                    return false;
+                };
+                delta
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| !t.is_empty())
+                    || delta
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| !t.is_empty())
+                    || delta
+                        .get("reasoning")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| !t.is_empty())
+                    || delta
+                        .get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| !arr.is_empty())
+                    || delta.get("function_call").is_some_and(|v| !v.is_null())
+                    || delta.get("audio").is_some_and(|v| !v.is_null())
+            })
+        })
+}
+
+async fn peek_openai_sse_stream<S, E>(
+    inner: S,
+) -> Result<(Vec<u8>, std::pin::Pin<Box<S>>), (CooldownReason, String)>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    let mut stream = Box::pin(inner);
+    let mut peek_buf = Vec::<u8>::new();
+    let mut scanned = 0usize;
+    let mut last_empty_reason: Option<String> = None;
+
+    const MAX_PEEK_BYTES: usize = 64 * 1024;
+    while peek_buf.len() < MAX_PEEK_BYTES {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                peek_buf.extend_from_slice(&chunk);
+                while let Some(rel) = peek_buf[scanned..].iter().position(|&b| b == b'\n') {
+                    let line_end = scanned + rel;
+                    let line = &peek_buf[scanned..=line_end];
+                    scanned = line_end + 1;
+                    let trimmed = line
+                        .strip_suffix(b"\r\n")
+                        .or_else(|| line.strip_suffix(b"\n"))
+                        .unwrap_or(line);
+                    let Some(payload) = trimmed.strip_prefix(b"data: ") else {
+                        continue;
+                    };
+                    let payload_trimmed = std::str::from_utf8(payload)
+                        .map(|s| s.trim().as_bytes())
+                        .unwrap_or(payload);
+                    if payload_trimmed == b"[DONE]" {
+                        return Err((
+                            CooldownReason::ServerError,
+                            last_empty_reason
+                                .unwrap_or_else(|| "DONE before any output delta".to_string()),
+                        ));
+                    }
+                    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(payload_trimmed)
+                    else {
+                        continue;
+                    };
+                    if parsed.get("type").and_then(|t| t.as_str()) == Some("error")
+                        || parsed.get("error").is_some()
+                    {
+                        let reason = classify_embedded_error(&parsed);
+                        let msg = parsed
+                            .get("error")
+                            .and_then(|e| e.get("message").or(Some(e)))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("openai sse error")
+                            .to_string();
+                        return Err((reason, msg));
+                    }
+                    if openai_sse_payload_has_output(&parsed) {
+                        return Ok((peek_buf, stream));
+                    }
+                    if let Some(fr) = parsed
+                        .get("choices")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|c| c.get("finish_reason"))
+                        .and_then(|v| v.as_str())
+                    {
+                        last_empty_reason = Some(format!("empty choice finish_reason={}", fr));
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                return Err((
+                    CooldownReason::ServerError,
+                    format!("stream read error: {}", e),
+                ));
+            }
+            None => {
+                return Err((
+                    CooldownReason::ServerError,
+                    last_empty_reason
+                        .unwrap_or_else(|| "stream closed with zero output deltas".to_string()),
+                ));
+            }
+        }
+    }
+    Ok((peek_buf, stream))
+}
+
 fn transform_google_sse_to_openai(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     stream_id: String,
@@ -7073,6 +7275,7 @@ fn transform_google_sse_to_openai(
             Vec::<u8>::new(),
             false,  // sent role chunk
             false,  // emitted terminal chunk
+            false,  // emitted any text/thought/tool content
             0usize, // next tool call index across the entire SSE stream
             stream_id,
             model_id,
@@ -7084,6 +7287,7 @@ fn transform_google_sse_to_openai(
             mut buf,
             mut sent_role,
             mut emitted_done,
+            mut has_output,
             mut next_tool_idx,
             stream_id,
             model_id,
@@ -7111,6 +7315,7 @@ fn transform_google_sse_to_openai(
                                     buf,
                                     sent_role,
                                     emitted_done,
+                                    has_output,
                                     next_tool_idx,
                                     stream_id,
                                     model_id,
@@ -7125,6 +7330,36 @@ fn transform_google_sse_to_openai(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    if let Some(err_obj) = parsed.get("error") {
+                        let chunk = serde_json::json!({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }],
+                            "error": err_obj,
+                        });
+                        let mut out = format!("data: {}\n\n", chunk);
+                        if !emitted_done {
+                            out.push_str("data: [DONE]\n\n");
+                            emitted_done = true;
+                        }
+                        return Some((
+                            Ok(bytes::Bytes::from(out)),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                emitted_done,
+                                has_output,
+                                next_tool_idx,
+                                stream_id,
+                                model_id,
+                                created,
+                                usage_seen,
+                            ),
+                        ));
+                    }
                     let resp = parsed.get("response").unwrap_or(&parsed);
                     // Gemini reports usageMetadata on (at least) the final
                     // chunk; remember the latest so the finish chunk can carry
@@ -7173,6 +7408,7 @@ fn transform_google_sse_to_openai(
                         for part in parts {
                             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
+                                    has_output = true;
                                     let is_thought = part
                                         .get("thought")
                                         .and_then(|v| v.as_bool())
@@ -7193,6 +7429,7 @@ fn transform_google_sse_to_openai(
                                 }
                             }
                             if let Some(fc) = part.get("functionCall") {
+                                has_output = true;
                                 let tool_idx = next_tool_idx;
                                 next_tool_idx += 1;
                                 let name =
@@ -7230,6 +7467,8 @@ fn transform_google_sse_to_openai(
                         let mut finish_reason = finish_reason_from_google(Some(fr)).to_string();
                         if next_tool_idx > 0 && finish_reason == "stop" {
                             finish_reason = "tool_calls".to_string();
+                        } else if !has_output && finish_reason == "stop" {
+                            finish_reason = "error".to_string();
                         }
                         let mut finish_chunk = serde_json::json!({
                             "id": stream_id,
@@ -7242,6 +7481,12 @@ fn transform_google_sse_to_openai(
                                 "finish_reason": finish_reason,
                             }],
                         });
+                        if finish_reason == "error" {
+                            finish_chunk["error"] = serde_json::json!({
+                                "message": format!("Google stream finished with no output (finishReason={})", fr),
+                                "type": "upstream_empty_response"
+                            });
+                        }
                         if let Some((prompt, completion)) = usage_seen {
                             finish_chunk["usage"] = serde_json::json!({
                                 "prompt_tokens": prompt,
@@ -7265,6 +7510,7 @@ fn transform_google_sse_to_openai(
                             buf,
                             sent_role,
                             emitted_done,
+                            has_output,
                             next_tool_idx,
                             stream_id,
                             model_id,
@@ -7284,6 +7530,7 @@ fn transform_google_sse_to_openai(
                                 buf,
                                 sent_role,
                                 emitted_done,
+                                has_output,
                                 next_tool_idx,
                                 stream_id,
                                 model_id,
@@ -7293,6 +7540,10 @@ fn transform_google_sse_to_openai(
                         ));
                     }
                     None => {
+                        if !buf.is_empty() && !buf.ends_with(b"\n") {
+                            buf.push(b'\n');
+                            continue;
+                        }
                         if emitted_done {
                             return None;
                         }
@@ -7303,6 +7554,7 @@ fn transform_google_sse_to_openai(
                                 buf,
                                 sent_role,
                                 true,
+                                has_output,
                                 next_tool_idx,
                                 stream_id,
                                 model_id,
@@ -9649,6 +9901,98 @@ mod tests {
                 .as_deref(),
             Some("builtin/smart")
         );
+    }
+
+    #[tokio::test]
+    async fn peek_google_sse_rejects_empty_candidate_completion() {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"candidates\":[{\"content\":{\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":59184,\"totalTokenCount\":59184}}\n\n",
+            )),
+        ];
+        let res = peek_google_sse_stream(futures::stream::iter(chunks)).await;
+        let (reason, detail) = match res {
+            Ok(_) => panic!("empty Google SSE completion should fail peek"),
+            Err(err) => err,
+        };
+        assert!(matches!(reason, CooldownReason::ServerError));
+        assert!(detail.contains("empty candidate finishReason=STOP"));
+    }
+
+    #[tokio::test]
+    async fn peek_google_sse_accepts_stream_once_first_text_part_arrives() {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"usageMetadata\":{\"promptTokenCount\":120}}\n\n",
+            )),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n",
+            )),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+            )),
+        ];
+        let (peek_buf, rest) = peek_google_sse_stream(futures::stream::iter(chunks))
+            .await
+            .expect("stream with text part should pass peek");
+        assert!(std::str::from_utf8(&peek_buf).unwrap().contains("Hello"));
+        let remaining: Vec<_> = rest.collect().await;
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn google_json_translation_rejects_empty_candidate_without_text_or_tools() {
+        let body = serde_json::json!({
+            "candidates": [{"content": {"role": "model"}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 59184, "totalTokenCount": 59184}
+        });
+        let err = translate_google_json_to_openai(
+            &serde_json::to_vec(&body).unwrap(),
+            "gemini-4-argon-eap",
+            0,
+        )
+        .expect_err("empty candidate should be rejected");
+        assert!(err.contains("no text or tool calls"));
+    }
+
+    #[tokio::test]
+    async fn peek_openai_sse_rejects_role_only_stop_completion() {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":59184,\"completion_tokens\":0,\"total_tokens\":59184}}\n\ndata: [DONE]\n\n",
+            )),
+        ];
+        let res = peek_openai_sse_stream(futures::stream::iter(chunks)).await;
+        let (reason, detail) = match res {
+            Ok(_) => panic!("role-only OpenAI SSE completion should fail peek"),
+            Err(err) => err,
+        };
+        assert!(matches!(reason, CooldownReason::ServerError));
+        assert!(detail.contains("empty choice finish_reason=stop"));
+    }
+
+    #[tokio::test]
+    async fn peek_openai_sse_accepts_stream_once_content_or_tool_arrives() {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                b"data: [DONE]\n\n",
+            )),
+        ];
+        let (peek_buf, rest) = peek_openai_sse_stream(futures::stream::iter(chunks))
+            .await
+            .expect("stream with content delta should pass peek");
+        assert!(std::str::from_utf8(&peek_buf).unwrap().contains("Hello"));
+        let remaining: Vec<_> = rest.collect().await;
+        assert_eq!(remaining.len(), 1);
     }
 }
 

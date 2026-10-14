@@ -3,14 +3,12 @@ import XCTest
 
 @MainActor
 final class OrbSettingsTests: XCTestCase {
-    func testSSHAddressValidationAndRevision() throws {
-        var address = OrbSSHAddress(id: "node", revision: 3, name: "Spark", host: "spark.local", user: "thomas", port: 22, note: "GPU")
-        XCTAssertTrue(address.valid)
-        XCTAssertEqual(address.body["revision"], .number(3))
-        address.port = 65536; XCTAssertFalse(address.valid)
-        address.port = 22; address.host = "host; command"; XCTAssertFalse(address.valid)
-        address.host = "2001:db8::1"; XCTAssertTrue(address.valid)
-        address.user = "-oProxyCommand"; XCTAssertFalse(address.valid)
+    /// Core trims messages, so a keyboard's trailing space must not leave the
+    /// optimistic bubble next to the stored copy.
+    func testOptimisticMessageMatchesTrimmedCoreCopy() {
+        XCTAssertTrue(OrbConversation.sameMessage("Vas y ", "Vas y"))
+        XCTAssertTrue(OrbConversation.sameMessage("\nVas y\n", "Vas y"))
+        XCTAssertFalse(OrbConversation.sameMessage("Vas y", "Vas-y"))
     }
     func testQuotaUnitsAndRemainingPercent() {
         let values: OrbJSON = .object(["unified_5h_utilization": .number(0.4), "codex_primary_used_percent": .number(20), "minimax_weekly_remaining_percent": .number(70)])
