@@ -90,6 +90,9 @@ export function storedToStream(ev: StoredEvent): StreamEvent | null {
       }
       return d({ bubble_id: ev.metadata?.bubble_id, ops });
     }
+    case "subagent_update": {
+      try { return d({agent: JSON.parse(ev.content)}); } catch { return null; }
+    }
     case "tool_call": {
       let args: unknown = null;
       try {

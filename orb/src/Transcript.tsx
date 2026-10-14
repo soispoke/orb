@@ -592,7 +592,7 @@ export function Transcript(p: { prepareSearch?:(signal:AbortSignal)=>Promise<voi
   const disclosures=new Map<string,boolean>();
   const reminders = createMemo(() => reminderMessages(p.items));
   const checklist = createMemo(() => latestChecklist(p.items));
-  const groups = createMemo<Grouped[]>((previous) => groupWork(p.items.filter(item => item.kind !== "user" || !item.queued), previous), []);
+  const groups = createMemo<Grouped[]>((previous) => groupWork(p.items.filter(item => item.kind !== "subagent" && (item.kind !== "user" || !item.queued)), previous), []);
   /** Key of the last user turn, when nothing follows it yet. Compared by key
    * rather than identity: `reconcile` hands the loop store proxies, not the
    * original objects. */

@@ -4,6 +4,7 @@ import { isGeneratedRemoteJobStatus, type StreamEvent } from "./stream";
 
 export type StreamItem =
   | { kind: "user"; key: string; text: string; images?: DraftImage[]; messageId?: string; source?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
+  | { kind: "subagent"; key: string; text: string; agent: import("./Subagents").Subagent }
   | { kind: "think"; key: string; text: string; done: boolean }
   | { kind: "text"; key: string; text: string; live: boolean }
   | { kind: "error"; key: string; text: string; terminal?: boolean; cancelled?: boolean }
@@ -128,6 +129,14 @@ export class TranscriptReducer {
     }
     const last = this.items.at(-1);
     switch (ev.type) {
+      case "subagent_update": {
+        const agent = d.agent as import("./Subagents").Subagent;
+        if (!agent || typeof agent.id !== "string" || typeof agent.description !== "string") break;
+        const index = this.items.findIndex(i => i.kind === "subagent" && i.agent.id === agent.id);
+        const item: StreamItem = {kind: "subagent", key: `subagent:${agent.id}`, text: agent.description, agent};
+        if (index < 0) this.items.push(item); else this.put(index, item);
+        break;
+      }
       case "text_delta":
       case "text_op": {
         let index = this.bubbles.get(bubble);

@@ -18548,6 +18548,7 @@ const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
     "assistant_message_canonical",
 ];
 const TRACE_EVENT_TYPES: &[&str] = &[
+    "subagent_update",
     "thinking",
     "tool_call",
     "tool_result",
@@ -18558,6 +18559,7 @@ const TRACE_EVENT_TYPES: &[&str] = &[
     "status",
 ];
 const HISTORY_EVENT_TYPES: &[&str] = &[
+    "subagent_update",
     "user_message",
     "assistant_message",
     "assistant_message_canonical",
@@ -20005,6 +20007,10 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 summary: None,
             })
         }
+        "subagent_update" => Some(AgentEvent::SubagentUpdate {
+            agent: serde_json::from_str(&event.content).ok()?,
+            mission_id,
+        }),
         "agent_phase" | "phase" => Some(AgentEvent::AgentPhase {
             phase: event.content.clone(),
             detail: event
@@ -29833,6 +29839,7 @@ async fn control_actor_loop(
                                 AgentEvent::Error { mission_id, .. } => *mission_id,
                                 AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
                                 AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
+                                AgentEvent::SubagentUpdate { mission_id, .. } => *mission_id,
                                 AgentEvent::AgentTree { mission_id, .. } => *mission_id,
                                 AgentEvent::Progress { mission_id, .. } => *mission_id,
                                 AgentEvent::MissionActivity { mission_id, .. } => *mission_id,

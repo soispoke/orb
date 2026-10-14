@@ -1873,6 +1873,7 @@ pub fn run_claudecode_turn<'a>(
         let mut midturn_messages = (stream_input && !native_plan)
             .then(|| super::live_session::midturn_messages(mission_id));
         let mut background = super::live_session::ClaudeBackground::default();
+        let mut subagents = super::subagents::ClaudeSubagents::default();
         let mut parked = false;
         let mut parked_slot: Option<tokio::sync::oneshot::Receiver<String>> = None;
         // A message that reached the slot just as the CLI woke itself: it is
@@ -2375,6 +2376,12 @@ pub fn run_claudecode_turn<'a>(
 
                                 continue;
                             }
+                        }
+                    }
+
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        for agent in subagents.consume(&event) {
+                            let _ = events_tx.send(AgentEvent::SubagentUpdate { agent, mission_id: Some(mission_id) });
                         }
                     }
 

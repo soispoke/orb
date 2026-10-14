@@ -5546,6 +5546,14 @@ impl MissionStore for SqliteMissionStore {
                 objective.clone(),
                 serde_json::json!({ "status": status }),
             ),
+            AgentEvent::SubagentUpdate { agent, .. } => (
+                "subagent_update",
+                None,
+                None,
+                None,
+                serde_json::to_string(agent).map_err(|e| e.to_string())?,
+                serde_json::json!({}),
+            ),
             // Skip events that are less important for debugging
             AgentEvent::Status { .. }
             | AgentEvent::AgentPhase { .. }
