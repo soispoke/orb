@@ -62,7 +62,7 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
   }
   return [...rows.values()];
 }
-const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', unknown:'Status unavailable'};
+const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', unknown:'Status unconfirmed'};
 
 function WorkflowActivity(p: {path: string; mission: string; workspace: string; active: boolean}) {
   const [activity, setActivity] = createSignal<ReturnType<typeof parseWorkflowTranscript>>();
@@ -214,7 +214,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
           </button>
           <div hidden={!open()} class="subagent-details">
             <Show when={agent().prompt}><div class="subagent-detail-label">Task</div><pre>{agent().prompt}</pre></Show>
-            <div class="subagent-detail-label">{status(agent()) === 'running' ? 'Latest activity' : 'Result'}</div>
+            <div class="subagent-detail-label">{['running', 'unknown', 'waiting'].includes(status(agent())) ? 'Latest recorded activity' : 'Result'}</div>
             <Show when={agent().transcriptPath && p.missionId && p.workspaceId} fallback={<pre>{agent().detail || (status(agent()) === 'running' ? 'No activity details received yet.' : 'No additional result was reported.')}</pre>}>
               <WorkflowActivity path={agent().transcriptPath!} mission={p.missionId!} workspace={p.workspaceId!} active={open() && expanded()} />
               <Show when={agent().detail && status(agent()) !== 'running'}><pre>{agent().detail}</pre></Show>

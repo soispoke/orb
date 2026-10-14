@@ -22,13 +22,21 @@ export function parseWorkflowJournal(content: string, journal: string): Subagent
     if (!event || typeof event.agentId !== 'string') continue;
     const id = `${journal}:${event.agentId}`;
     const old = rows.get(id);
+    // A durable start receipt proves a launch, not that its process still exists.
+    // Workflow journals have no heartbeat or runner identity; do not resurrect
+    // historical children as Working after a disconnect or server restart.
     if (event.type === 'started' && !old) rows.set(id, {
       id, description: typeof event.label === 'string' ? event.label : 'Workflow agent',
-      phase: typeof event.phase === 'string' ? event.phase : undefined, status: 'running',
+      phase: typeof event.phase === 'string' ? event.phase : undefined, status: 'unknown',
+      detail: 'A start was recorded, but this workflow does not report live status. Its current state is unconfirmed.',
       transcriptPath: /^[a-zA-Z0-9_-]+$/.test(event.agentId) ? journal.replace(/journal\.jsonl$/, `agent-${event.agentId}.jsonl`) : undefined,
     });
-    if (event.type === 'result' && old) rows.set(id, {...old, status: 'completed', detail: JSON.stringify(event.result, null, 2)});
-    // Other journal types are deliberately not guessed to mean success.
+    // Terminal receipts are authoritative. A replayed start or contradictory
+    // later receipt must not turn a finished child back into a working child.
+    if (old && old.status === 'unknown' && event.type === 'result')
+      rows.set(id, {...old, status: 'completed', detail: JSON.stringify(event.result, null, 2)});
+    if (old && old.status === 'unknown' && event.type === 'failed')
+      rows.set(id, {...old, status: 'failed', detail: 'The workflow recorded an agent failure.'});
   }
   return [...rows.values()];
 }

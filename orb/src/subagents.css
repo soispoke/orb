@@ -13,7 +13,7 @@
 .subagent-status { flex-shrink: 0; }
 .subagent-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--fg-3); opacity: .55; transition: background-color 180ms ease, opacity 180ms ease; }
 .subagent[data-state=running] .subagent-dot { background: #269dff; opacity: 1; box-shadow: 0 0 0 3px #269dff26, 0 0 10px #269dff99; }
-.subagent[data-state=waiting] .subagent-dot, .subagent[data-state=unknown] .subagent-dot { background: #ffbb32; opacity: 1; box-shadow: 0 0 7px #ffbb3266; }
+.subagent[data-state=waiting] .subagent-dot { background: #ffbb32; opacity: 1; box-shadow: 0 0 7px #ffbb3266; }
 .subagent[data-state=failed] .subagent-dot { background: #ff5268; opacity: 1; box-shadow: 0 0 7px #ff526866; }
 .subagent[data-state=failed] .subagent-status { color: var(--danger, #d57979); }
 .subagent-details { margin: 0 12px 10px 29px; padding-left: 12px; border-left: 1px solid var(--stroke); }
@@ -32,3 +32,6 @@
 .subagent-metrics:empty { display:none; }
 .subagent[data-state=running] .subagent-status { color:#269dff; }
 .subagent[data-state=completed] .subagent-dot, .subagent[data-state=finished] .subagent-dot { background:#8a8a92; box-shadow:none; }
+
+/* Unconfirmed history is neutral; reserve the bright blue dot for reported live work. */
+.subagent[data-state=unknown] .subagent-dot { background:#8a8a92; box-shadow:none; }
