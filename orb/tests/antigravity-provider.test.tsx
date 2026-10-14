@@ -26,7 +26,7 @@ it("clears account models when refreshed discovery fails",async()=>{
  await waitFor(()=>expect(ui.getByText("Gemini 4 Argon")).toBeTruthy());
  discovery.mockRejectedValueOnce(new Error("unavailable"));
  fireEvent.click(ui.getByRole("button",{name:"Refresh machines"}));
- await waitFor(()=>expect(ui.getByText("Machine unavailable")).toBeTruthy());
+ await waitFor(()=>expect(ui.getByText("Native runner not ready")).toBeTruthy());
  expect(ui.queryByText("Gemini 4 Argon")).toBeNull();
 });
 it("ignores a late response from the previous machine",async()=>{
@@ -72,4 +72,13 @@ it("shows machine controls immediately without a second expandable card", async 
  expect(ui.getByLabelText("Antigravity machine")).toBeTruthy();
  expect(ui.queryByRole("button",{name:/Execution machines/})).toBeNull();
  expect(ui.getByText(/separate from the subscription/)).toBeTruthy();
+});
+
+it("explains native setup failures without marking the machine offline", async () => {
+ vi.spyOn(api,"getRemoteNodes").mockResolvedValue({enabled:true,nodes:[]});
+ vi.spyOn(api,"listNodeAntigravityModels").mockRejectedValue(new Error("Sign in with agy inside the selected workspace"));
+ const ui=render(()=><AntigravityProvider/>);
+ await waitFor(()=>expect(ui.getByText(/Sign in with agy/)).toBeTruthy());
+ expect(ui.getByText("Native runner not ready")).toBeTruthy();
+ expect(ui.queryByText("Machine unavailable")).toBeNull();
 });

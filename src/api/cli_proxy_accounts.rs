@@ -367,6 +367,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_keeps_usage_credentials_scoped_to_each_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AIProviderStore::new(dir.path().join("providers.json")).await;
+        for (email, token, expiry) in [
+            ("first@example.com", "first-token", "2098-01-01T00:00:00Z"),
+            ("second@example.com", "second-token", "2099-01-01T00:00:00Z"),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("claude-{email}.json")),
+                serde_json::json!({"type":"claude", "email":email,
+                    "access_token":token, "refresh_token":"refresh", "expired":expiry})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        reconcile_from(&store, dir.path()).await;
+        let rows = store.list().await;
+        assert_eq!(rows.len(), 2);
+        for (email, token) in [
+            ("first@example.com", "first-token"),
+            ("second@example.com", "second-token"),
+        ] {
+            let row = rows
+                .iter()
+                .find(|p| p.account_email.as_deref() == Some(email))
+                .unwrap();
+            assert_eq!(row.oauth.as_ref().unwrap().access_token, token);
+        }
+    }
+
+    #[tokio::test]
     async fn reconnect_preserves_identity_settings_and_independent_api_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = AIProviderStore::new(dir.path().join("providers.json")).await;
