@@ -45,3 +45,17 @@ it("cancels a pending debounced draft save when a message is sent quickly so rem
   }
 });
 
+
+it("ignores held Enter so it cannot send a draft repeatedly or dispatch the queue", async () => {
+  vi.mocked(readComposerDraft).mockResolvedValue(undefined);
+  const send=vi.fn().mockResolvedValue(true), empty=vi.fn();
+  render(()=><Composer scope="m:repeat" placeholder="Reply" busy={false} onSend={send} onEmptySubmit={empty}/>);
+  const input=screen.getByPlaceholderText("Reply");
+  fireEvent.input(input,{target:{value:"A single message"}});
+  fireEvent.keyDown(input,{key:"Enter",repeat:true});
+  expect(send).not.toHaveBeenCalled(); expect(empty).not.toHaveBeenCalled();
+  expect((input as HTMLTextAreaElement).value).toBe("A single message");
+  fireEvent.input(input,{target:{value:""}});
+  fireEvent.keyDown(input,{key:"Enter",repeat:true});
+  expect(empty).not.toHaveBeenCalled();
+});

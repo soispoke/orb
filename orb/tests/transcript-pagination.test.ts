@@ -93,3 +93,16 @@ it('joins an in-flight initial load when refreshTranscript is called before init
  expect(mocks.page).toHaveBeenCalledTimes(1);
 });
 
+
+it('does not resurrect deleted queued receipts from cached history',async()=>{
+ mocks.page.mockResolvedValue({events:[{id:1,event_id:'deleted',sequence:1,event_type:'user_message',content:'Old retry',timestamp:'',metadata:{queued:true}},{id:2,event_id:'delivered',sequence:2,event_type:'user_message',content:'Actual message',timestamp:''}],hasMore:false,pageMax:2});
+ const result=await loadTranscript('queue-ghost');
+ expect(result.items.filter(i=>i.kind==='user').map(i=>i.text)).toEqual(['Actual message']);
+});
+it('keeps queued history when the authoritative queue cannot be reached',async()=>{
+ mocks.queue.mockRejectedValue(new Error('Offline'));
+ mocks.page.mockResolvedValue({events:[{id:1,event_id:'pending',sequence:1,event_type:'user_message',content:'Keep this',timestamp:'',metadata:{queued:true}}],hasMore:false,pageMax:1});
+ const result=await loadTranscript('queue-offline');
+ expect(result.items.some(i=>i.kind==='user'&&i.text==='Keep this')).toBe(true);
+ expect(result.queueError).toContain('Offline');
+});

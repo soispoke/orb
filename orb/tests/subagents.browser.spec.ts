@@ -1,0 +1,21 @@
+import {test,expect} from '@playwright/test';
+test('subagents stay stable, readable, and keyboard accessible as they finish',async({page},testInfo)=>{
+ await page.goto('/tests/subagents.html');
+ const row=page.getByRole('button',{name:/Inspect the parser/});
+ await row.focus();await page.keyboard.press('Enter');
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ const before=await row.boundingBox();
+ await page.getByRole('button',{name:'Complete first agent'}).click();
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(row).toContainText('Done');
+ const after=await row.boundingBox();
+ expect(after!.y).toBe(before!.y);
+ await expect(page.getByText('Checked unicode boundaries. All tests pass.')).toBeVisible();
+ await page.screenshot({path:testInfo.outputPath('subagents-desktop.png')});
+ await page.setViewportSize({width:390,height:844});
+ await page.emulateMedia({reducedMotion:'reduce'});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ const dot=page.locator('.subagent[data-state=running] .subagent-dot').first();
+ expect(await dot.evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
+ await page.screenshot({path:testInfo.outputPath('subagents-mobile.png')});
+});

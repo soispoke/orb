@@ -117,6 +117,10 @@ async function fetchTranscript(id: string): Promise<TranscriptSnap> {
   }
   const queued = await queuedPromise;
   check();
+  if (!queueError) {
+    const pendingIds = new Set(queued.map(row => row.id));
+    stream = stream.filter(event => event.type !== "user_message" || event.data.queued !== true || pendingIds.has(String(event.data.id ?? event.eventId)));
+  }
   const queueEvents: StreamEvent[] = queued.map(row => ({ type: "user_message", eventId: row.id, data: { id: row.id, content: row.content, queued: row.inflight !== true } }));
   // History first puts accepted user turns at their actual transcript positions.
   return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError, cursor, before, hasOlder };

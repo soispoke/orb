@@ -180,6 +180,10 @@ pub enum AgentEvent {
         mission_id: Option<Uuid>,
     },
     /// Agent tree update (for real-time tree visualization)
+    SubagentUpdate {
+        agent: super::super::runners::subagents::Subagent,
+        mission_id: Option<Uuid>,
+    },
     AgentTree {
         /// The full agent tree structure
         tree: AgentTreeNode,
@@ -331,6 +335,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::MissionStatusChanged { .. } => "mission_status_changed",
             AgentEvent::AgentPhase { .. } => "agent_phase",
+            AgentEvent::SubagentUpdate { .. } => "subagent_update",
             AgentEvent::AgentTree { .. } => "agent_tree",
             AgentEvent::Progress { .. } => "progress",
             AgentEvent::SessionIdUpdate { .. } => "session_id_update",
@@ -357,6 +362,7 @@ impl AgentEvent {
             AgentEvent::Error { mission_id, .. } => *mission_id,
             AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
+            AgentEvent::SubagentUpdate { mission_id, .. } => *mission_id,
             AgentEvent::AgentTree { mission_id, .. } => *mission_id,
             AgentEvent::Progress { mission_id, .. } => *mission_id,
             AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),

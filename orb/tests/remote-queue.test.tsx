@@ -82,29 +82,47 @@ it('supports editing, replacing in order, and sending a queued remote message im
   expect(replayAfter).toHaveBeenCalledWith([{ content: 'Second', attached: undefined }]);
 });
 
-it('sends the selected remote queued message immediately ahead of earlier rows and strips attachment trailers', async () => {
-  const attachedContent = 'Please add a markdown file inside @Context\n\n<!-- paloma:attachment:dd4b234f-6097-4d72-82c7-aae18689e1fc -->\nAttached context: read `.paloma/messages/dd4b234f-6097-4d72-82c7-aae18689e1fc/.paloma/attach.md` (paths in that manifest are relative to `.paloma/messages/dd4b234f-6097-4d72-82c7-aae18689e1fc`).';
-  backend.list.mockResolvedValue([{ id: 'one', content: 'First', source: 'remote-queue' }, { id: 'two', content: attachedContent, source: 'remote-queue' }]);
-  backend.api.mockResolvedValue({ ok: true });
-  const sendImmediate = vi.fn().mockResolvedValue(undefined);
-  render(() => <RemoteQueue mission="remote" onSendImmediate={sendImmediate} onRows={() => {}} onCancel={() => {}}/>);
+it('keeps messages queued when live delivery is unsupported, without cancelling or resending', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'}, {id:'two',content:'Second',source:'remote-queue'}]);
+  backend.api.mockResolvedValue({ok:true,delivered:false});
+  const send = vi.fn(), cancel = vi.fn();
+  render(() => <RemoteQueue mission="remote" onSendImmediate={send} onRows={()=>{}} onCancel={cancel}/>);
   await screen.findByText('2 Queued');
-  await fireEvent.click(screen.getByRole('button', { name: 'Send now: Please add a markdown file inside @Context' }));
-  await waitFor(() => expect(sendImmediate).toHaveBeenCalledWith([
-    { id: 'two', content: 'Please add a markdown file inside @Context', attached: true },
-    { id: 'one', content: 'First', attached: undefined },
-  ]));
+  await fireEvent.click(screen.getByRole('button',{name:'Send now: Second'}));
+  expect((await screen.findByRole('alert')).textContent).toContain('still queued');
+  expect(screen.getByText('2 Queued')).toBeTruthy();
+  expect(backend.api).toHaveBeenCalledTimes(1);
+  expect(backend.api).toHaveBeenCalledWith('/api/control/queue/two/send-now',{method:'POST'});
+  expect(send).not.toHaveBeenCalled(); expect(cancel).not.toHaveBeenCalled();
 });
-
-it('keeps the error alert visible when sendNow fails after clearing the queue', async () => {
-  backend.list.mockResolvedValue([{ id: 'one', content: 'First', source: 'remote-queue' }]);
-  backend.api.mockResolvedValue({ ok: true });
-  const sendImmediate = vi.fn().mockRejectedValue(new Error('Immediate dispatch failed'));
-  render(() => <RemoteQueue mission="remote" onSendImmediate={sendImmediate} onRows={() => {}} onCancel={() => {}}/>);
+it('does not turn an ambiguous network failure into a delete and resend', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'}]);
+  backend.api.mockRejectedValue(new Error('Connection interrupted'));
+  const send = vi.fn();
+  render(() => <RemoteQueue mission="remote" onSendImmediate={send} onRows={()=>{}} onCancel={()=>{}}/>);
   await screen.findByText('1 Queued');
-  await fireEvent.click(screen.getByRole('button', { name: 'Send now: First' }));
-  const alert = await screen.findByRole('alert');
-  expect(alert.textContent).toContain('Immediate dispatch failed');
+  await fireEvent.click(screen.getByRole('button',{name:'Send now: First'}));
+  expect((await screen.findByRole('alert')).textContent).toContain('Connection interrupted');
+  expect(screen.getByText('First')).toBeTruthy();
+  expect(backend.api).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+});
+it('removes ghost receipts absent from the authoritative queue', async () => {
+  backend.list.mockResolvedValue([]);
+  const cancel=vi.fn();
+  render(() => <RemoteQueue mission="remote" confirmed={[{id:'ghost',content:'Old retry'}]} onRows={()=>{}} onCancel={cancel}/>);
+  await waitFor(()=>expect(cancel).toHaveBeenCalledWith('ghost'));
+  expect(screen.queryByText('Old retry')).toBeNull();
+});
+it('preserves a new receipt arriving after a queue read began', async () => {
+  let finish!: (rows:unknown[])=>void;
+  backend.list.mockReturnValue(new Promise(resolve=>{finish=resolve;}));
+  const {createSignal}=await import('solid-js');
+  const [confirmed,setConfirmed]=createSignal<{id:string;content:string}[]>([]);
+  const cancel=vi.fn();
+  render(()=><RemoteQueue mission="remote" confirmed={confirmed()} onRows={()=>{}} onCancel={cancel}/>);
+  setConfirmed([{id:'new',content:'Just sent'}]);finish([]);
+  await waitFor(()=>expect(screen.getByText('Just sent')).toBeTruthy());
+  expect(cancel).not.toHaveBeenCalled();
 });
 
 it('injects the selected queued message live without deleting remaining queued messages when the harness accepts mid-turn input', async () => {

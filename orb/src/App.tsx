@@ -27,6 +27,7 @@ import {BtwSettings} from "./btwSettings";
 import {createPlanProgress, type PlanProgressData} from "./PlanProgress";
 import { nativeComposerDrop } from "./composerDrop";
 import { SideQuestions, type SideQuestionsHandle } from "./SideQuestionPanel";
+import {Subagents} from "./Subagents";
 import { AgentActivity, activityShouldCollapse } from "./AgentActivity";
 import { startLocalOrigin, localRunKnown, localAgentForLaunch } from "./localAgents";
 import { ChangeMachine, preloadMachineDestinations } from "./ChangeMachine";
@@ -1214,6 +1215,7 @@ export function Composer(p: {
               return;
             }
             if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+              if (e.repeat) { e.preventDefault(); return; }
               e.preventDefault();
               send();
             }
@@ -3077,11 +3079,9 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
       recordLocalFailure(p.id, null);
     }
   });
-  const [sendingImmediate, setSendingImmediate] = createSignal(false);
   const localQueueActive = () => clientPlaced() && queuedLocalMessages(p.id).some(row => !row.error && !row.interrupted && (row.state === "queued" || row.state === "dispatching" || row.state === "accepted"));
   const busy = () => {
     if(!p.id)return !p.launchError;
-    if (sendingImmediate()) return true;
     if (localRunActive(p.id)) return true;
     if(clientPlaced()&&localRunKnown(p.id))return queuedLocalMessages(p.id).some(row=>row.state==='dispatching');
     const s = mission()?.status;
@@ -3326,88 +3326,9 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
         else applyLive(event);
       }
     }
-    if (!ordered.length) return;
-    const wasBusy = busy();
-    setSendingImmediate(true);
-    setSendError(null);
-    try {
-      if (wasBusy) {
-        await cancelMission(targetMissionId).catch(() => {});
-        for (let poll = 0; poll < 75; poll++) {
-          if (staleMission() || p.id !== targetMissionId) return;
-          try {
-            const current = await getMission(targetMissionId);
-            if (staleMission() || p.id !== targetMissionId) return;
-            setMission(current);
-            const stillStopping =
-              ["active", "running", "starting", "resuming"].includes(current.status) ||
-              current.execution?.state === "stopping" ||
-              (!!current.remote_job && current.remote_job.phase !== "finished");
-            if (!stillStopping) break;
-          } catch {
-            break;
-          }
-          await new Promise(r => setTimeout(r, 200));
-        }
-      }
-      if (staleMission() || p.id !== targetMissionId) return;
-      const project = mission()?.project;
-      const attachItems = project ? await loadAttachItems(project).catch(() => []) : [];
-      if (staleMission() || p.id !== targetMissionId) return;
-      const maxAttempts = wasBusy ? 30 : 1;
-      for (let i = 0; i < ordered.length; i++) {
-        if (staleMission() || p.id !== targetMissionId) return;
-        const row = ordered[i];
-        const presented = messagePresentation(row.content);
-        const cleanText = presented.text;
-        const attachments = (project ? mentionedChips(cleanText, attachItems) : []).map(chipToAttachment);
-        let sent = false;
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          if (staleMission() || p.id !== targetMissionId) return;
-          const freshId = crypto.randomUUID();
-          try {
-            const result = await sendMissionMessage(targetMissionId, cleanText, attachments, freshId);
-            if (staleMission() || p.id !== targetMissionId) return;
-            if (result.replacement) {
-              const replacement = result.replacement;
-              const nodeId = replacement.remote_job?.node_id ?? replacement.remote_node_id ?? mission()?.remote_job?.node_id ?? mission()?.remote_node_id ?? "";
-              rememberLaunch(replacement.id, { prompt: cleanText, nodeId, destination: nodeLabel(nodeId), replacement: true });
-              for (const rest of ordered.slice(i + 1)) {
-                const restText = messagePresentation(rest.content).text;
-                const restAttach = (project ? mentionedChips(restText, attachItems) : []).map(chipToAttachment);
-                await sendMissionMessage(replacement.id, restText, restAttach, crypto.randomUUID()).catch(() => {});
-              }
-              p.onFork?.(replacement);
-              return;
-            }
-            if (i === 0 && wasBusy && result.queued && attempt < maxAttempts - 1) {
-              await api(`/api/control/queue/${encodeURIComponent(result.id)}`, { method: "DELETE" }).catch(() => {});
-              await new Promise(r => setTimeout(r, 250));
-              continue;
-            }
-            const event: StreamEvent = { type: "user_message", eventId: result.id, data: { id: result.id, content: cleanText, queued: result.queued, receipt: true, attached: Boolean(row.attached || presented.attached || attachments.length > 0) } };
-            if (replaying) held.push(event);
-            else applyLive(event);
-            sent = true;
-            break;
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            if (attempt < maxAttempts - 1 && /still has a remote job|stopping|409/i.test(msg)) {
-              await new Promise(r => setTimeout(r, 250));
-              continue;
-            }
-            throw e;
-          }
-        }
-        if (!sent) break;
-      }
-      if (!staleMission()) await refresh();
-    } catch (e) {
-      if (!staleMission()) setSendError(launchError(e));
-      throw e;
-    } finally {
-      setSendingImmediate(false);
-    }
+    // Sending a queued message must never cancel and recreate a turn.
+    // The queue endpoint owns delivery and preserves its original identity.
+    if (ordered.length) throw new Error("Your messages remain queued. Live delivery was not confirmed.");
   };
 
   return (
@@ -3452,8 +3373,9 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
               </div>
             </div>}</Show>
             <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
-              <AgentActivity items={localActivities(p.id)} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
+              <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
             </Show>
+            <Subagents items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} onSend={text => sendMsg(text, [], [])} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={busy() || localQueueActive() || (!clientPlaced() && (remoteQueuedIds().length > 0 || items().some(i => i.kind === "user" && i.queued)))} error={clientPlaced() ? localFailure(p.id) : undefined} onResume={resume} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />

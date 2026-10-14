@@ -16,6 +16,7 @@ pub(crate) mod live_session;
 pub(crate) mod midturn;
 pub(crate) mod opencode;
 pub(crate) mod stream_guard;
+pub mod subagents;
 pub(crate) mod vibe;
 
 use std::future::Future;

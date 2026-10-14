@@ -69,9 +69,14 @@ export function RemoteQueue(p: {
       if (loading || !mission) return;
       loading = true;
       const started = revision;
+      // Only reconcile receipts that existed before this read. A new send may
+      // be accepted while the snapshot request is still in flight.
+      const captured = untrack(() => new Set([...(p.confirmed ?? []).map(row => row.id), ...rows().map(row => row.id)]));
       try {
         const pending = (await listQueuedMessages(mission)).filter(row => !row.inflight && !deletedIds.has(row.id) && (row.source === "remote-queue" || row.source?.startsWith("host-queue:api:")));
         if (disposed || started !== revision || version !== connectionVersion()) return;
+        const present = new Set(pending.map(row => row.id));
+        for (const id of captured) if (!present.has(id)) { deletedIds.add(id); p.onCancel(id); }
         setRows(pending); p.onRows(pending.map(row => row.id));
       } catch { /* Keep the last confirmed inbox during a network interruption. */ }
       finally { loading = false; }
@@ -124,7 +129,7 @@ export function RemoteQueue(p: {
     setWorking(true); setError("");
     const version = connectionVersion(), mission = p.mission;
     try {
-      const live = await api<{ ok?: boolean; delivered?: boolean }>(`/api/control/queue/${encodeURIComponent(target.id)}/send-now`, { method: "POST" }).catch(() => ({ delivered: false }));
+      const live = await api<{ ok?: boolean; delivered?: boolean }>(`/api/control/queue/${encodeURIComponent(target.id)}/send-now`, { method: "POST" });
       if (live?.delivered) {
         if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
         revision++;
@@ -135,18 +140,7 @@ export function RemoteQueue(p: {
         await p.onSendImmediate?.([], [{ id: target.id, content: messagePresentation(target.content).text, attached: target.attached || messagePresentation(target.content).attached || undefined }]);
         return;
       }
-      const ordered = [target, ...list.filter(r => r.id !== target.id)];
-      const payload = ordered.map(r => {
-        const presented = messagePresentation(r.content);
-        return { id: r.id, content: presented.text, attached: r.attached || presented.attached || undefined };
-      });
-      await Promise.allSettled(ordered.map(r => api(`/api/control/queue/${encodeURIComponent(r.id)}`, { method: "DELETE" })));
-      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
-      revision++;
-      for (const r of ordered) deletedIds.add(r.id);
-      setRows([]); p.onRows([]);
-      for (const r of ordered) p.onCancel(r.id);
-      await p.onSendImmediate?.(payload);
+      setError("This run cannot accept a live message right now. Your message is still queued; it will be sent when the run is ready.");
     } catch (e) {
       if (version === connectionVersion() && mission === p.mission) setError(e instanceof Error ? e.message : String(e));
     } finally {
