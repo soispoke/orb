@@ -2722,6 +2722,11 @@ pub(crate) async fn chat_completions_inner(
             if provider_type == ProviderType::Kimi {
                 extra.insert(header::USER_AGENT, HeaderValue::from_static("KimiCLI/1.5"));
             }
+            if provider_type == ProviderType::Custom {
+                // Identify our client: gateways may reject reqwest's absent UA
+                // before the request reaches an otherwise valid model route.
+                extra.insert(header::USER_AGENT, HeaderValue::from_static("Orb/0.1"));
+            }
             (url, upstream_body, extra)
         };
 
