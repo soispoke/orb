@@ -64,7 +64,12 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
   const working = () => agents().filter(a => status(a) === 'running').length;
   const failed = () => agents().filter(a => status(a) === 'failed').length;
   // Iterate IDs, not fresh event objects: an update never remounts an open row.
-  const visible = () => (showAll() ? agents() : agents().slice(0,6)).map(a => a.id);
+  const revealed = createMemo<Set<string>>(previous => {
+    const ids = new Set(previous);
+    for (const agent of agents()) if (["running", "waiting", "failed"].includes(status(agent))) ids.add(agent.id);
+    return ids;
+  }, new Set());
+  const visible = () => agents().filter((agent, index) => showAll() || index < 6 || revealed().has(agent.id)).map(a => a.id);
   return <Show when={agents().length}><section class="subagents" aria-label="Subagents">
     <button class="subagents-heading" ref={toggle} aria-expanded={expanded()} onClick={() => anchored(toggle, () => setExpanded(v => !v))}>
       <span class="subagents-chevron" data-open={expanded()} aria-hidden="true">›</span>
@@ -90,7 +95,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
           </div>
         </div>;
       }}</For>
-      <Show when={agents().length > 6}><button class="subagents-more" onClick={e => anchored(e.currentTarget, () => setShowAll(v => !v))}>{showAll() ? 'Show fewer' : `Show all ${agents().length} agents`}</button></Show>
+      <Show when={showAll() || visible().length < agents().length}><button class="subagents-more" onClick={e => anchored(e.currentTarget, () => setShowAll(v => !v))}>{showAll() ? 'Show fewer' : `Show all ${agents().length} agents`}</button></Show>
     </div>
   </section></Show>;
 }

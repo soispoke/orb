@@ -58,3 +58,14 @@ describe('subagent lifecycle', () => {
     expect(screen.getByText('Status unavailable')).toBeTruthy();
   });
 });
+
+it('keeps new live agents visible beyond folded history, including after completion',()=>{
+ const history:StreamItem[]=Array.from({length:8},(_,i)=>({kind:'subagent',key:`old-${i}`,text:`Old ${i}`,agent:{id:`old-${i}`,description:`Old ${i}`,status:'completed'}}));
+ const [items,setItems]=createSignal([...history,agent()]);
+ render(()=><Subagents items={items()}/>);
+ const row=screen.getByRole('button',{name:/Inspect parser/});
+ fireEvent.click(row);
+ setItems([...history,agent('completed','Finished last task')]);
+ expect(screen.getByRole('button',{name:/Inspect parser/})).toBe(row);
+ expect(row.getAttribute('aria-expanded')).toBe('true');
+});
