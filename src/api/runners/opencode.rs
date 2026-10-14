@@ -94,7 +94,7 @@ pub async fn run_opencode_turn(
     work_dir: &std::path::Path,
     message: &str,
     model: Option<&str>,
-    _model_effort: Option<&str>,
+    model_effort: Option<&str>,
     agent: Option<&str>,
     mission_id: Uuid,
     events_tx: broadcast::Sender<AgentEvent>,
@@ -447,6 +447,20 @@ pub async fn run_opencode_turn(
         });
         return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
     }
+    if let Some(effort) = model_effort {
+        if let Err(error) = crate::opencode::effort::validate(
+            app_working_dir,
+            Some(opencode_model.as_ref()),
+            effort,
+        ) {
+            let _ = events_tx.send(AgentEvent::Error {
+                message: error.clone(),
+                mission_id: Some(mission_id),
+                resumable: true,
+            });
+            return AgentResult::failure(error, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    }
     if opencode_model.starts_with("builtin/") {
         ensure_opencode_provider_for_model(
             &opencode_config_dir_host,
@@ -463,6 +477,10 @@ pub async fn run_opencode_turn(
     // Without `--thinking` the CLI drops reasoning parts from its JSON output.
     inner_cmd.push_str(" run --format json --thinking --model ");
     inner_cmd.push_str(&shell_escape(opencode_model.as_ref()));
+    if let Some(effort) = model_effort {
+        inner_cmd.push_str(" --variant ");
+        inner_cmd.push_str(&shell_escape(effort));
+    }
     if let Some(a) = agent {
         inner_cmd.push_str(" --agent ");
         inner_cmd.push_str(&shell_escape(a));

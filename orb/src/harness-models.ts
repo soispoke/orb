@@ -18,5 +18,6 @@ export function destinationHarnessChoices(
     backend: { id: "antigravity", name: "Antigravity CLI" },
     models: accountModels.map(([value, label]) => ({ value, label })),
   });
-  return choices;
+  return machine !== "core" ? choices.map(choice => choice.backend.id === "opencode"
+    ? {...choice, models: choice.models.map(model => ({...model, efforts: undefined}))} : choice) : choices;
 }

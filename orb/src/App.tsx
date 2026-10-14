@@ -209,7 +209,7 @@ const effectivePick = (machine = "core"): HarnessPick | null => {
   if (!choices.length) return null;
   const stored = harnessPick();
   if (stored) {
-    const effort = normalizeEffort(stored.effort, stored.backend);
+    const effort = normalizeEffort(stored.effort, stored.backend, choices.find(c => c.backend.id === stored.backend)?.models.find(m => m.value === stored.model)?.efforts);
     return { ...stored, effort: effort ?? undefined };
   }
   const first = choices.find((c) => c.backend.id === "claudecode") ?? choices[0];
@@ -978,8 +978,9 @@ export function Composer(p: {
                 onClose={() => setWhich(null)} onSelect={id => {
                   const c = harnessChoices(p.uploadTarget).find(c => c.backend.id === id);
                   if (c && id !== pick()?.backend) {
-                    const effort = normalizeEffort(pick()?.effort, id);
-                    setHarnessPick({backend:id,model:preferredModel(id,c.models[0].value),...(effort ? {effort} : {})});
+                    const model = preferredModel(id,c.models[0].value);
+                    const effort = normalizeEffort(pick()?.effort, id, c.models.find(m => m.value === model)?.efforts);
+                    setHarnessPick({backend:id,model,...(effort ? {effort} : {})});
                   }
                   setWhich(null);
                 }}/>
@@ -996,8 +997,8 @@ export function Composer(p: {
                 items={(choice()?.models ?? []).map(m => ({id:m.value,label:shortModelLabel(m.label)}))}
                 onClose={() => setWhich(null)} onSelect={value => {
                   const backend = choice()!.backend.id;
-                  const effort = normalizeEffort(pick()?.effort, backend);
-                  setHarnessPick({...pick()!,backend,model:value,...(effort ? {effort} : {})});setWhich(null);
+                  const effort = normalizeEffort(pick()?.effort, backend, choice()?.models.find(m => m.value === value)?.efforts);
+                  setHarnessPick({...pick()!,backend,model:value,effort:effort ?? undefined});setWhich(null);
                 }}/>
 
             </Show>
@@ -1005,7 +1006,7 @@ export function Composer(p: {
           {/* Effort, after harness and model. Only rendered for a harness the
               core actually accepts an effort for — everything else has
               model_effort forced to null server-side. */}
-          <Show when={harnessSupportsEffort(pick()?.backend)}>
+          <Show when={harnessSupportsEffort(pick()?.backend, choice()?.models.find(m => m.value === pick()?.model)?.efforts)}>
             <span class="picks-sep">·</span>
             <div class="model-wrap">
               <button
@@ -1018,10 +1019,10 @@ export function Composer(p: {
               </button>
               <Show when={which() === "effort"}>
                 <Picker label="Reasoning effort" searchable={false} selected={pick()?.effort ?? ""}
-                  items={[{id:"",label:defaultEffortLabel(pick()?.backend,pick()?.model)},...supportedEfforts(pick()?.backend).map(e => ({id:e,label:effortLabel(e)}))]}
+                  items={[{id:"",label:defaultEffortLabel(pick()?.backend,pick()?.model)},...supportedEfforts(pick()?.backend, choice()?.models.find(m => m.value === pick()?.model)?.efforts).map(e => ({id:e,label:effortLabel(e)}))]}
                   onClose={() => setWhich(null)} onSelect={value => {
-                    const cur = pick()!; const effort = normalizeEffort(value, cur.backend);
-                    setHarnessPick({...cur,backend:cur.backend,model:cur.model,...(effort ? {effort} : {})});setWhich(null);
+                    const cur = pick()!; const effort = normalizeEffort(value, cur.backend, choice()?.models.find(m => m.value === cur.model)?.efforts);
+                    setHarnessPick({...cur,effort:effort ?? undefined});setWhich(null);
                   }}/>
 
               </Show>
@@ -1628,7 +1629,7 @@ export default function App() {
     const choice = harnessChoices(local ? "local" : "core").find(c => c.backend.id === backend);
     const model = mission?.model_override || binding?.model;
     const modelLabel = choice?.models.find(m => m.value === model)?.label;
-    const effort = normalizeEffort(mission?.model_effort, backend);
+    const effort = normalizeEffort(mission?.model_effort, backend, choice?.models.find(m => m.value === model)?.efforts);
     return { id, title: displayTitle(mission?.title) || "Mission", local,
       destination: local ? "This computer" : missionDestination(mission ?? null, recalledLaunch(id)),
       directory: binding?.cwd || mission?.working_directory,
@@ -1834,7 +1835,7 @@ export default function App() {
         // `effectivePick` already dropped an effort this harness can't take, so
         // an omitted field means "backend default" rather than a stale level.
         if(pick.backend === "codex") { await requireCyberSupport({model:pick.model,mode:selectedCyber,remote:machine !== "core"}); await requireSpeedSupport(pick.model,pick.service_tier??"standard"); }
-        const effort = normalizeEffort(pick.effort, pick.backend);
+        const effort = normalizeEffort(pick.effort, pick.backend, harnessChoices(machine).find(c => c.backend.id === pick.backend)?.models.find(m => m.value === pick.model)?.efforts);
         const attachments = attachChips().map(chipToAttachment);
         const sentPrompt = imagePrompt(prompt, await stageRemoteImages(images, undefined, machine), images);
         const body = {...(pick.backend === "codex" ? {cyber_access:selectedCyber,service_tier:pick.service_tier??"standard"} : {}),...(pick.backend === "vibe" && planObjective(prompt) !== null ? {agent:"plan"} : {}),title,prompt:sentPrompt,working_directory:workingDirectory().trim() || undefined,project:projectSlug,tags:folderTags(projectSlug),backend:pick.backend,model_override:pick.model,...(effort ? {model_effort:effort} : {}),...(machine === "core" ? {} : {remote_node_id:machine}),...(attachments.length ? {attachments} : {})};
@@ -2622,8 +2623,8 @@ function MissionDock(p: {
   const canChangeModel = () => idle() && models().length > 1 && !saving();
   // The mission's own stored effort, normalized against its harness: a mission
   // created before an effort was offered simply has none.
-  const effort = () => normalizeEffort(p.mission?.model_effort, p.mission?.backend);
-  const efforts = () => supportedEfforts(p.mission?.backend);
+  const effort = () => normalizeEffort(p.mission?.model_effort, p.mission?.backend, models().find(m => m.value === modelId())?.efforts);
+  const efforts = () => supportedEfforts(p.mission?.backend, models().find(m => m.value === modelId())?.efforts);
   // Effort can change during a turn: a running Claude session applies it at
   // once, any other mission from its next turn.
   const canChangeEffort = () => !!p.mission && efforts().length > 0 && !saving();
@@ -2633,7 +2634,7 @@ function MissionDock(p: {
     setSaving(true);
     setModelOpen(false);
     try {
-      p.onMission?.(await updateMissionSettings(m.id, { model_override: value }));
+      p.onMission?.(await updateMissionSettings(m.id, { model_override: value, model_effort: normalizeEffort(m.model_effort, m.backend, models().find(model => model.value === value)?.efforts) ?? "" }));
     } catch (e) {
       p.onError?.(e instanceof Error && e.message.includes("409") ? "Stop the current turn before switching models." : launchError(e));
     } finally { setSaving(false); }

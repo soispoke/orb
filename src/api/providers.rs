@@ -244,6 +244,9 @@ pub struct ProvidersResponse {
 /// Model option for a specific backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendModelOption {
+    /// Explicit effort capabilities for routed models. Missing means unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
     /// Model value to submit (raw model id or provider/model)
     pub value: String,
     /// UI label
@@ -2214,6 +2217,7 @@ pub async fn list_backend_model_options(
                         model.id.clone()
                     };
                     options.push(BackendModelOption {
+                        efforts: Vec::new(),
                         value,
                         label: format!("{} — {}", provider.name, model.name),
                         description: model.description.clone(),
@@ -2270,6 +2274,7 @@ pub async fn list_backend_model_options(
                     additional.sort();
                     for id in additional {
                         options.push(BackendModelOption {
+                            efforts: Vec::new(),
                             label: format!("OpenAI — {}", model_id_to_display_name(&id)),
                             value: id,
                             description: None,
@@ -2299,6 +2304,10 @@ pub async fn list_backend_model_options(
                     .map(|e| format!("{}/{}", e.provider_id, e.model_id))
                     .collect();
                 BackendModelOption {
+                    efforts: crate::opencode::effort::chain_efforts(c)
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
                     value: c.id.clone(),
                     label: format!("Routing — {}", c.name),
                     description: Some(entries_desc.join(" → ")),

@@ -4,17 +4,19 @@ export type Effort = (typeof EFFORT_LADDER)[number] | "ultracode";
 
 export const EFFORT_BY_HARNESS: Readonly<Record<string, readonly Effort[]>> = {
   antigravity: ["low", "medium", "high"],
+  opencode: ["low", "medium", "high"],
   codex: EFFORT_LADDER,
   claudecode: [...EFFORT_LADDER, "ultracode"],
 };
 
 /** The efforts this harness accepts. Empty when it ignores effort entirely. */
-export function supportedEfforts(backend?: string | null): readonly Effort[] {
-  return (backend && EFFORT_BY_HARNESS[backend]) || [];
+export function supportedEfforts(backend?: string | null, modelEfforts?: readonly string[]): readonly Effort[] {
+  const allowed = (backend && EFFORT_BY_HARNESS[backend]) || [];
+  return backend === "opencode" ? allowed.filter(level => modelEfforts?.includes(level)) : allowed;
 }
 
-export function harnessSupportsEffort(backend?: string | null): boolean {
-  return supportedEfforts(backend).length > 0;
+export function harnessSupportsEffort(backend?: string | null, modelEfforts?: readonly string[]): boolean {
+  return supportedEfforts(backend, modelEfforts).length > 0;
 }
 
 /**
@@ -24,10 +26,10 @@ export function harnessSupportsEffort(backend?: string | null): boolean {
  * An effort the harness no longer accepts normalizes away instead of riding
  * along into a request the server would reject.
  */
-export function normalizeEffort(effort: string | null | undefined, backend?: string | null): Effort | null {
+export function normalizeEffort(effort: string | null | undefined, backend?: string | null, modelEfforts?: readonly string[]): Effort | null {
   const value = (effort ?? "").trim().toLowerCase();
   if (!value) return null;
-  const allowed = supportedEfforts(backend);
+  const allowed = supportedEfforts(backend, modelEfforts);
   return allowed.includes(value as Effort) ? (value as Effort) : null;
 }
 

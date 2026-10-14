@@ -323,6 +323,8 @@ export interface BackendInfo {
 }
 
 export interface BackendModelOption {
+  /** Core-validated effort levels for this route; absent means unavailable. */
+  efforts?: string[];
   value: string;
   label: string;
   description?: string;
@@ -366,7 +368,7 @@ export async function listBackendModels(): Promise<Record<string, BackendModelOp
   // Route identity comes from the chain store, never provider display labels.
   // Invalid responses must not silently remove an installed harness.
   if (!Array.isArray(chains)) throw new Error("Invalid model routing catalog");
-  return {...data.backends, opencode: chains.map(chain => ({value:chain.id,label:`Routing — ${chain.name}`}))};
+  return {...data.backends, opencode: chains.map(chain => ({...data.backends?.opencode?.find(model => model.value === chain.id),value:chain.id,label:`Routing — ${chain.name}`}))};
 }
 
 /** Harness order for the composer: the native agents first, then routers. */

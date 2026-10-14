@@ -8990,6 +8990,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
     let normalized = normalize_model_effort(raw)?;
     match (backend, normalized.as_str()) {
         (Some("antigravity"), "low" | "medium" | "high") => Some(normalized),
+        (Some("opencode"), "low" | "medium" | "high") => Some(normalized),
         (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max" | "ultracode") => {
             Some(normalized)
         }
@@ -9003,6 +9004,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("antigravity") => "low, medium, high",
+        Some("opencode") => "low, medium, high (supported routes only)",
         Some("claudecode") => "low, medium, high, xhigh, max, ultracode",
         Some("codex") => "low, medium, high, xhigh, max, ultra",
         _ => "none",
@@ -11804,10 +11806,10 @@ pub(super) async fn create_mission_inner(
         }
     }
 
-    // Model effort is supported for Codex and Claude Code missions.
+    // Normalize the harness ladder first, then validate routed model capabilities.
     if !matches!(
         backend.as_deref(),
-        Some("codex") | Some("claudecode") | Some("antigravity")
+        Some("codex") | Some("claudecode") | Some("antigravity") | Some("opencode")
     ) {
         model_effort = None;
     } else if let Some(value) = model_effort.as_ref() {
@@ -11828,6 +11830,26 @@ pub(super) async fn create_mission_inner(
     // OpenCode expects provider/model; Claude Code and Codex expect raw model IDs.
     if let Some(ref raw_model) = model_override {
         model_override = normalize_model_override_for_backend(backend.as_deref(), raw_model);
+    }
+
+    if backend.as_deref() == Some("opencode") {
+        if let Some(effort) = model_effort.as_deref() {
+            if req.remote_node_id.is_some()
+                || client_placement::is_client_placement(req.placement.as_deref())
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Routed OpenCode reasoning effort currently requires execution on Core"
+                        .to_string(),
+                ));
+            }
+            crate::opencode::effort::validate(
+                &state.config.working_dir,
+                model_override.as_deref(),
+                effort,
+            )
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        }
     }
 
     // Resolve the effective config profile:
@@ -17200,6 +17222,40 @@ pub async fn update_mission_settings(
     if let Some(ref model) = effective_model {
         if model_override.as_ref().and_then(|value| value.as_ref()) != Some(model) {
             model_override = Some(Some(model.clone()));
+        }
+    }
+
+    if effective_backend == "opencode" {
+        if let Some(Some(effort)) = model_effort.as_ref() {
+            if client_placement::is_tagged(&current.project.tags)
+                || remote_grok::placement(&state.config.working_dir, &control.mission_store, id)
+                    .await
+                    .map_err(internal_error)?
+                    .is_some()
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Routed OpenCode reasoning effort currently requires execution on Core"
+                        .to_string(),
+                ));
+            }
+            crate::opencode::effort::validate(
+                &state.config.working_dir,
+                effective_model.as_deref(),
+                effort,
+            )
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        } else if model_effort.is_none()
+            && current.model_effort.as_deref().is_some_and(|effort| {
+                crate::opencode::effort::validate(
+                    &state.config.working_dir,
+                    effective_model.as_deref(),
+                    effort,
+                )
+                .is_err()
+            })
+        {
+            model_effort = Some(None);
         }
     }
 

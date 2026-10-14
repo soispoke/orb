@@ -44,3 +44,13 @@ it("dismisses a positioned sidebar fork when clicking outside its portal", () =>
   expect(closed).toHaveBeenCalledOnce();
   ui.unmount();
 });
+
+it("forks an Argon route with a real effort level and no Max option", async () => {
+ const fork = vi.spyOn(api,"forkMission").mockResolvedValue({...mission,id:"fork",backend:"opencode"});
+ render(() => <ForkMission mission={mission} choices={[{backend:{id:"opencode",name:"OpenCode"},models:[{value:"route/renamed",label:"Routing — Argon",efforts:["low","medium","high"]}]}]} destination="Core" onClose={() => {}} onFork={() => {}}/>);
+ fireEvent.click(screen.getByRole("menuitem",{name:"OpenCode"}));
+ fireEvent.click(screen.getByRole("menuitem",{name:/Argon/}));
+ expect(screen.queryByRole("menuitem",{name:"Max",exact:true})).toBeNull();
+ fireEvent.click(screen.getByRole("menuitem",{name:"High",exact:true}));
+ await waitFor(() => expect(fork).toHaveBeenCalledWith("source",expect.objectContaining({model_override:"route/renamed",model_effort:"high"})));
+});

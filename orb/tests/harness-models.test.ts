@@ -32,3 +32,10 @@ it("drops retired Gemini CLI from stale Core choices without removing Antigravit
   expect(choices[0].models[0].value).toBe("gemini-account");
   expect(destinationHarnessChoices([retired], "local", [])).toEqual([]);
 });
+
+it("only offers routed OpenCode effort on the Core runner that implements variants", () => {
+ const choices = [{backend:{id:"opencode",name:"OpenCode"},models:[{value:"custom-route",label:"Argon",efforts:["low","medium","high"]}]}];
+ expect(destinationHarnessChoices(choices,"core",[])[0].models[0].efforts).toEqual(["low","medium","high"]);
+ for (const machine of ["local", "node"]) expect(destinationHarnessChoices(choices,machine,[])[0].models[0].efforts).toBeUndefined();
+ expect(choices[0].models[0].efforts).toHaveLength(3);
+});

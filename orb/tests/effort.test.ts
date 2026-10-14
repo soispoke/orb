@@ -33,9 +33,9 @@ function effortsFromCore(): Record<string, string[]> {
 describe("effort options come from the core's own gate", () => {
   it("matches normalize_model_effort_for_backend exactly", () => {
     const core = effortsFromCore();
-    expect(Object.keys(core).sort()).toEqual(["antigravity", "claudecode", "codex"]);
+    expect(Object.keys(core).sort()).toEqual(["antigravity", "claudecode", "codex", "opencode"]);
     for (const [backend, ladder] of Object.entries(core)) {
-      expect(supportedEfforts(backend)).toEqual(ladder);
+      expect(EFFORT_BY_HARNESS[backend]).toEqual(ladder);
     }
     expect(Object.keys(EFFORT_BY_HARNESS).sort()).toEqual(Object.keys(core).sort());
   });
@@ -91,4 +91,13 @@ it("Antigravity offers only native efforts and makes the required default explic
    expect(effortLabel("ultracode", "claudecode")).toBe("Ultracode");
    expect(normalizeEffort("ultracode", "codex")).toBeNull();
    expect(normalizeEffort("ultracode", "antigravity")).toBeNull();
+ });
+
+ it("requires model capability before offering OpenCode effort and rejects Max", () => {
+   const levels = ["low", "medium", "high"];
+   expect(supportedEfforts("opencode", levels)).toEqual(levels);
+   expect(normalizeEffort("HIGH", "opencode", levels)).toBe("high");
+   expect(normalizeEffort("max", "opencode", [...levels, "max"])).toBeNull();
+   expect(normalizeEffort("high", "opencode", [])).toBeNull();
+   expect(normalizeEffort("", "opencode", levels)).toBeNull();
  });

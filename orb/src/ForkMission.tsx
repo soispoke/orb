@@ -40,18 +40,18 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     </button>}</For>
     <Show when={modelAnchor()}>{anchor => <Menu label="Choose a model" class="fork-models" anchor={anchor()} placement="right-start" busy={busy()} onClose={() => setModelAnchor(undefined)}>
       <For each={choices()}>{choice => {
-        const choose = (anchor: HTMLButtonElement) => {if (busy()) return; setModel(choice.value); if (supportedEfforts(backend()).length) setEffortAnchor(anchor); else void fork();};
-        return <button type="button" class="menu-item" role="menuitem" disabled={busy()} aria-haspopup={supportedEfforts(backend()).length ? "menu" : undefined}
+        const choose = (anchor: HTMLButtonElement) => {if (busy()) return; setModel(choice.value); if (supportedEfforts(backend(), choice.efforts).length) setEffortAnchor(anchor); else void fork();};
+        return <button type="button" class="menu-item" role="menuitem" disabled={busy()} aria-haspopup={supportedEfforts(backend(), choice.efforts).length ? "menu" : undefined}
           title={`Fork into ${shortModelLabel(choice.label)} · same workspace on ${p.destination}`}
-          onClick={e => choose(e.currentTarget)} onMouseEnter={e => {if (!busy() && supportedEfforts(backend()).length) {setModel(choice.value);setEffortAnchor(e.currentTarget);}}}
-          onKeyDown={e => {if(e.key === "ArrowRight" && supportedEfforts(backend()).length){e.preventDefault();e.stopPropagation();choose(e.currentTarget);}}}>
-          {shortModelLabel(choice.label)}<Show when={supportedEfforts(backend()).length}><span class="menu-chevron" aria-hidden="true">›</span></Show>
+          onClick={e => choose(e.currentTarget)} onMouseEnter={e => {if (!busy() && supportedEfforts(backend(), choice.efforts).length) {setModel(choice.value);setEffortAnchor(e.currentTarget);}}}
+          onKeyDown={e => {if(e.key === "ArrowRight" && supportedEfforts(backend(), choice.efforts).length){e.preventDefault();e.stopPropagation();choose(e.currentTarget);}}}>
+          {shortModelLabel(choice.label)}<Show when={supportedEfforts(backend(), choice.efforts).length}><span class="menu-chevron" aria-hidden="true">›</span></Show>
         </button>;
       }}</For>
       <Show when={!choices().length}><div class="menu-group">No models available</div></Show>
       <Show when={effortAnchor()}>{anchor => <Menu label="Choose effort" class="fork-effort-menu" anchor={anchor()} placement="right-start" busy={busy()} onClose={() => setEffortAnchor(undefined)}>
         <Show when={backend()==="codex"}><CodexSpeedPicker model={model()} value={speed()} local={!!localBinding(p.mission.id)} disabled={busy()} onChange={setSpeed}/></Show>
-        <For each={["", ...supportedEfforts(backend())]}>{effort => <button type="button" role="menuitem" class="menu-item" disabled={busy()} onClick={() => void fork(effort)}>{effortLabel(effort || undefined,backend(),model())}</button>}</For>
+        <For each={["", ...supportedEfforts(backend(), choices().find(c => c.value === model())?.efforts)]}>{effort => <button type="button" role="menuitem" class="menu-item" disabled={busy()} onClick={() => void fork(effort)}>{effortLabel(effort || undefined,backend(),model())}</button>}</For>
         <Show when={error()}><ErrorNotice error={error()}/></Show>
       </Menu>}</Show>
       <Show when={error() && !effortAnchor()}><ErrorNotice error={error()}/></Show>
