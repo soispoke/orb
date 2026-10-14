@@ -1,5 +1,6 @@
 import {render} from 'solid-js/web';
 import {createSignal, onMount, onCleanup} from 'solid-js';
+import {BackgroundPanel} from '../src/BackgroundPanel';
 import {Subagents} from '../src/Subagents';
 import type {StreamItem} from '../src/transcriptModel';
 import '../src/styles.css';
@@ -32,4 +33,10 @@ function Gallery() {
    <button onClick={()=>setItems(rows=>rows.map(row=>row.kind==='subagent'&&row.agent.id==='a'?{...row,agent:{...row.agent,status:'completed',finishedAt:Date.now(),detail:'Checked unicode boundaries. All tests pass.'}}:row))}>Complete first agent</button>
  </main>;
 }
-render(()=> location.search.includes('scroll') ? <ScrollGallery/> : <Gallery/>,document.getElementById('root')!);
+function PanelGallery() {
+ return <div style={{height:'100vh',display:'flex'}}><BackgroundPanel tasks={<Subagents items={initial}/>}>
+ <div class="scroll"><div class="col"><div style={{height:'1800px'}}>Conversation stays in place</div></div></div>
+ <div class="dock"><div class="col">Composer</div></div>
+ </BackgroundPanel></div>;
+}
+render(()=> location.search.includes('panel') ? <PanelGallery/> : location.search.includes('scroll') ? <ScrollGallery/> : <Gallery/>,document.getElementById('root')!);

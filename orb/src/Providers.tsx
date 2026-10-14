@@ -689,7 +689,7 @@ function UsageSummary(p: { usage: ProviderUsage }) {
           {(w) => (
             <span class="p-usage-chip" title={`${w.label} window: ${Math.round(w.used * 100)}% used`}>
               <span class="p-usage-label">{w.label === "7d" ? "Weekly" : w.label}</span>
-              <span class="p-usage-pct">{Math.round(w.used * 100)}%</span>
+              <span class="p-usage-pct">{Math.round(w.used * 100)}% used</span>
             </span>
           )}
         </For>

@@ -15,3 +15,16 @@ describe('Workflow journals', () => {
     expect(workflowJournals([item('/root/../subagents/workflows/wf_1')])).toEqual([]);
   });
 });
+
+it('extracts real activity without displaying hidden thinking or inventing completion', async () => {
+ const {parseWorkflowTranscript}=await import('../src/workflowAgents');
+ const result=parseWorkflowTranscript([
+  JSON.stringify({timestamp:'2026-10-14T17:00:00Z',type:'assistant',message:{model:'test-model',content:[{type:'text',text:'Checking the build'},{type:'thinking',thinking:'private'}]}}),
+  JSON.stringify({timestamp:'2026-10-14T17:01:00Z',type:'assistant',message:{content:[{type:'tool_use',name:'Bash',input:{description:'Run the verifier'}}]}}),
+  '{"type":'
+ ].join('\n'));
+ expect(result.detail).toBe('Bash: Run the verifier');
+ expect(result.model).toBe('test-model');
+ expect(result.updatedAt).toBe(Date.parse('2026-10-14T17:01:00Z'));
+ expect(result.startedAt).toBe(Date.parse('2026-10-14T17:00:00Z'));
+});

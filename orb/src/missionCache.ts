@@ -4,7 +4,7 @@ import { applyStreamEvent, buildTranscript, type StreamItem } from "./transcript
 import { getMissionEventPage, storedToStream, type StreamEvent } from "./stream";
 import { cacheDelete, cachePeek, cachePut } from "./pageCache";
 
-export type TranscriptSnap = { items: StreamItem[]; stream: StreamEvent[]; fromLog?: boolean; queueError?: string; cursor?: number; before?: number; hasOlder?: boolean };
+export type TranscriptSnap = { items: StreamItem[]; stream: StreamEvent[]; fromLog?: boolean; queueError?: string; cursor?: number; before?: number; hasOlder?: boolean; checkedReceiptIds?: string[] };
 
 const key = (id: string) => `c:${connectionVersion()}:m:${id}:tx`;
 const heightKey = (id: string) => `c:${connectionVersion()}:m:${id}:h`;
@@ -117,13 +117,33 @@ async function fetchTranscript(id: string): Promise<TranscriptSnap> {
   }
   const queued = await readQueue();
   check();
+  // Recovery receipts can outlive the recent event window. Resolve their
+  // original delivery positions before treating them as new transcript rows.
+  const checkedReceiptIds = new Set(resets ? [] : previous?.checkedReceiptIds ?? []);
+  const deliveredIds = () => new Set(stream.filter(event => event.type === "user_message" && event.data.queued !== true).map(event => String(event.data.id ?? event.eventId)));
+  const known = deliveredIds();
+  const unresolved = queued.filter(row => row.inflight && !known.has(row.id) && !checkedReceiptIds.has(row.id));
+  if (unresolved.length && hasOlder && before !== undefined) {
+    let olderCursor = before;
+    for (;;) {
+      const page = await getMissionEventPage(id, {before: olderCursor, view: "transcript"});
+      check();
+      const older = page.events.map(storedToStream).filter((event): event is StreamEvent => event !== null);
+      stream = mergeStreamBySequence(older, stream);
+      const delivered = deliveredIds();
+      if (!page.hasMore || unresolved.every(row => delivered.has(row.id))) break;
+      if (page.nextCursor === undefined || page.nextCursor >= olderCursor) throw Error("Receipt history cursor did not advance.");
+      olderCursor = page.nextCursor;
+    }
+    for (const row of unresolved) checkedReceiptIds.add(row.id);
+  }
   if (!queueError) {
     const pendingIds = new Set(queued.map(row => row.id));
     stream = stream.filter(event => event.type !== "user_message" || event.data.queued !== true || pendingIds.has(String(event.data.id ?? event.eventId)));
   }
-  const queueEvents: StreamEvent[] = queued.map(row => ({ type: "user_message", eventId: row.id, data: { id: row.id, content: row.content, queued: row.inflight !== true } }));
+  const queueEvents: StreamEvent[] = queued.map(row => ({ type: "user_message", eventId: row.id, data: { id: row.id, content: row.content, queued: row.inflight !== true, receipt: true } }));
   // History first puts accepted user turns at their actual transcript positions.
-  return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError, cursor, before, hasOlder };
+  return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError, cursor, before, hasOlder, checkedReceiptIds: [...checkedReceiptIds] };
 }
 
 type JobKind='initial'|'refresh'|'older';

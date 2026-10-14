@@ -53,7 +53,7 @@ it("durable inflight evidence confirms the ID while the transcript logger is beh
     {id:"dispatched",content:"same",mission_id:"m",inflight:true},{id:"waiting",content:"same",mission_id:"m",inflight:false},
   ] : []),{headers:{"X-Orb-Events-Protocol":"1","X-Has-More":"false"}})));
   const snap=await loadTranscript("m");
-  expect(snap.items).toMatchObject([{messageId:"dispatched",queued:false},{messageId:"waiting",queued:true}]);
+  expect(snap.items).toMatchObject([{messageId:"dispatched",queued:false,receipt:true},{messageId:"waiting",queued:true}]);
 });
 
 import { forgetPrefetchPauses, prefetchTranscript } from "../src/missionCache";
@@ -62,7 +62,7 @@ it("a transcript the cache cannot hold is prefetched once, not at every refresh"
   const big = "x".repeat(20 * 1024 * 1024);
   const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(url.includes("/queue") ? [] :
     [{ id: 1, event_id: "one", event_type: "assistant_message", content: big, sequence: 1, metadata: {}, timestamp: "" }]),
-    { headers: { "X-Orb-Events-Protocol": "1", "X-Has-More": "false", "X-Next-Cursor": "1", "X-Page-Max": "1", "Content-Type": "application/json" } }));
+    { headers: { "X-Orb-Events-Protocol": "1", "X-Has-More": "false", "X-Next-Cursor": "1", "X-Page-Max-Sequence": "1", "Content-Type": "application/json" } }));
   vi.stubGlobal("fetch", fetchMock);
   prefetchTranscript("huge");
   await vi.waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2));
@@ -71,4 +71,22 @@ it("a transcript the cache cannot hold is prefetched once, not at every refresh"
   for (let i = 0; i < 5; i++) prefetchTranscript("huge");
   await new Promise(resolve => setTimeout(resolve, 20));
   expect(fetchMock.mock.calls.length).toBe(after);
+});
+
+
+it("places old inflight receipts in older history instead of after the latest response", async () => {
+ const row = (sequence:number,id:string,type:string,content:string) => ({id:sequence,event_id:id,event_type:type,content,sequence,metadata:{queued:false},timestamp:''});
+ const fetchMock = vi.fn(async (url:string) => {
+  const queue=url.includes('/queue'), older=url.includes('view=transcript');
+  const data=queue ? [{id:'old',content:'A+B asap',mission_id:'receipt-history',inflight:true}] : older ?
+   [row(1,'old','user_message','A+B asap'),row(2,'old-reply','assistant_message','Already handled')] :
+   [row(100,'recent','user_message','Optimize the build'),row(101,'reply','assistant_message','Optimizing now')];
+  return new Response(JSON.stringify(data),{headers:{'X-Orb-Events-Protocol':'1','X-Has-More':older?'false':'true','X-Next-Cursor':older?'1':'100','X-Page-Max-Sequence':older?'2':'101'}});
+ });
+ vi.stubGlobal('fetch',fetchMock);
+ const snap=await loadTranscript('receipt-history');
+ expect(snap.items.filter(item=>item.kind==='user').map(item=>item.text)).toEqual(['A+B asap','Optimize the build']);
+ expect(snap.items.at(-1)).toMatchObject({kind:'text',text:'Optimizing now'});
+ expect(snap.items.filter(item=>item.kind==='user'&&item.messageId==='old')).toHaveLength(1);
+ expect(fetchMock.mock.calls.some(([url])=>url.includes('view=transcript'))).toBe(true);
 });

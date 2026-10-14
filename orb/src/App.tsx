@@ -1,3 +1,4 @@
+import {frameResizeObserver} from "./frameResizeObserver";
 import {CodexSpeedPicker, missionSpeed, requireSpeedSupport} from './CodexSpeedPicker';
 import type {CodexServiceTier} from './api';
 import { Picker } from "./Picker";
@@ -28,6 +29,8 @@ import {createPlanProgress, type PlanProgressData} from "./PlanProgress";
 import { nativeComposerDrop } from "./composerDrop";
 import { SideQuestions, type SideQuestionsHandle } from "./SideQuestionPanel";
 import {Subagents} from "./Subagents";
+import {hasTurnActivity} from "./turnActivity";
+import {BackgroundPanel} from "./BackgroundPanel";
 import { AgentActivity, activityShouldCollapse } from "./AgentActivity";
 import { startLocalOrigin, localRunKnown, localAgentForLaunch } from "./localAgents";
 import { ChangeMachine, preloadMachineDestinations } from "./ChangeMachine";
@@ -687,7 +690,7 @@ export function Composer(p: {
   };
   onMount(() => {
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(([entry]) => { if (!multiline()) compactWidth = entry.contentRect.width; });
+    const observer = frameResizeObserver(([entry]) => { if (!multiline()) compactWidth = entry.contentRect.width; });
     observer.observe(ta);
     onCleanup(() => observer.disconnect());
   });
@@ -1240,7 +1243,7 @@ export function floatingDock(el: HTMLDivElement) {
       "--composer-bottom-space", `${bounds.bottom - composer.getBoundingClientRect().bottom}px`,
     );
   };
-  const observer = new ResizeObserver(update);
+  const observer = frameResizeObserver(update);
   queueMicrotask(() => { parent = el.parentElement; update(); observer.observe(el); });
   onCleanup(() => { observer.disconnect(); parent?.style.removeProperty("--dock-height"); el.closest<HTMLElement>(".app")?.style.removeProperty("--composer-bottom-space"); });
 }
@@ -2858,7 +2861,10 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
+  // Layout scroll events must not release the initial tail pin before paint.
+  let openingAtLatest = true;
   let inspectingAgents = false;
+  const beginManualScroll = () => { openingAtLatest = false; inspectingAgents = false; };
   createEffect(()=>{if(p.id)cacheRemember(`m:${p.id}`);});
 
   const scrollIfPinned = () => {
@@ -2867,9 +2873,11 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   // Resize notifications run after streaming Markdown has changed layout.
   onMount(() => {
     if (!scroller) return;
-    const older=()=>{if(scroller!.scrollTop<800&&peekReadyTranscript(p.id)?.hasOlder)void loadOlder().catch(e=>setError(String(e)));};
+    const older=()=>{if(!openingAtLatest&&scroller!.scrollTop<800&&peekReadyTranscript(p.id)?.hasOlder)void loadOlder().catch(e=>setError(String(e)));};
     scroller.addEventListener('scroll',older,{passive:true});onCleanup(()=>scroller?.removeEventListener('scroll',older));
-    const observer = new ResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
+    const initialFrame = requestAnimationFrame(scrollIfPinned);
+    onCleanup(() => cancelAnimationFrame(initialFrame));
+    const observer = frameResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
     const content = scroller.querySelector(".col");
     if (content) observer.observe(content);
     onCleanup(() => observer.disconnect());
@@ -3092,9 +3100,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   /** Anything the agent has actually said or done in this turn. */
   const activity = () => {
     if (localRunActive(p.id) && localActivities(p.id).length > 0) return true;
-    const list = viewItems();
-    const lastUser = list.reduce((last, item, index) => item.kind === "user" && !item.queued ? index : last, -1);
-    return list.slice(lastUser + 1).some(i => (i.kind === "tool" || ((i.kind === "text" || i.kind === "think") && !!i.text.trim())));
+    return hasTurnActivity(viewItems());
   };
   /**
    * The mission is working and has produced nothing yet: the window where the
@@ -3333,15 +3339,21 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   };
 
   return (
-    <>
+    <BackgroundPanel tasks={<>
+            <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
+              <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
+            </Show>
+            <Subagents missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
+    </>}>
       <div
         class="scroll"
         ref={scroller}
-        onWheel={() => { inspectingAgents = false; }}
-        onTouchMove={() => { inspectingAgents = false; }}
-        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) inspectingAgents = false; }}
+        onWheel={beginManualScroll}
+        onTouchMove={beginManualScroll}
+        onPointerDown={beginManualScroll}
+        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) beginManualScroll(); }}
         onScroll={() => {
-          if(scroller?.dataset.panelResizing)return;
+          if(openingAtLatest || scroller?.dataset.panelResizing)return;
           nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
         }}
       >
@@ -3376,10 +3388,6 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
                 <Show when={row().state==='error'}><button onClick={()=>void deliverResend()}>Retry</button></Show>
               </div>
             </div>}</Show>
-            <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
-              <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
-            </Show>
-            <Subagents onInspect={() => { inspectingAgents = true; nearBottom = false; }} missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} onSend={text => sendMsg(text, [], [])} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={busy() || localQueueActive() || (!clientPlaced() && (remoteQueuedIds().length > 0 || items().some(i => i.kind === "user" && i.queued)))} error={clientPlaced() ? localFailure(p.id) : undefined} onResume={resume} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
@@ -3463,6 +3471,6 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
           <MissionDock mission={mission()} items={viewItems()} destination={missionDestination(mission(), receipt)} onMission={setMission} onError={setError} onFork={p.onFork} />
         </div>
       </div>
-    </>
+    </BackgroundPanel>
   );
 }

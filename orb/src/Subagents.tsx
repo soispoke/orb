@@ -4,7 +4,7 @@ import type {StreamItem} from './transcriptModel';
 import type {LocalActivity} from './localAgents';
 import './subagents.css';
 import {ElapsedTime} from './ElapsedTime';
-import {workflowJournals, parseWorkflowJournal} from './workflowAgents';
+import {workflowJournals, parseWorkflowJournal, parseWorkflowTranscript} from './workflowAgents';
 import {connectionVersion, getApiUrl, getJwt} from './api';
 
 export interface Subagent {
@@ -19,6 +19,7 @@ export interface Subagent {
   model?: string;
   tokens?: number;
   phase?: string;
+  transcriptPath?: string;
 }
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' ? value as Record<string, unknown> : {};
 const text = (value: unknown): string => {
@@ -62,6 +63,53 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
   return [...rows.values()];
 }
 const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', unknown:'Status unavailable'};
+
+function WorkflowActivity(p: {path: string; mission: string; workspace: string; active: boolean}) {
+  const [activity, setActivity] = createSignal<ReturnType<typeof parseWorkflowTranscript>>();
+  const [error, setError] = createSignal('');
+  const identity = createMemo(() => JSON.stringify([p.path, p.mission, p.workspace, p.active]));
+  createEffect(() => {
+    const [path, mission, workspace, active] = JSON.parse(identity());
+    connectionVersion();
+    if (!active) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      const request = new AbortController(), abort = () => request.abort();
+      controller.signal.addEventListener('abort', abort, {once:true});
+      const timeout = setTimeout(abort, 10000);
+      try {
+        const query = new URLSearchParams({path, mission_id:mission, workspace_id:workspace});
+        const response = await fetch(`${getApiUrl()}/api/fs/download?${query}`, {headers:{Authorization:`Bearer ${getJwt()}`},signal:request.signal});
+        if (!response.ok) throw new Error('Transcript unavailable');
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('Transcript unavailable');
+        const decoder = new TextDecoder(); let content = '', bytes = 0;
+        try {
+          while (true) {
+            const chunk = await reader.read(); if (chunk.done) break;
+            bytes += chunk.value.byteLength;
+            if (bytes > 8 * 1024 * 1024) throw new Error('Transcript exceeds the live preview limit');
+            content += decoder.decode(chunk.value, {stream:true});
+          }
+          content += decoder.decode();
+        } finally { await reader.cancel().catch(() => {}); }
+        if (!controller.signal.aborted) { setActivity(parseWorkflowTranscript(content)); setError(''); }
+      } catch (e) {
+        if (!controller.signal.aborted) setError(e instanceof Error ? e.message : 'Activity unavailable');
+      } finally {clearTimeout(timeout);controller.signal.removeEventListener('abort',abort);}
+      if (!controller.signal.aborted) timer = setTimeout(poll, 15000);
+    };
+    void poll();
+    onCleanup(() => {controller.abort();clearTimeout(timer);});
+  });
+  return <div class="workflow-activity">
+    <Show when={activity()?.model}><div>{activity()!.model}</div></Show>
+    <Show when={activity()?.updatedAt}><div>Last recorded activity: {new Date(activity()!.updatedAt!).toLocaleTimeString()}</div></Show>
+    <pre>{activity()?.detail || (error() ? 'No activity preview available.' : 'Loading agent transcript…')}</pre>
+    <Show when={error()}><div role="status">{error()}. Retrying while this card is open.</div></Show>
+  </div>;
+}
 
 export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean; missionId?: string; workspaceId?: string; onInspect?: () => void}) {
   const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
@@ -171,7 +219,10 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
           <div hidden={!open()} class="subagent-details">
             <Show when={agent().prompt}><div class="subagent-detail-label">Task</div><pre>{agent().prompt}</pre></Show>
             <div class="subagent-detail-label">{status(agent()) === 'running' ? 'Latest activity' : 'Result'}</div>
-            <pre>{agent().detail || (status(agent()) === 'running' ? 'Waiting for the next update…' : 'No additional result was reported.')}</pre>
+            <Show when={agent().transcriptPath && p.missionId && p.workspaceId} fallback={<pre>{agent().detail || (status(agent()) === 'running' ? 'No activity details received yet.' : 'No additional result was reported.')}</pre>}>
+              <WorkflowActivity path={agent().transcriptPath!} mission={p.missionId!} workspace={p.workspaceId!} active={open() && expanded()} />
+              <Show when={agent().detail && status(agent()) !== 'running'}><pre>{agent().detail}</pre></Show>
+            </Show>
           </div>
         </div>;
       }}</For>
