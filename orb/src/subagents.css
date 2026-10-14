@@ -32,3 +32,7 @@
 .subagent-metrics:empty { display:none; }
 .subagent[data-state=running] .subagent-status { color:#269dff; }
 .subagent[data-state=completed] .subagent-dot, .subagent[data-state=finished] .subagent-dot { background:#8a8a92; box-shadow:none; }
+
+/* Interactive details must keep their real height while the conversation scrolls.
+   The generic offscreen 160px placeholder otherwise competes with bottom-follow. */
+.scroll .col > .subagents { content-visibility: visible; contain-intrinsic-size: none; }

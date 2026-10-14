@@ -2811,7 +2811,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
       return [...prev, { ...draft, id: nextId, waiting }];
     });
     if (!addedWaiting) {
-      nearBottom = true;
+      nearBottom = true; inspectingAgents = false;
       queueMicrotask(scrollIfPinned);
     }
   };
@@ -2858,10 +2858,11 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
+  let inspectingAgents = false;
   createEffect(()=>{if(p.id)cacheRemember(`m:${p.id}`);});
 
   const scrollIfPinned = () => {
-    if (nearBottom && !scroller?.dataset.panelResizing && !scroller?.querySelector(".user.editing")) scroller?.scrollTo({ top: scroller.scrollHeight });
+    if (nearBottom && !inspectingAgents && !scroller?.dataset.panelResizing && !scroller?.querySelector(".user.editing")) scroller?.scrollTo({ top: scroller.scrollHeight });
   };
   // Resize notifications run after streaming Markdown has changed layout.
   onMount(() => {
@@ -3272,7 +3273,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     if(resend()?.state==='sending')return true;
     if(resend()?.state==='error'&&!resendKnown())return false;
     setResend({id:crypto.randomUUID(),text,waiting:busy(),state:"accepted"});
-    nearBottom=true;
+    nearBottom=true; inspectingAgents=false;
     queueMicrotask(scrollIfPinned);
     void deliverResend();
     return true;
@@ -3336,6 +3337,9 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
       <div
         class="scroll"
         ref={scroller}
+        onWheel={() => { inspectingAgents = false; }}
+        onTouchMove={() => { inspectingAgents = false; }}
+        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) inspectingAgents = false; }}
         onScroll={() => {
           if(scroller?.dataset.panelResizing)return;
           nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
@@ -3375,7 +3379,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
             <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
               <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
             </Show>
-            <Subagents missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
+            <Subagents onInspect={() => { inspectingAgents = true; nearBottom = false; }} missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} onSend={text => sendMsg(text, [], [])} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={busy() || localQueueActive() || (!clientPlaced() && (remoteQueuedIds().length > 0 || items().some(i => i.kind === "user" && i.queued)))} error={clientPlaced() ? localFailure(p.id) : undefined} onResume={resume} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />

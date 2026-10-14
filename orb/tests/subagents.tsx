@@ -1,5 +1,5 @@
 import {render} from 'solid-js/web';
-import {createSignal} from 'solid-js';
+import {createSignal, onMount, onCleanup} from 'solid-js';
 import {Subagents} from '../src/Subagents';
 import type {StreamItem} from '../src/transcriptModel';
 import '../src/styles.css';
@@ -8,6 +8,21 @@ const initial: StreamItem[] = [
   {kind:'subagent',key:'b',text:'Review the tests',agent:{id:'b',description:'Review the tests',status:'running',startedAt:Date.now()-120000,detail:'Running the focused test suite.'}},
   {kind:'subagent',key:'c',text:'Map the data flow',agent:{id:'c',description:'Map the data flow',status:'completed',startedAt:Date.now()-180000,finishedAt:Date.now()-30000,detail:'Mapped the request path. No gaps found.'}},
 ];
+function ScrollGallery() {
+ let scroller!: HTMLDivElement, content!: HTMLDivElement;
+ let pinned=true;
+ onMount(()=>{
+  scroller.scrollTop=scroller.scrollHeight;
+  const observer=new ResizeObserver(()=>{if(pinned)scroller.scrollTop=scroller.scrollHeight;});
+  observer.observe(content); onCleanup(()=>observer.disconnect());
+ });
+ return <div ref={scroller} class="scroll" style={{height:'600px',flex:'none'}} onScroll={()=>{pinned=scroller.scrollHeight-scroller.scrollTop-scroller.clientHeight<80;}}>
+  <div class="col" ref={content}>
+   <div style={{height:'1200px'}}>Earlier conversation</div>
+   <Subagents items={initial} onInspect={()=>{pinned=false;}}/>
+  </div>
+ </div>;
+}
 function Gallery() {
  const [items,setItems]=createSignal(initial);
  return <main style={{'max-width':'680px',margin:'80px auto',padding:'0 20px'}}>
@@ -17,4 +32,4 @@ function Gallery() {
    <button onClick={()=>setItems(rows=>rows.map(row=>row.kind==='subagent'&&row.agent.id==='a'?{...row,agent:{...row.agent,status:'completed',finishedAt:Date.now(),detail:'Checked unicode boundaries. All tests pass.'}}:row))}>Complete first agent</button>
  </main>;
 }
-render(()=> <Gallery/>,document.getElementById('root')!);
+render(()=> location.search.includes('scroll') ? <ScrollGallery/> : <Gallery/>,document.getElementById('root')!);

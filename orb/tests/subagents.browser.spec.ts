@@ -19,3 +19,20 @@ test('subagents stay stable, readable, and keyboard accessible as they finish',a
  expect(await dot.evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
  await page.screenshot({path:testInfo.outputPath('subagents-mobile.png')});
 });
+
+test('expanded agents remain rendered inside the real conversation scroller',async({page})=>{
+ await page.goto('/tests/subagents.html?scroll');
+ const panel=page.locator('.subagents');
+ const heading=page.getByRole('button',{name:/Subagents/});
+ await heading.click(); await heading.click();
+ const row=page.getByRole('button',{name:/Inspect the parser/});
+ await row.click();
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ expect(await panel.evaluate(el=>getComputedStyle(el).contentVisibility)).toBe('visible');
+ const samples=await page.evaluate(async()=>{
+  const el=document.querySelector('.subagents')!; const points:number[]=[];
+  for(let i=0;i<30;i++){await new Promise(requestAnimationFrame);points.push(el.getBoundingClientRect().top);}
+  return points;
+ });
+ expect(Math.max(...samples)-Math.min(...samples)).toBeLessThan(2);
+});

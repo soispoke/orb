@@ -63,7 +63,7 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
 }
 const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', unknown:'Status unavailable'};
 
-export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean; missionId?: string; workspaceId?: string}) {
+export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean; missionId?: string; workspaceId?: string; onInspect?: () => void}) {
   const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
   const [workflowError, setWorkflowError] = createSignal(false);
   const journals = createMemo(() => workflowJournals(p.items), [], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
@@ -120,6 +120,10 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
   const [expanded, setExpanded] = createSignal(true);
   const [showAll, setShowAll] = createSignal(false);
   const anchored = anchoredDisclosure();
+  const disclose = (trigger: HTMLElement, change: () => void) => {
+    p.onInspect?.();
+    anchored(trigger, change);
+  };
   let toggle!: HTMLButtonElement;
   const status = (agent: Subagent) => p.interrupted && agent.status === 'running' ? 'unknown' : agent.status;
   const working = () => agents().filter(a => status(a) === 'running').length;
@@ -133,7 +137,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
   }, new Set());
   const visible = () => agents().filter((agent, index) => showAll() || index < 6 || revealed().has(agent.id)).map(a => a.id);
   return <Show when={agents().length || journals().length}><section class="subagents" aria-label="Subagents">
-    <button class="subagents-heading" ref={toggle} aria-expanded={expanded()} onClick={() => anchored(toggle, () => setExpanded(v => !v))}>
+    <button class="subagents-heading" ref={toggle} aria-expanded={expanded()} onClick={() => disclose(toggle, () => setExpanded(v => !v))}>
       <span class="subagents-chevron" data-open={expanded()} aria-hidden="true">›</span>
       <span>Subagents</span><span class="subagents-count">{agents().length}</span>
       <span class="subagents-summary">{working() ? `${working()} working` : 'Activity'}{failed() ? ` · ${failed()} failed` : ''}</span>
@@ -146,7 +150,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
         const [open, setOpen] = createSignal(false);
         let row!: HTMLButtonElement;
         return <div class="subagent" data-state={status(agent())}>
-          <button ref={row} class="subagent-toggle" aria-expanded={open()} onClick={() => anchored(row, () => setOpen(v => !v))}>
+          <button ref={row} class="subagent-toggle" aria-expanded={open()} onClick={() => disclose(row, () => setOpen(v => !v))}>
             <span class="subagent-dot" aria-hidden="true"/>
             <span class="subagent-copy">
               <span class="subagent-description" title={agent().description}>{agent().description}</span>
@@ -167,7 +171,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
           </div>
         </div>;
       }}</For>
-      <Show when={showAll() || visible().length < agents().length}><button class="subagents-more" onClick={e => anchored(e.currentTarget, () => setShowAll(v => !v))}>{showAll() ? 'Show fewer' : `Show all ${agents().length} agents`}</button></Show>
+      <Show when={showAll() || visible().length < agents().length}><button class="subagents-more" onClick={e => disclose(e.currentTarget, () => setShowAll(v => !v))}>{showAll() ? 'Show fewer' : `Show all ${agents().length} agents`}</button></Show>
     </div>
   </section></Show>;
 }
