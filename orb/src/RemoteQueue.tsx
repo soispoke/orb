@@ -140,9 +140,19 @@ export function RemoteQueue(p: {
         await p.onSendImmediate?.([], [{ id: target.id, content: messagePresentation(target.content).text, attached: target.attached || messagePresentation(target.content).attached || undefined }]);
         return;
       }
+      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
       setError("This run cannot accept a live message right now. Your message is still queued; it will be sent when the run is ready.");
     } catch (e) {
-      if (version === connectionVersion() && mission === p.mission) setError(e instanceof Error ? e.message : String(e));
+      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
+      const message = e instanceof Error ? e.message : String(e);
+      if (/^404\b/.test(message)) {
+        // The consumer won the race. Absence does not prove delivery, and must
+        // never trigger a second send with a fresh identity.
+        revision++; deletedIds.add(target.id);
+        setRows(previous => previous.filter(row => row.id !== target.id));
+        p.onRows(rows().map(row => row.id)); p.onCancel(target.id);
+        setError('');
+      } else setError(message);
     } finally {
       setWorking(false);
     }
@@ -195,7 +205,7 @@ export function RemoteQueue(p: {
   return <Show when={displayRows().length || error()}>
     <section class="followup-queue" classList={{collapsed:collapsed()}} aria-label="Queued messages" aria-live="polite">
       <header>
-        <span class="queue-count">{visibleRows().length ? `${displayRows().length} Queued` : `${displayRows().length} Sending…`}</span>
+        <span class="queue-count">{visibleRows().length ? `${displayRows().length} Queued` : displayRows().length ? `${displayRows().length} Sending…` : "Queue update failed"}</span>
         <Show when={visibleRows().length > 0 && !p.editing}><span class="queue-hint"><Ic.ReturnIcon size={13}/> to Send</span></Show>
         <Show when={displayRows().length > 0}>
           <div class="queue-options">

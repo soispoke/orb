@@ -183,3 +183,17 @@ it('removes a queued message optimistically before the DELETE request resolves a
 });
 
 
+
+it('reconciles a send-now 404 without resending or leaving a zero-item sending indicator', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'Already consumed',source:'remote-queue'}]);
+  backend.api.mockRejectedValue(new Error('404 message not in queue'));
+  const cancel=vi.fn(), send=vi.fn();
+  render(()=><RemoteQueue mission="remote" onRows={()=>{}} onCancel={cancel} onSendImmediate={send}/>);
+  await screen.findByText('Already consumed');
+  fireEvent.click(screen.getByRole('button',{name:'Send now: Already consumed'}));
+  await waitFor(()=>expect(cancel).toHaveBeenCalledWith('one'));
+  expect(screen.queryByRole('region',{name:'Queued messages'})).toBeNull();
+  expect(screen.queryByText('0 Sending…')).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(send).not.toHaveBeenCalled(); expect(backend.api).toHaveBeenCalledTimes(1);
+});

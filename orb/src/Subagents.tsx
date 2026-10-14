@@ -1,4 +1,4 @@
-import {For, Show, createMemo, createSignal, createEffect, onCleanup} from 'solid-js';
+import {For, Show, createMemo, createSignal, createEffect, onCleanup, untrack} from 'solid-js';
 import {anchoredDisclosure} from './anchoredDisclosure';
 import type {StreamItem} from './transcriptModel';
 import type {LocalActivity} from './localAgents';
@@ -64,20 +64,24 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
 const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', unknown:'Status unavailable'};
 
 export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean; missionId?: string; workspaceId?: string}) {
-  const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([]);
+  const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
   const [workflowError, setWorkflowError] = createSignal(false);
   const journals = createMemo(() => workflowJournals(p.items), [], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
   createEffect(() => {
-    const paths = journals(), mission = p.missionId, workspace = p.workspaceId;
+    const mission = p.missionId, workspace = p.workspaceId;
     connectionVersion();
     setWorkflowRows([]); setWorkflowError(false);
-    if (!paths.length || !mission || !workspace) return;
+    if (!mission || !workspace) return;
+    const knownPaths = new Set<string>();
     const controller = new AbortController();
     const cache = new Map<string, Subagent[]>();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       let failed = false;
-      for (const path of paths) {
+      // History replay and new launches must not clear existing cards or their disclosure state.
+      for (const path of untrack(journals)) knownPaths.add(path);
+      while (knownPaths.size > 20) { const oldest = knownPaths.values().next().value!; knownPaths.delete(oldest); cache.delete(oldest); }
+      for (const path of knownPaths) {
         if (controller.signal.aborted) break;
         const request = new AbortController();
         const abort = () => request.abort();

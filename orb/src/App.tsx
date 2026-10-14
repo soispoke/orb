@@ -68,7 +68,7 @@ import { cacheRemember, cacheRecents } from "./pageCache";
 import { antigravityBaseModel, defaultEffortLabel, effortLabel, harnessSupportsEffort, normalizeEffort, supportedEfforts } from "./effort";
 import { retainTranscript, loadOlderTranscript, refreshTranscript, loadTranscript, peekReadyTranscript, peekTranscriptHeight, prefetchTranscript, putTranscript, putTranscriptHeight, putTranscriptItems, transcriptVersion } from "./missionCache";
 import { ConversationSkeleton, DelayedTranscriptSkeleton } from "./Skeleton";
-import { visibleTranscript } from "./transcriptModel";
+import { visibleTranscript, removeQueuedMessages } from "./transcriptModel";
 import { mergeById, pollWhileVisible } from "./poll";
 import { LiveProjectsSection, ProjectFileView, isMissionDeleting } from "./ProjectFiles";
 const ProjectSettings=lazy(()=>import("./ProjectSettings").then(module=>({default:module.ProjectSettings})));
@@ -2896,7 +2896,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     const removed=new Set(remoteQueuedIds().filter(id=>!ids.includes(id)));
     setRemoteQueuedIds(ids);
     if(!removed.size)return;
-    setItems(previous=>previous.filter(item=>item.kind!=="user"||!item.queued||!item.messageId||!removed.has(item.messageId)));
+    setItems(previous=>removeQueuedMessages(previous, removed));
     liveEvents=liveEvents.filter(event=>event.type!=="user_message"||!event.data?.queued||!removed.has(String(event.data?.id)));
     void resync(true);
   };
@@ -3400,7 +3400,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
             pending={!clientPlaced() && !sendError() ? optimisticList().filter(item => item.waiting && !item.failed).map(item => ({id:item.id,content:item.text})) : undefined}
             confirmed={clientPlaced() ? [] : items().filter((item): item is Extract<StreamItem,{kind:"user"}> => item.kind === "user" && item.queued === true && !!item.messageId).map(item=>({id:item.messageId!,content:item.text,attached:item.attached}))}
             onRows={reconcileRemoteQueue} onCancel={id=>{
-            setItems(previous=>previous.filter(item=>item.kind!=="user"||!item.queued||item.messageId!==id));
+            setItems(previous=>removeQueuedMessages(previous, new Set([id])));
             liveEvents=liveEvents.filter(event=>event.type!=="user_message"||!event.data?.queued||event.data?.id!==id);
           }}/>
           <QueuedMessages mission={p.id} editing={editingQueued()} pending={clientPlaced() && !sendError() && !editingQueued() ? optimisticList().filter(item => item.waiting && !item.failed).map(item => ({id:item.id,text:item.text})) : undefined} onCancelPending={id => setOptimisticList(prev => prev.filter(item => item.id !== id))} onEdit={row=>void queuedEdit.start(row)}/>
