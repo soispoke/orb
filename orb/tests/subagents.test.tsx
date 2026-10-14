@@ -90,3 +90,18 @@ it('loads real Workflow children through the mission-scoped API and cancels on u
   // A completed request is no longer attached; no further polling remains after cleanup.
   expect(signal.aborted).toBe(false);
 });
+
+it('keeps an expanded Workflow child mounted when another workflow appears or history refreshes', async () => {
+  const receipt=(id:string):StreamItem=>({...call,callId:id,name:'Workflow',result:`Transcript dir: /root/.claude/subagents/workflows/${id}\nRun ID: ${id}`});
+  vi.stubGlobal('fetch',vi.fn().mockImplementation(async()=>new Response(JSON.stringify({type:'started',agentId:'a',label:'Stable child'}))));
+  const [items,setItems]=createSignal<StreamItem[]>([receipt('first')]);
+  render(()=><Subagents items={items()} missionId="m" workspaceId="w"/>);
+  const row=await screen.findByRole('button',{name:/Stable child/});
+  fireEvent.click(row);
+  setItems([receipt('first'),receipt('second')]);
+  expect(screen.getByRole('button',{name:/Stable child/})).toBe(row);
+  expect(row.getAttribute('aria-expanded')).toBe('true');
+  setItems([]);
+  expect(screen.getByRole('button',{name:/Stable child/})).toBe(row);
+  expect(row.getAttribute('aria-expanded')).toBe('true');
+});
