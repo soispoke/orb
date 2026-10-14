@@ -77,11 +77,11 @@ function mergeStreamBySequence(older: StreamEvent[], newer: StreamEvent[]): Stre
 
 async function fetchTranscript(id: string): Promise<TranscriptSnap> {
   const version=connectionVersion();const check=()=>{if(version!==connectionVersion())throw Error("Connection changed during transcript load.");};
-  // Start pending queue read in parallel with the event page read rather than
-  // blocking the event log round-trip on /queue. Any delivery racing this read
-  // wins by message identity in the reducer; held SSE fills the live boundary.
+  // Read the authoritative queue after history. An older queue snapshot must
+  // not erase a message accepted while the history request was in flight.
+  // Held SSE events cover deliveries after this snapshot.
   let queueError: string | undefined;
-  const queuedPromise = listQueuedMessages(id).catch(error => {
+  const readQueue = () => listQueuedMessages(id).catch(error => {
     queueError = `Queued messages could not refresh: ${error instanceof Error ? error.message : String(error)}`;
     return [];
   });
@@ -115,7 +115,7 @@ async function fetchTranscript(id: string): Promise<TranscriptSnap> {
    if(page.nextCursor!==undefined){if(page.nextCursor<=cursor)throw Error('Event cursor did not advance.');cursor=page.nextCursor;}
    if(!page.hasMore)break;
   }
-  const queued = await queuedPromise;
+  const queued = await readQueue();
   check();
   if (!queueError) {
     const pendingIds = new Set(queued.map(row => row.id));

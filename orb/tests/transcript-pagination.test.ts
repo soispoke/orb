@@ -106,3 +106,15 @@ it('keeps queued history when the authoritative queue cannot be reached',async()
  expect(result.items.some(i=>i.kind==='user'&&i.text==='Keep this')).toBe(true);
  expect(result.queueError).toContain('Offline');
 });
+
+it('reads the queue after history so a racing acceptance is not erased',async()=>{
+ let finish!:(page:unknown)=>void;
+ mocks.page.mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+ const loading=loadTranscript('queue-race');
+ await vi.waitFor(()=>expect(mocks.page).toHaveBeenCalled());
+ expect(mocks.queue).not.toHaveBeenCalled();
+ mocks.queue.mockResolvedValue([{id:'new',content:'New message',mission_id:'queue-race'}]);
+ finish({events:[{id:1,event_id:'new',sequence:1,event_type:'user_message',content:'New message',timestamp:'',metadata:{queued:true}}],hasMore:false,pageMax:1});
+ const result=await loading;
+ expect(result.items.filter(i=>i.kind==='user'&&i.messageId==='new')).toHaveLength(1);
+});
