@@ -105,3 +105,17 @@ it('keeps an expanded Workflow child mounted when another workflow appears or hi
   expect(screen.getByRole('button',{name:/Stable child/})).toBe(row);
   expect(row.getAttribute('aria-expanded')).toBe('true');
 });
+
+it('does not restart Workflow polling when mission metadata refreshes with the same workspace', async () => {
+  const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/.claude/subagents/workflows/stable\nRun ID: stable'};
+  const fetcher=vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({type:'started',agentId:'a',label:'Metadata stable'}))).mockReturnValue(new Promise(()=>{}));
+  vi.stubGlobal('fetch',fetcher);
+  const [mission,setMission]=createSignal({id:'m',workspace_id:'w',status:'active'});
+  render(()=><Subagents items={[receipt]} missionId={mission().id} workspaceId={mission().workspace_id}/>);
+  const row=await screen.findByRole('button',{name:/Metadata stable/});
+  fireEvent.click(row);
+  setMission({id:'m',workspace_id:'w',status:'idle'});
+  expect(screen.getByRole('button',{name:/Metadata stable/})).toBe(row);
+  expect(row.getAttribute('aria-expanded')).toBe('true');
+  expect(fetcher).toHaveBeenCalledTimes(1);
+});

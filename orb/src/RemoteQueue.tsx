@@ -57,6 +57,7 @@ export function RemoteQueue(p: {
     return out;
   };
   const [error, setError] = createSignal("");
+  let deliveryErrorId: string | undefined;
   const [cancelling, setCancelling] = createSignal<string>();
   const [working, setWorking] = createSignal(false);
   const [collapsed, setCollapsed] = createSignal(false);
@@ -76,6 +77,9 @@ export function RemoteQueue(p: {
         const pending = (await listQueuedMessages(mission)).filter(row => !row.inflight && !deletedIds.has(row.id) && (row.source === "remote-queue" || row.source?.startsWith("host-queue:api:")));
         if (disposed || started !== revision || version !== connectionVersion()) return;
         const present = new Set(pending.map(row => row.id));
+        if (deliveryErrorId && captured.has(deliveryErrorId) && !present.has(deliveryErrorId)) {
+          deliveryErrorId = undefined; setError("");
+        }
         for (const id of captured) if (!present.has(id)) { deletedIds.add(id); p.onCancel(id); }
         setRows(pending); p.onRows(pending.map(row => row.id));
       } catch { /* Keep the last confirmed inbox during a network interruption. */ }
@@ -126,7 +130,7 @@ export function RemoteQueue(p: {
     const list = visibleRows();
     const target = targetId ? list.find(r => r.id === targetId) : list[0];
     if (!target) return;
-    setWorking(true); setError("");
+    setWorking(true); setError(""); deliveryErrorId = target.id;
     const version = connectionVersion(), mission = p.mission;
     try {
       const live = await api<{ ok?: boolean; delivered?: boolean }>(`/api/control/queue/${encodeURIComponent(target.id)}/send-now`, { method: "POST" });
@@ -152,7 +156,11 @@ export function RemoteQueue(p: {
         setRows(previous => previous.filter(row => row.id !== target.id));
         p.onRows(rows().map(row => row.id)); p.onCancel(target.id);
         setError('');
-      } else setError(message);
+      } else if (deletedIds.has(target.id)) {
+        deliveryErrorId = undefined; setError('');
+      } else setError(/abort|timed? ?out/i.test(message)
+        ? "Delivery wasn’t confirmed. Checking the queue; this message won’t be resent automatically."
+        : message);
     } finally {
       setWorking(false);
     }

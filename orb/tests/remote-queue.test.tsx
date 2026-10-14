@@ -197,3 +197,16 @@ it('reconciles a send-now 404 without resending or leaving a zero-item sending i
   expect(screen.queryByRole('alert')).toBeNull();
   expect(send).not.toHaveBeenCalled(); expect(backend.api).toHaveBeenCalledTimes(1);
 });
+
+it('reconciles an aborted send without resending and clears its stale error when dequeued', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'Status?',source:'remote-queue'}]);
+  backend.api.mockRejectedValue(new DOMException('Fetch is aborted','AbortError'));
+  const send=vi.fn();
+  render(()=><RemoteQueue mission="remote" onRows={()=>{}} onCancel={()=>{}} onSendImmediate={send}/>);
+  await screen.findByText('Status?');
+  fireEvent.click(screen.getByRole('button',{name:'Send now: Status?'}));
+  expect((await screen.findByRole('alert')).textContent).toContain('Delivery wasn’t confirmed');
+  backend.list.mockResolvedValue([]);
+  await waitFor(()=>expect(screen.queryByRole('alert')).toBeNull(),{timeout:4000});
+  expect(send).not.toHaveBeenCalled(); expect(backend.api).toHaveBeenCalledTimes(1);
+});
