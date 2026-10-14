@@ -188,3 +188,26 @@ it('deduplicates trimmed terminal assistant_message receipt against native antig
  expect(texts(items)[0].text).toBe(`${msg}\n\n`);
 });
 
+
+
+it('keeps an in-flight response and command alive across delivered follow-ups',()=>{
+ const user=ev('user_message',{id:'steer',content:'Explain simply'});
+ const events=[snap('I will update the runner.'),tool,user,user,snap('I will update the runner.')];
+ const replay=buildTranscript(events);
+ let live=buildTranscript([]);for(const event of events)live=applyStreamEvent(live,event);
+ for(const items of [replay,live]){
+  expect(texts(items)).toMatchObject([{text:'I will update the runner.',live:true}]);
+  expect(items.filter(i=>i.kind==='user')).toHaveLength(1);
+  expect(items.find(i=>i.kind==='tool')).toMatchObject({done:false});
+ }
+ live=applyStreamEvent(live,result);
+ live=applyStreamEvent(live,final('The runner is updated.','first-response'));
+ live=applyStreamEvent(live,snap('Here is the simple explanation.'));
+ expect(texts(live)).toMatchObject([{text:'The runner is updated.',live:false},{text:'Here is the simple explanation.',live:true}]);
+});
+
+it('preserves deliberately repeated submissions with distinct message identities',()=>{
+ const items=buildTranscript([snap('Working'),ev('user_message',{id:'one',content:'Explain simply'}),ev('user_message',{id:'two',content:'Explain simply'}),snap('Working')]);
+ expect(items.filter(i=>i.kind==='user')).toHaveLength(2);
+ expect(texts(items)).toHaveLength(1);
+});

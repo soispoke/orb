@@ -9,7 +9,7 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:browser": "playwright test",
-    "build:desktop": "tauri build --no-bundle -- --jobs 1"
+    "build:desktop": "tauri build --bundles app -- --jobs 1"
   },
   "dependencies": {
     "katex": "^0.18.9",

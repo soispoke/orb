@@ -154,7 +154,7 @@ impl Drop for SessionGuard {
 #[derive(Default)]
 pub(crate) struct ClaudeBackground {
     tasks: HashSet<String>,
-    has_snapshot: bool,
+    terminal_tasks: HashSet<String>,
 }
 
 impl ClaudeBackground {
@@ -165,22 +165,42 @@ impl ClaudeBackground {
         match event["subtype"].as_str() {
             Some("background_tasks_changed") => {
                 if let Some(tasks) = event["tasks"].as_array() {
-                    self.has_snapshot = true;
+                    for task in tasks {
+                        if matches!(
+                            task["status"].as_str(),
+                            Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
+                        ) {
+                            if let Some(id) = task["task_id"].as_str() {
+                                self.terminal_tasks.insert(id.into());
+                            }
+                        }
+                    }
                     self.tasks = tasks
                         .iter()
                         .filter(|task| task["ambient"] != true)
-                        .filter_map(|task| task["task_id"].as_str().map(str::to_owned))
+                        .filter(|task| {
+                            !matches!(
+                                task["status"].as_str(),
+                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
+                            )
+                        })
+                        .filter_map(|task| task["task_id"].as_str())
+                        .filter(|id| !self.terminal_tasks.contains(*id))
+                        .map(str::to_owned)
                         .collect();
                 }
             }
-            Some("task_started") if !self.has_snapshot && event["ambient"] != true => {
+            Some("task_started") if event["ambient"] != true => {
                 if let Some(id) = event["task_id"].as_str() {
-                    self.tasks.insert(id.into());
+                    if !self.terminal_tasks.contains(id) {
+                        self.tasks.insert(id.into());
+                    }
                 }
             }
-            Some("task_notification") if !self.has_snapshot => {
+            Some("task_notification") => {
                 if let Some(id) = event["task_id"].as_str() {
                     self.tasks.remove(id);
+                    self.terminal_tasks.insert(id.into());
                 }
             }
             _ => {}
@@ -207,12 +227,28 @@ mod tests {
             "tasks":[{"task_id":"b"},{"task_id":"c","ambient":true}]}),
         );
         assert_eq!(background.running(), 1);
-        // Edges are ignored once the CLI sends snapshots.
+        // A terminal edge remains authoritative even after snapshots begin.
         background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"b"}));
+        assert_eq!(background.running(), 0);
+        background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b"}]}));
+        assert_eq!(background.running(), 0);
+        background.consume(&json!({"type":"system","subtype":"task_started","task_id":"d"}));
         assert_eq!(background.running(), 1);
         background
             .consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}));
         assert_eq!(background.running(), 0);
+    }
+
+    #[test]
+    fn terminal_snapshot_entries_do_not_keep_the_runner_parked() {
+        let mut background = ClaudeBackground::default();
+        background.consume(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_id":"a","status":"completed"},{"task_id":"b","status":"failed"},
+                {"task_id":"c","status":"stopped"},{"task_id":"d","status":"running"}
+            ]}),
+        );
+        assert_eq!(background.running(), 1);
     }
 
     #[test]

@@ -85,6 +85,17 @@ export class TranscriptReducer {
     }
     this.bubbles.clear();
   }
+  private beginUserTurn() {
+    // Delivery can happen while the harness is still processing the previous
+    // response. Only a producer completion settles its text and tools. Keep
+    // live bubble identities so a cumulative snapshot cannot repeat that reply
+    // below the follow-up, or mark a still-running command as finished.
+    for (const [bubble, index] of this.bubbles) {
+      const item = this.items[index];
+      if (item?.kind !== "text" || !item.live) this.bubbles.delete(bubble);
+    }
+    this.lastFinal = undefined;
+  }
   apply(ev: StreamEvent) {
     this.identity=ev.eventId??(ev.storedId!==undefined?`stored:${ev.storedId}`:ev.sequence!==undefined?`seq:${ev.sequence}`:undefined);this.nextForEvent=0;
     // The persisted text snapshot keeps its row/event ID as its sequence advances.
@@ -118,7 +129,7 @@ export class TranscriptReducer {
           if (previous.receipt && d.receipt !== true) this.put(index, { ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, receipt: false });
           return;
         }
-        this.close(); this.lastFinal = undefined;
+        this.beginUserTurn();
         // A queued row may precede text that arrived while it was waiting.
         // Delivery places it after that response without changing its identity.
         this.items.splice(index, 1);
@@ -129,7 +140,7 @@ export class TranscriptReducer {
         this.items.push({ ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, queued: false, receipt: d.receipt === true });
         return;
       }
-      if (!queued) { this.close(); this.lastFinal = undefined; }
+      if (!queued) { this.beginUserTurn(); }
       if (messageId) this.users.set(messageId, this.items.length);
       this.items.push({ kind: "user", key: messageId ? `user:${messageId}` : this.key("user"), text: str(d.content), messageId, source, queued, attached: d.attached === true, receipt: d.receipt === true });
       return;
@@ -139,7 +150,7 @@ export class TranscriptReducer {
     if (identity && this.seen.has(identity)) return;
     if (identity) this.seen.add(identity);
     const bubble = str(d.bubble_id) || "text_delta_latest";
-    const channel = `${ev.type}:${bubble}`;
+    const channel = ev.type === "subagent_update" ? `subagent_update:${str((d.agent as {id?: unknown} | undefined)?.id)}` : `${ev.type}:${bubble}`;
     if (ev.sequence != null) {
       if (ev.sequence < (this.seq.get(channel) ?? -1)) return;
       this.seq.set(channel, ev.sequence);
@@ -152,6 +163,7 @@ export class TranscriptReducer {
         const index = this.items.findIndex(i => i.kind === "subagent" && i.agent.id === agent.id);
         const previous = index < 0 ? undefined : this.items[index];
         const old = previous?.kind === "subagent" ? previous.agent : undefined;
+        if (old && ["completed", "failed", "stopped"].includes(old.status) && ["running", "waiting", "unknown"].includes(agent.status)) break;
         const parsed = Date.parse(ev.timestamp ?? "");
         const time = Number.isFinite(parsed) ? parsed : undefined;
         const terminal = ["completed", "finished", "failed", "stopped"].includes(agent.status);
@@ -277,6 +289,13 @@ export class TranscriptReducer {
         const status = str(d.status).toLowerCase();
         if (["completed", "failed", "not_feasible", "interrupted", "cancelled", "canceled"].includes(status)) {
           this.close();
+        }
+        if (["failed", "not_feasible", "interrupted", "cancelled", "canceled", "paused"].includes(status)) {
+          for (let i = 0; i < this.items.length; i++) {
+            const item = this.items[i];
+            if (item.kind === "subagent" && ["running", "waiting"].includes(item.agent.status))
+              this.put(i, {...item, agent: {...item.agent, status: "unknown"}});
+          }
         }
         const summary = str(d.summary ?? d.content).trim();
         if (["failed", "not_feasible"].includes(status) && summary) {

@@ -2643,6 +2643,7 @@ mod path_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn linux_pid_helpers_see_this_process() {
         let pid = std::process::id();
         assert!(linux_pid_is_alive(pid));
