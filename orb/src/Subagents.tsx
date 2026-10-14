@@ -67,8 +67,12 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
   const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
   const [workflowError, setWorkflowError] = createSignal(false);
   const journals = createMemo(() => workflowJournals(p.items), [], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
+  // Parent mission objects refresh frequently. Only a change of identity
+  // should restart the reader, clear its rows, and reset disclosures.
+  const missionIdentity = createMemo(() => p.missionId);
+  const workspaceIdentity = createMemo(() => p.workspaceId);
   createEffect(() => {
-    const mission = p.missionId, workspace = p.workspaceId;
+    const mission = missionIdentity(), workspace = workspaceIdentity();
     connectionVersion();
     setWorkflowRows([]); setWorkflowError(false);
     if (!mission || !workspace) return;
