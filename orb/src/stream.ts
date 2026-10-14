@@ -25,6 +25,7 @@ export function isGeneratedRemoteJobStatus(ev: Pick<StoredEvent, "content" | "me
 }
 
 export interface StreamEvent {
+  timestamp?: string;
   eventId?: string;
   sequence?: number;
   storedId?: number;
@@ -66,7 +67,7 @@ export async function getMissionEvents(id:string):Promise<StoredEvent[]>{return 
 
 /** Map a stored (replayed) event row onto the live-stream event shape. */
 export function storedToStream(ev: StoredEvent): StreamEvent | null {
-  const d = (obj: Record<string, unknown>): StreamEvent => ({ type: ev.event_type, data: obj, eventId: ev.event_id ?? undefined, sequence: ev.sequence, storedId: ev.id });
+  const d = (obj: Record<string, unknown>): StreamEvent => ({ timestamp: ev.timestamp, type: ev.event_type, data: obj, eventId: ev.event_id ?? undefined, sequence: ev.sequence, storedId: ev.id });
   switch (ev.event_type) {
     case "text_delta":
       return d({ content: ev.content });
@@ -195,7 +196,7 @@ export function streamMission(
           }
           try {
             const parsed = JSON.parse(data);
-            deliver({ type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence });
+            deliver({ timestamp: parsed.timestamp ?? new Date().toISOString(), type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence });
           } catch {
             /* malformed frame — skip */
           }

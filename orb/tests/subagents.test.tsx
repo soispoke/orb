@@ -69,3 +69,8 @@ it('keeps new live agents visible beyond folded history, including after complet
  expect(screen.getByRole('button',{name:/Inspect parser/})).toBe(row);
  expect(row.getAttribute('aria-expanded')).toBe('true');
 });
+
+it('preserves the launch time when a terminal lifecycle event has no start timestamp', () => {
+ const items: StreamItem[]=[{...call,startedAt:1000}, {...agent('completed'),agent:{id:'a',tool_call_id:'call',description:'Inspect parser',status:'completed',startedAt:undefined,finishedAt:64000}} as StreamItem];
+ expect(collectSubagents(items)[0]).toMatchObject({startedAt:1000,finishedAt:64000});
+});
