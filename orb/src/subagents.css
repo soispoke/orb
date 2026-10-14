@@ -11,15 +11,24 @@
 .subagents-list[hidden], .subagent-details[hidden] { display: none; }
 .subagent-description { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .subagent-status { flex-shrink: 0; }
-.subagent-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--fg-3); opacity: .55; transition: background-color 180ms ease, opacity 180ms ease; }
-.subagent[data-state=running] .subagent-dot { background: var(--blue, #529bff); opacity: 1; animation: subagent-pulse 1.8s ease-in-out infinite; }
-.subagent[data-state=waiting] .subagent-dot, .subagent[data-state=unknown] .subagent-dot { background: var(--warning, #c79b46); opacity: 1; }
-.subagent[data-state=failed] .subagent-dot { background: var(--danger, #d57979); opacity: 1; }
+.subagent-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--fg-3); opacity: .55; transition: background-color 180ms ease, opacity 180ms ease; }
+.subagent[data-state=running] .subagent-dot { background: #269dff; opacity: 1; box-shadow: 0 0 0 3px #269dff26, 0 0 10px #269dff99; animation: subagent-pulse 1.5s ease-in-out infinite; }
+.subagent[data-state=waiting] .subagent-dot, .subagent[data-state=unknown] .subagent-dot { background: #ffbb32; opacity: 1; box-shadow: 0 0 7px #ffbb3266; }
+.subagent[data-state=failed] .subagent-dot { background: #ff5268; opacity: 1; box-shadow: 0 0 7px #ff526866; }
 .subagent[data-state=failed] .subagent-status { color: var(--danger, #d57979); }
 .subagent-details { margin: 0 12px 10px 29px; padding-left: 12px; border-left: 1px solid var(--stroke); }
 .subagent-detail-label { color: var(--fg-3); font-size: 11px; margin: 10px 0 4px; }
 .subagent-details pre { font: inherit; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; margin: 0; }
 .subagents-more { background: transparent; border: 0; color: var(--fg-3); padding: 8px 12px; cursor: pointer; font-size: 11px; }
-@keyframes subagent-pulse { 50% { opacity: .45; } }
+@keyframes subagent-pulse { 50% { box-shadow: 0 0 0 5px #269dff12, 0 0 15px #269dffcc; } }
 @media (prefers-reduced-motion: reduce) { .subagent-dot { animation: none !important; transition: none; } .subagents-chevron { transition: none; } }
 @media (max-width: 440px) { .subagent-toggle { gap: 7px; padding-inline: 8px; } .subagent-status { max-width: 90px; } }
+
+.subagents-overview { display:flex; gap:16px; padding:6px 12px 12px; color:var(--fg-3); font-size:11px; }
+.subagent { border:1px solid var(--stroke); border-radius:9px; margin:6px 4px; background:var(--hover); }
+.subagent-toggle { min-height:58px; }
+.subagent-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:5px; }
+.subagent-metrics { display:flex; flex-wrap:wrap; gap:5px 12px; color:var(--fg-3); font-size:11px; }
+.subagent-metrics:empty { display:none; }
+.subagent[data-state=running] .subagent-status { color:#269dff; }
+.subagent[data-state=completed] .subagent-dot, .subagent[data-state=finished] .subagent-dot { background:#8a8a92; box-shadow:none; }

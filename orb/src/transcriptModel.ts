@@ -12,6 +12,8 @@ export type StreamItem =
       kind: "tool";
       key: string;
       callId: string;
+      startedAt?: number;
+      finishedAt?: number;
       name: string;
       args: unknown;
       result?: unknown;
@@ -133,7 +135,13 @@ export class TranscriptReducer {
         const agent = d.agent as import("./Subagents").Subagent;
         if (!agent || typeof agent.id !== "string" || typeof agent.description !== "string") break;
         const index = this.items.findIndex(i => i.kind === "subagent" && i.agent.id === agent.id);
-        const item: StreamItem = {kind: "subagent", key: `subagent:${agent.id}`, text: agent.description, agent};
+        const previous = index < 0 ? undefined : this.items[index];
+        const old = previous?.kind === "subagent" ? previous.agent : undefined;
+        const parsed = Date.parse(ev.timestamp ?? "");
+        const time = Number.isFinite(parsed) ? parsed : undefined;
+        const terminal = ["completed", "finished", "failed", "stopped"].includes(agent.status);
+        const enriched = {...agent, startedAt: old?.startedAt ?? agent.startedAt ?? (agent.status === "running" ? time : undefined), finishedAt: old?.finishedAt ?? agent.finishedAt ?? (terminal ? time : undefined)};
+        const item: StreamItem = {kind: "subagent", key: `subagent:${agent.id}`, text: agent.description, agent: enriched};
         if (index < 0) this.items.push(item); else this.put(index, item);
         break;
       }
@@ -238,14 +246,16 @@ export class TranscriptReducer {
       case "tool_call":
       case "tool_result": {
         const callId=str(d.tool_call_id), index=this.tools.get(callId);
+        const parsedTime = Date.parse(ev.timestamp ?? "");
+        const time = Number.isFinite(parsedTime) ? parsedTime : undefined;
         if(index!=null){
           const old=this.items[index];
-          if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result:d.result,done:true,unresolved:false});
-          else if(old.kind==="tool"&&ev.type==="tool_call")this.put(index,{...old,name:str(d.name)||old.name,args:d.args??old.args});
+          if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result:d.result,done:true,unresolved:false,finishedAt:old.finishedAt ?? time});
+          else if(old.kind==="tool"&&ev.type==="tool_call")this.put(index,{...old,name:str(d.name)||old.name,args:d.args??old.args,startedAt:old.startedAt ?? time});
           return;
         }
         this.tools.set(callId,this.items.length);
-        this.items.push({kind:"tool",key:`tool:${callId}`,callId,name:str(d.name)||"tool",args:d.args??null,...(ev.type==="tool_result"?{result:d.result}:{}),done:ev.type==="tool_result"});return;
+        this.items.push({kind:"tool",key:`tool:${callId}`,callId,...(ev.type==="tool_call"?{startedAt:time}:{finishedAt:time}),name:str(d.name)||"tool",args:d.args??null,...(ev.type==="tool_result"?{result:d.result}:{}),done:ev.type==="tool_result"});return;
       }
       case "error": this.close(); this.items.push({kind:"error",key:this.key("error"),text:str(d.message)});return;
       case "mission_status_changed": {

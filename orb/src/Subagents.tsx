@@ -3,6 +3,7 @@ import {anchoredDisclosure} from './anchoredDisclosure';
 import type {StreamItem} from './transcriptModel';
 import type {LocalActivity} from './localAgents';
 import './subagents.css';
+import {ElapsedTime} from './ElapsedTime';
 
 export interface Subagent {
   id: string;
@@ -11,6 +12,11 @@ export interface Subagent {
   status: string;
   detail?: string | null;
   prompt?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  model?: string;
+  tokens?: number;
+  phase?: string;
 }
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' ? value as Record<string, unknown> : {};
 const text = (value: unknown): string => {
@@ -31,7 +37,8 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
     const background = args.run_in_background === true;
     rows.set(item.callId, {
       id: item.callId, description: label(args.description) || label(args.subagent_type) || 'Subagent',
-      prompt: label(args.prompt),
+      prompt: label(args.prompt), model: label(args.model) || undefined, phase: label(args.phase) || undefined,
+      startedAt: item.startedAt, finishedAt: background ? undefined : item.finishedAt,
       status: item.unresolved ? 'unknown' : result.is_error === true ? 'failed' : background ? (item.done ? 'unknown' : 'running') : item.done ? 'completed' : 'running',
       detail: item.done && !background ? text(item.result) : undefined,
     });
@@ -39,7 +46,7 @@ export function collectSubagents(items: StreamItem[], local: LocalActivity[] = [
   for (const item of items) {
     if (item.kind !== 'subagent') continue;
     const agent = item.agent, key = agent.tool_call_id || agent.id, old = rows.get(key);
-    rows.set(key, {...old, ...agent, id: key, description: agent.description === 'Subagent' && old ? old.description : agent.description});
+    rows.set(key, {...old, ...agent, startedAt: agent.startedAt ?? old?.startedAt, finishedAt: agent.finishedAt ?? old?.finishedAt, id: key, description: agent.description === 'Subagent' && old ? old.description : agent.description});
   }
   const spawned = new Set(local.filter(a => a.background && a.kind === 'agent').map(a => a.tool_use_id));
   for (const activity of local) {
@@ -62,6 +69,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
   let toggle!: HTMLButtonElement;
   const status = (agent: Subagent) => p.interrupted && agent.status === 'running' ? 'unknown' : agent.status;
   const working = () => agents().filter(a => status(a) === 'running').length;
+  const completed = () => agents().filter(a => ['completed', 'finished'].includes(status(a))).length;
   const failed = () => agents().filter(a => status(a) === 'failed').length;
   // Iterate IDs, not fresh event objects: an update never remounts an open row.
   const revealed = createMemo<Set<string>>(previous => {
@@ -77,6 +85,7 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
       <span class="subagents-summary">{working() ? `${working()} working` : 'Activity'}{failed() ? ` · ${failed()} failed` : ''}</span>
     </button>
     <div hidden={!expanded()} class="subagents-list">
+      <div class="subagents-overview"><span>{agents().length} agents</span><span>{working()} working</span><span>{completed()} finished</span></div>
       <For each={visible()}>{id => {
         const agent = () => agents().find(a => a.id === id)!;
         const [open, setOpen] = createSignal(false);
@@ -84,7 +93,15 @@ export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; inte
         return <div class="subagent" data-state={status(agent())}>
           <button ref={row} class="subagent-toggle" aria-expanded={open()} onClick={() => anchored(row, () => setOpen(v => !v))}>
             <span class="subagent-dot" aria-hidden="true"/>
-            <span class="subagent-description" title={agent().description}>{agent().description}</span>
+            <span class="subagent-copy">
+              <span class="subagent-description" title={agent().description}>{agent().description}</span>
+              <span class="subagent-metrics">
+                <Show when={agent().phase}><span>{agent().phase}</span></Show>
+                <Show when={agent().model}><span>{agent().model}</span></Show>
+                <Show when={agent().tokens !== undefined}><span>{agent().tokens!.toLocaleString()} tokens</span></Show>
+                <ElapsedTime startedAt={agent().startedAt} finishedAt={agent().finishedAt} running={status(agent()) === 'running'} />
+              </span>
+            </span>
             <span class="subagent-status">{states[status(agent())] ?? 'Status unavailable'}</span>
             <span class="subagents-chevron" data-open={open()} aria-hidden="true">›</span>
           </button>

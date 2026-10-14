@@ -1,3 +1,4 @@
+import {ElapsedTime} from "./ElapsedTime";
 import {AutomaticReminder, reminderMessages} from "./AutomaticReminder";
 import { ErrorToast } from "./toast";
 import {PromptEditor} from "./PromptEditor";
@@ -397,6 +398,7 @@ function ToolRow(p: { item: Extract<StreamItem, { kind: "tool" }> }) {
         <Show when={diff()}>
           {d => <DiffBadges stats={d()} />}
         </Show>
+        <ElapsedTime startedAt={p.item.startedAt} finishedAt={p.item.unresolved ? undefined : p.item.finishedAt} running={!p.item.done} />
         <span class="st-tool-state">
           <Show when={p.item.done} fallback={<Ic.Spinner size={12} />}>
             <span class="st-tool-check" classList={{"is-failed":failed()}} title={p.item.unresolved?"No result recorded":failed()?"Failed":undefined}>{p.item.unresolved?"—":failed()?"!":"✓"}</span>
@@ -467,6 +469,10 @@ function WorkFold(p: { items: WorkItem[] }) {
     return `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim();
   };
   const summary = createMemo(() => workSummary(p.items));
+  const runningSince = createMemo(() => {
+    const starts = p.items.flatMap(t => t.kind === "tool" && !t.done && t.startedAt !== undefined ? [t.startedAt] : []);
+    return starts.length ? Math.min(...starts) : undefined;
+  });
   const totalDiff = createMemo<DiffStats | null>(() => {
     let additions = 0, deletions = 0, has = false;
     for (const t of p.items) {
@@ -492,6 +498,7 @@ function WorkFold(p: { items: WorkItem[] }) {
         <Show when={running()} fallback={<span class="st-work-label">{summary()}</span>}>
           <span class="st-work-label shimmer">{current()}</span>
         </Show>
+        <ElapsedTime startedAt={runningSince()} running={running()} />
         <Show when={!running() && totalDiff()}>
           {d => <DiffBadges stats={d()} />}
         </Show>
