@@ -58,6 +58,21 @@ export class TranscriptReducer {
     return index;
   }
 
+  removeQueued(ids: ReadonlySet<string>) {
+    const positions = new Map<number, number>();
+    const next = this.items.filter((item, index) => {
+      if (item.kind === 'user' && item.queued && item.messageId && ids.has(item.messageId)) return false;
+      positions.set(index, positions.size); return true;
+    });
+    if (next.length === this.items.length) return;
+    for (const map of [this.users, this.tools, this.bubbles]) for (const [key, index] of map) {
+      const position = positions.get(index);
+      if (position === undefined) map.delete(key); else map.set(key, position);
+    }
+    if (this.lastFinal !== undefined) this.lastFinal = positions.get(this.lastFinal);
+    this.items = next;
+  }
+
   private close() {
     for (const index of this.bubbles.values()) {
       const item = this.items[index];
@@ -374,5 +389,16 @@ export function applyStreamEvents(items: StreamItem[], events: StreamEvent[]): S
   // array identity: a new one would re-run every memo and the turn list.
   if(reducer.items.length===items.length&&reducer.items.every((item,index)=>item===items[index])){reducer.items=items;states.set(items,reducer);return items;}
   states.set(reducer.items,reducer);
+  return reducer.items;
+}
+
+/** Queue reconciliation must preserve reducer identity and every live index. */
+export function removeQueuedMessages(items: StreamItem[], ids: ReadonlySet<string>): StreamItem[] {
+  if (!ids.size || !items.length) return items;
+  const reducer = states.get(items);
+  if (!reducer) throw new Error("Transcript must originate from buildTranscript");
+  reducer.items = items;
+  reducer.removeQueued(ids);
+  states.set(reducer.items, reducer);
   return reducer.items;
 }
