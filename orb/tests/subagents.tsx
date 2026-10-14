@@ -39,4 +39,5 @@ function PanelGallery() {
  <div class="dock"><div class="col">Composer</div></div>
  </BackgroundPanel></div>;
 }
-render(()=> location.search.includes('panel') ? <PanelGallery/> : location.search.includes('scroll') ? <ScrollGallery/> : <Gallery/>,document.getElementById('root')!);
+const workflow: StreamItem = {kind:'tool', key:'workflow', callId:'workflow', name:'Workflow', args:{}, done:true, result:'Transcript dir: /root/.claude/subagents/workflows/test'};
+render(()=> location.search.includes('workflow') ? <Subagents items={[workflow]} missionId="m" workspaceId="w"/> : location.search.includes('panel') ? <PanelGallery/> : location.search.includes('scroll') ? <ScrollGallery/> : <Gallery/>,document.getElementById('root')!);

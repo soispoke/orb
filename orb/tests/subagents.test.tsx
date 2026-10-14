@@ -55,7 +55,7 @@ describe('subagent lifecycle', () => {
   it('does not label interrupted work as successfully completed', () => {
     const {container}=render(() => <Subagents items={[agent()]} interrupted/>);
     expect(container.querySelector('.subagent')?.getAttribute('data-state')).toBe('unknown');
-    expect(screen.getByText('Status unavailable')).toBeTruthy();
+    expect(screen.getByText('Status unconfirmed')).toBeTruthy();
   });
 });
 
@@ -83,7 +83,8 @@ it('loads real Workflow children through the mission-scoped API and cancels on u
   const {unmount,container} = render(() => <Subagents items={[receipt]} missionId="mission" workspaceId="workspace"/>);
   await screen.findByRole('button', {name:/subagent-1/});
   expect(container.querySelectorAll('.subagent')).toHaveLength(2);
-  expect(container.querySelectorAll('[data-state="running"]')).toHaveLength(1);
+  expect(container.querySelectorAll('[data-state="running"]')).toHaveLength(0);
+  expect(container.querySelectorAll('[data-state="unknown"]')).toHaveLength(1);
   expect(fetcher.mock.calls[0][0]).toContain('mission_id=mission');
   const signal = fetcher.mock.calls[0][1].signal as AbortSignal;
   unmount();
@@ -133,7 +134,7 @@ it('loads child activity only when expanded and keeps lifecycle status from the 
  fireEvent.click(row);
  expect(await screen.findByText('Bash: Checking proof results')).toBeTruthy();
  expect(screen.getByText(/Last recorded activity:/)).toBeTruthy();
- expect(row.textContent).toContain('Working');
+ expect(row.textContent).toContain('Status unconfirmed');
  expect(fetcher.mock.calls[1][0]).toContain('agent-agent1.jsonl');
  view.unmount();
 });
