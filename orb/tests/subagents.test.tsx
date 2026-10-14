@@ -138,3 +138,27 @@ it('loads child activity only when expanded and keeps lifecycle status from the 
  expect(fetcher.mock.calls[1][0]).toContain('agent-agent1.jsonl');
  view.unmount();
 });
+
+
+it('accepts out-of-order updates for different children without losing either', () => {
+ const update=(id:string,status:string,sequence:number)=>({type:'subagent_update',sequence,data:{agent:{id,description:id,status}}});
+ let items=buildTranscript([update('a','running',1),update('b','running',2)]);
+ items=applyStreamEvent(items,update('a','completed',5));
+ items=applyStreamEvent(items,update('b','failed',4));
+ expect(collectSubagents(items).map(a=>a.status)).toEqual(['completed','failed']);
+});
+
+it('does not revive a completed child from a late running notification', () => {
+ let items=buildTranscript([{type:'subagent_update',sequence:1,data:{agent:{id:'a',description:'A',status:'completed'}}}]);
+ items=applyStreamEvent(items,{type:'subagent_update',sequence:2,data:{agent:{id:'a',description:'A',status:'running'}}});
+ expect(collectSubagents(items)[0].status).toBe('completed');
+});
+
+it('keeps prior children unconfirmed when an interrupted mission resumes', () => {
+ let items=buildTranscript([{type:'subagent_update',sequence:1,data:{agent:{id:'a',description:'A',status:'running'}}},
+  {type:'mission_status_changed',sequence:2,data:{status:'interrupted'}}]);
+ items=applyStreamEvent(items,{type:'mission_status_changed',sequence:3,data:{status:'active'}});
+ expect(collectSubagents(items)[0].status).toBe('unknown');
+ items=applyStreamEvent(items,{type:'subagent_update',sequence:4,data:{agent:{id:'a',description:'A',status:'running'}}});
+ expect(collectSubagents(items)[0].status).toBe('running');
+});

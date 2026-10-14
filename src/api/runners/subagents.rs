@@ -1,7 +1,10 @@
 //! Native child-task lifecycle, independent of the parent's tool/turn completion.
+use crate::api::control::AgentEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use tokio::sync::broadcast;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Subagent {
@@ -49,8 +52,9 @@ impl ClaudeSubagents {
                                 .iter()
                                 .any(|t| t["task_id"].as_str() == Some(&agent.id))
                         {
-                            // Disappearance proves neither success nor failure.
-                            agent.status = "finished".into();
+                            // A missing task is no longer confirmed live. Only a
+                            // terminal receipt can establish its outcome.
+                            agent.status = "unknown".into();
                         }
                     }
                 }
@@ -92,20 +96,71 @@ impl ClaudeSubagents {
         if let Some(label) = value["description"].as_str().filter(|s| !s.is_empty()) {
             agent.description = label.chars().take(240).collect();
         }
-        if value["subtype"] == "task_notification" {
-            agent.status = match value["status"].as_str() {
-                Some("completed") => "completed",
-                Some("failed") => "failed",
-                Some("stopped") => "stopped",
-                _ => "finished",
-            }
-            .into();
+        let reported_terminal = terminal_status(value["status"].as_str());
+        if reported_terminal.is_some() || value["subtype"] == "task_notification" {
+            agent.status = reported_terminal.unwrap_or("finished").into();
             if let Some(summary) = value["summary"].as_str() {
                 agent.detail = Some(summary.chars().take(8000).collect());
             }
-        } else if agent.status == "running" {
+        } else if !is_terminal(&agent.status) {
+            // A subsequent live snapshot may resolve an unknown status.
+            agent.status = "running".into();
             if let Some(tool) = value["last_tool_name"].as_str() {
                 agent.detail = Some(format!("Using {tool}"));
+            }
+        }
+    }
+}
+
+fn terminal_status(status: Option<&str>) -> Option<&'static str> {
+    match status {
+        Some("completed") => Some("completed"),
+        Some("failed") => Some("failed"),
+        Some("stopped" | "cancelled" | "canceled") => Some("stopped"),
+        _ => None,
+    }
+}
+fn is_terminal(status: &str) -> bool {
+    terminal_status(Some(status)).is_some() || status == "finished"
+}
+
+/// Emits a final loss-of-liveness update on every runner exit, including early
+/// returns and future cancellation. A parent turn's result does not drop this
+/// guard while its native session remains alive with background tasks.
+pub(crate) struct ClaudeSubagentSession {
+    tracker: ClaudeSubagents,
+    events: broadcast::Sender<AgentEvent>,
+    mission: Uuid,
+}
+impl ClaudeSubagentSession {
+    pub(crate) fn new(events: broadcast::Sender<AgentEvent>, mission: Uuid) -> Self {
+        Self {
+            tracker: ClaudeSubagents::default(),
+            events,
+            mission,
+        }
+    }
+    pub(crate) fn consume(&mut self, event: &Value) {
+        for agent in self.tracker.consume(event) {
+            self.emit(agent);
+        }
+    }
+    fn emit(&self, agent: Subagent) {
+        let _ = self.events.send(AgentEvent::SubagentUpdate {
+            agent,
+            mission_id: Some(self.mission),
+        });
+    }
+}
+impl Drop for ClaudeSubagentSession {
+    fn drop(&mut self) {
+        for agent in self.tracker.agents.values() {
+            if agent.status == "running" {
+                let mut agent = agent.clone();
+                agent.status = "unknown".into();
+                agent.detail =
+                    Some("The runner disconnected before reporting this agent's outcome.".into());
+                self.emit(agent);
             }
         }
     }
@@ -137,7 +192,51 @@ mod tests {
                 .consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}))
                 [0]
             .status,
-            "finished"
+            "unknown"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regressions {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn snapshots_report_terminal_states_and_do_not_resurrect_finished_agents() {
+        let mut tracker = ClaudeSubagents::default();
+        let snapshot = |status| json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"local_agent","status":status}]});
+        assert_eq!(tracker.consume(&snapshot("running"))[0].status, "running");
+        assert_eq!(tracker.consume(&snapshot("failed"))[0].status, "failed");
+        assert!(tracker.consume(&snapshot("running")).is_empty());
+    }
+    #[test]
+    fn missing_tasks_are_unconfirmed_and_can_be_confirmed_live_again() {
+        let mut tracker = ClaudeSubagents::default();
+        let live = json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"local_agent"}]});
+        tracker.consume(&live);
+        assert_eq!(
+            tracker
+                .consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}))
+                [0]
+            .status,
+            "unknown"
+        );
+        assert_eq!(tracker.consume(&live)[0].status, "running");
+    }
+    #[test]
+    fn dropping_a_session_invalidates_only_unfinished_children() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mission = Uuid::new_v4();
+        let mut session = ClaudeSubagentSession::new(tx, mission);
+        session.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"local_agent"},{"task_id":"b","task_type":"local_agent","status":"completed"}]}));
+        while rx.try_recv().is_ok() {}
+        drop(session);
+        let AgentEvent::SubagentUpdate { agent, mission_id } = rx.try_recv().unwrap() else {
+            panic!("wrong event")
+        };
+        assert_eq!(agent.id, "a");
+        assert_eq!(agent.status, "unknown");
+        assert_eq!(mission_id, Some(mission));
+        assert!(rx.try_recv().is_err());
     }
 }
