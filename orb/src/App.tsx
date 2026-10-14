@@ -3375,7 +3375,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
             <Show when={clientPlaced() && localActivities(p.id).some(a => a.kind === "status" || a.id === "antigravity:status" || a.background || a.id.startsWith("task:"))}>
               <AgentActivity items={localActivities(p.id).filter(a => a.kind !== "agent")} running={localRunActive(p.id)} completed={activityShouldCollapse(mission()?.status, localRunActive(p.id))} />
             </Show>
-            <Subagents items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
+            <Subagents missionId={p.id} workspaceId={mission()?.workspace_id ?? undefined} items={viewItems()} local={clientPlaced() ? localActivities(p.id) : undefined} interrupted={["failed", "interrupted", "cancelled", "paused"].includes(mission()?.status ?? "")} />
             <NativeInteraction mission={p.id} active={clientPlaced() ? localRunActive(p.id) : busy()} remote={!clientPlaced()} items={viewItems()} onSend={text => sendMsg(text, [], [])} />
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={busy() || localQueueActive() || (!clientPlaced() && (remoteQueuedIds().length > 0 || items().some(i => i.kind === "user" && i.queued)))} error={clientPlaced() ? localFailure(p.id) : undefined} onResume={resume} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />

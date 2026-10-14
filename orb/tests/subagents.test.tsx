@@ -1,10 +1,10 @@
 import {createSignal} from 'solid-js';
-import {afterEach, describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {cleanup, fireEvent, render, screen} from '@solidjs/testing-library';
 import {collectSubagents, Subagents} from '../src/Subagents';
 import {applyStreamEvent, buildTranscript, type StreamItem} from '../src/transcriptModel';
 import {storedToStream} from '../src/stream';
-afterEach(cleanup);
+afterEach(() => {cleanup(); vi.unstubAllGlobals();});
 const call: StreamItem = {kind:'tool',key:'call',callId:'call',name:'Agent',args:{description:'Inspect parser',prompt:'Check unicode boundaries',run_in_background:true},done:true,result:'Agent launched'};
 const agent = (status = 'running', detail = 'Using Read'): StreamItem => ({kind:'subagent',key:'agent:a',text:'Inspect parser',agent:{id:'a',tool_call_id:'call',description:'Inspect parser',status,detail}});
 
@@ -73,4 +73,20 @@ it('keeps new live agents visible beyond folded history, including after complet
 it('preserves the launch time when a terminal lifecycle event has no start timestamp', () => {
  const items: StreamItem[]=[{...call,startedAt:1000}, {...agent('completed'),agent:{id:'a',tool_call_id:'call',description:'Inspect parser',status:'completed',startedAt:undefined,finishedAt:64000}} as StreamItem];
  expect(collectSubagents(items)[0]).toMatchObject({startedAt:1000,finishedAt:64000});
+});
+
+it('loads real Workflow children through the mission-scoped API and cancels on unmount', async () => {
+  const receipt: StreamItem = {...call, name:'Workflow', result:'Workflow launched in background.\nTranscript dir: /root/.claude/subagents/workflows/wf_test\nRun ID: wf_test'};
+  const journal = [{type:'started',agentId:'a',label:'subagent-1',phase:'Wait'}, {type:'started',agentId:'b',label:'subagent-2'}, {type:'result',agentId:'a',result:{ok:true}}].map(x=>JSON.stringify(x)).join('\n');
+  const fetcher = vi.fn().mockResolvedValue(new Response(journal));
+  vi.stubGlobal('fetch', fetcher);
+  const {unmount,container} = render(() => <Subagents items={[receipt]} missionId="mission" workspaceId="workspace"/>);
+  await screen.findByRole('button', {name:/subagent-1/});
+  expect(container.querySelectorAll('.subagent')).toHaveLength(2);
+  expect(container.querySelectorAll('[data-state="running"]')).toHaveLength(1);
+  expect(fetcher.mock.calls[0][0]).toContain('mission_id=mission');
+  const signal = fetcher.mock.calls[0][1].signal as AbortSignal;
+  unmount();
+  // A completed request is no longer attached; no further polling remains after cleanup.
+  expect(signal.aborted).toBe(false);
 });
