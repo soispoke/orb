@@ -8607,6 +8607,45 @@ async fn get_provider_usage(
         ));
     };
 
+    // Proxy-managed accounts have already been reconciled by their bound file.
+    // A ChatGPT workspace ID may be shared by multiple users; using it to look
+    // up a different credential silently reports that other user's quota.
+    if provider_type == ProviderType::OpenAI
+        && crate::api::oauth_owner::cli_proxy_owns(ProviderType::OpenAI)
+        && api_key_opt.is_none()
+    {
+        if let Some(oauth) = oauth.as_ref() {
+            let mut base = serde_json::json!({
+                "provider_type": "openai", "provider_name": provider_name,
+                "account_email": account_email, "status": "connected",
+            });
+            if let Some(account_id) = extract_chatgpt_account_id(&oauth.access_token) {
+                match crate::api::codex_usage::read_usage(
+                    &state.http_client,
+                    &oauth.access_token,
+                    &account_id,
+                )
+                .await
+                {
+                    Ok(snapshot) => return Ok(Json(merge_codex_usage(base, &snapshot))),
+                    Err(crate::api::codex_usage::UsageError::Unauthorized) => {
+                        base["status"] = serde_json::json!("needs_reauth");
+                        base["error"] = serde_json::json!(
+                            "This account's usage token was rejected; reconnect this account"
+                        );
+                    }
+                    Err(error) => {
+                        base["error"] = serde_json::json!(format!("Usage unavailable: {error:?}"));
+                    }
+                }
+            } else {
+                base["error"] =
+                    serde_json::json!("Usage unavailable: missing ChatGPT account identity");
+            }
+            return Ok(Json(base));
+        }
+    }
+
     // Codex can refresh its shared OAuth credential tier independently from
     // ai_providers.json. Reconcile the selected OpenAI provider before probing
     // usage so an expired store copy cannot hide a live Codex account behind a
