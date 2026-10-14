@@ -148,10 +148,10 @@ it('accepts out-of-order updates for different children without losing either', 
  expect(collectSubagents(items).map(a=>a.status)).toEqual(['completed','failed']);
 });
 
-it('does not revive a completed child from a late running notification', () => {
- let items=buildTranscript([{type:'subagent_update',sequence:1,data:{agent:{id:'a',description:'A',status:'completed'}}}]);
+it.each(['completed','finished','failed','stopped'])('does not revive a %s child from a late running notification', status => {
+ let items=buildTranscript([{type:'subagent_update',sequence:1,data:{agent:{id:'a',description:'A',status}}}]);
  items=applyStreamEvent(items,{type:'subagent_update',sequence:2,data:{agent:{id:'a',description:'A',status:'running'}}});
- expect(collectSubagents(items)[0].status).toBe('completed');
+ expect(collectSubagents(items)[0].status).toBe(status);
 });
 
 it('keeps prior children unconfirmed when an interrupted mission resumes', () => {
