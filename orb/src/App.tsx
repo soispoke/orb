@@ -1762,10 +1762,10 @@ export default function App() {
       if (state.text.trim()) await appendClientTranscript(id, "assistant", state.text, undefined, run);
       const failed = (state.exit_code != null && state.exit_code !== 0) || (!!state.error && !state.text.trim());
       if (failed) recordLocalFailure(id, state.error || `Local process exited with code ${state.exit_code}`);
-      await setClientMissionStatus(id, failed ? "failed" : "awaiting_user", run);
+      await setClientMissionStatus(id, failed ? "failed" : "awaiting_user", run, undefined, failed ? localFailure(id) : undefined);
     } catch (error) {
       recordLocalFailure(id, error);
-      await setClientMissionStatus(id, "failed", run).catch(() => {});
+      await setClientMissionStatus(id, "failed", run, undefined, localFailure(id)).catch(() => {});
     }
     void refreshMissions();
   };

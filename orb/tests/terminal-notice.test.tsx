@@ -115,3 +115,22 @@ it("shows one card when a harness failure is followed by the node's generic stat
   expect(errors).toHaveLength(1);
   expect(errors[0].kind === "error" && errors[0].text).toContain("Argument list too long");
 });
+
+it("never renders a client_runner marker as the user-facing failure", async () => {
+  const {MissionFailure} = await import("../src/missionLaunch");
+  for (const props of [
+    {mission: {status: "failed", terminal_reason: "client_runner"}},
+    {mission: {status: "failed", status_message: "client_runner"}},
+    {mission: {status: "failed"}, error: "client_runner"},
+  ]) {
+    const {container, unmount} = render(() => <MissionFailure {...props as any} />);
+    expect(container.textContent).toContain("The local run stopped without a recorded error");
+    expect(container.textContent).not.toContain("client_runner");
+    unmount();
+  }
+});
+
+it("explains legacy client_runner errors restored in the transcript", () => {
+ const {container}=render(() => <Transcript items={[{kind:"error",key:"legacy",text:"client_runner"}]} />);
+ expect(container.querySelector('.error-notice-body > p')?.textContent).toContain('The local run stopped without a recorded error');
+});

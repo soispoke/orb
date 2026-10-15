@@ -966,15 +966,16 @@ fn spawn_harness(
             session_id,
             env,
         ),
-        "opencode" => spawn_piped(
-            request,
-            opencode_args(request),
-            text,
-            error,
-            true,
-            session_id,
-            env,
-        ),
+        "opencode" => {
+            let version = crate::agent_software::version(Path::new(&request.bin));
+            let mut args = opencode_args(request);
+            if opencode_needs_standalone(version.as_deref()) {
+                // The shared 2.x service does not inherit this mission's routing
+                // credentials/configuration. Keep its server in our process group.
+                args.insert(1, "--standalone".into());
+            }
+            spawn_piped(request, args, text, error, true, session_id, env)
+        }
         other => Err(format!("unknown local harness {other}")),
     }
 }
@@ -1292,14 +1293,16 @@ fn grok_args(request: &StartRequest) -> Vec<String> {
     args
 }
 
+fn opencode_needs_standalone(version: Option<&str>) -> bool {
+    version
+        .and_then(crate::agent_software::numeric_version)
+        .and_then(|v| v.split('.').next()?.parse::<u64>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
 fn opencode_args(request: &StartRequest) -> Vec<String> {
-    let mut args = vec![
-        "run".into(),
-        "--format".into(),
-        "json".into(),
-        "--dir".into(),
-        request.cwd.clone(),
-    ];
+    // spawn_piped sets the process cwd. OpenCode 2.x does not accept --dir.
+    let mut args = vec!["run".into(), "--format".into(), "json".into()];
     if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
         args.push("--model".into());
         // Backend aliases need their configured OpenCode provider namespace.
@@ -1735,6 +1738,8 @@ fn spawn_piped(
         }
     }
     command.env("NO_COLOR", "1");
+    // OpenCode 2 uses PWD to select its workspace; current_dir alone is insufficient.
+    command.env("PWD", &request.cwd);
     let mut child = command
         .current_dir(&request.cwd)
         .args(&args)
@@ -3315,6 +3320,56 @@ mod tests {
     }
 
     #[test]
+    fn opencode_v2_launch_uses_private_server_and_workspace_pwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode-fixture");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'opencode v2.0.25'; exit 0; fi
+printf '%s\n' "$@" > args.txt
+printf '%s' "$PWD" > pwd.txt
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let request = StartRequest {
+            harness: "opencode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "test".into(),
+            ..Default::default()
+        };
+        let mut child = spawn_harness(
+            &request,
+            &Arc::new(Output::default()),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            &[],
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let args = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert!(args.starts_with("run\n--standalone\n"));
+        assert!(!args.contains("--dir"));
+        let pwd = std::fs::read_to_string(dir.path().join("pwd.txt")).unwrap();
+        assert_eq!(
+            Path::new(&pwd).canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn opencode_shared_server_requires_private_execution() {
+        assert!(opencode_needs_standalone(Some("opencode v2.0.25")));
+        assert!(opencode_needs_standalone(Some("2.1.0")));
+        assert!(!opencode_needs_standalone(Some("1.2.10")));
+        assert!(!opencode_needs_standalone(None));
+    }
+
+    #[test]
     fn grok_and_opencode_args_match_the_pinned_flags() {
         let fresh = StartRequest {
             service_tier: None,
@@ -3364,7 +3419,7 @@ mod tests {
         );
         assert_eq!(
             opencode_args(&fresh),
-            vec!["run", "--format", "json", "--dir", "/tmp", "--model", "xai/grok", "hi"]
+            vec!["run", "--format", "json", "--model", "xai/grok", "hi"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()

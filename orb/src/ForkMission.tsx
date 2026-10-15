@@ -1,9 +1,10 @@
 import {CodexSpeedPicker,missionSpeed,requireSpeedSupport} from './CodexSpeedPicker';
 import {localBinding} from './localAgents';
 import type {CodexServiceTier} from './api';
-import { ErrorNotice } from "./ErrorNotice";
+import { ErrorDialog, workspaceConflict } from "./ErrorNotice";
+import { DialogButton } from "./Dialog";
 import { For, Show, createSignal, onMount } from "solid-js";
-import { forkMission, shortModelLabel, type HarnessChoice, type Mission } from "./api";
+import { forkMission, getMission, shortModelLabel, type HarnessChoice, type Mission } from "./api";
 import { effortLabel, supportedEfforts } from "./effort";
 import { Menu } from "./Menu";
 
@@ -24,6 +25,14 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
     try { if(backend()==="codex")await requireSpeedSupport(model(),speed(),undefined,!!localBinding(p.mission.id)); p.onFork(await forkMission(p.mission.id, { backend: backend(), model_override: model(), model_effort: effort, service_tier:backend()==="codex"?speed():undefined, idempotency_key: key })); }
     catch (e) {setError(e instanceof Error ? e.message : String(e));}
     finally {setBusy(false);}
+  };
+  const openExisting = async () => {
+    const id = workspaceConflict(error())?.missionId;
+    if (!id || busy()) return;
+    setBusy(true);
+    try { p.onFork(await getMission(id)); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
   };
   const openModels = (id: string, anchor: HTMLButtonElement) => {
     if (busy() || unavailable(id)) return;
@@ -52,10 +61,12 @@ export function ForkMission(p: { mission: Mission; choices: HarnessChoice[]; des
       <Show when={effortAnchor()}>{anchor => <Menu label="Choose effort" class="fork-effort-menu" anchor={anchor()} placement="right-start" busy={busy()} onClose={() => setEffortAnchor(undefined)}>
         <Show when={backend()==="codex"}><CodexSpeedPicker model={model()} value={speed()} local={!!localBinding(p.mission.id)} disabled={busy()} onChange={setSpeed}/></Show>
         <For each={["", ...supportedEfforts(backend(), choices().find(c => c.value === model())?.efforts)]}>{effort => <button type="button" role="menuitem" class="menu-item" disabled={busy()} onClick={() => void fork(effort)}>{effortLabel(effort || undefined,backend(),model())}</button>}</For>
-        <Show when={error()}><ErrorNotice error={error()}/></Show>
+
       </Menu>}</Show>
-      <Show when={error() && !effortAnchor()}><ErrorNotice error={error()}/></Show>
+
     </Menu>}</Show>
+    <Show when={error()}><ErrorDialog error={error()} busy={busy()} onClose={() => setError("")}
+      actions={<Show when={workspaceConflict(error())?.missionId}><DialogButton variant="primary" disabled={busy()} onClick={() => void openExisting()}>{busy() ? "Opening…" : "Open existing chat"}</DialogButton></Show>}/></Show>
     <Show when={busy()}><div class="menu-group" role="status">Forking…</div></Show>
   </Menu>;
 }

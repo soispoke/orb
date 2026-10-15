@@ -5,7 +5,21 @@ import { Dialog, DialogButton } from "./Dialog";
 import { providerLimit, resetPhrase } from "./usageLimit";
 
 export type ErrorInfo = { title: string; message: string; tone?: "warning"; link?: { label: string; url: string } };
+/** Parse only the structured conflict; never infer an actionable ID from prose. */
+export function workspaceConflict(raw: string): {missionId?: string; title?: string} | undefined {
+  try {
+    const data = JSON.parse(raw.replace(/^(?:Error: )?(?:409\s+)?/, ""));
+    if (data?.error !== "workspace_occupied") return;
+    return {
+      missionId: typeof data.mission_id === "string" && /^[a-zA-Z0-9-]+$/.test(data.mission_id) ? data.mission_id : undefined,
+      title: typeof data.title === "string" ? data.title : undefined,
+    };
+  } catch { return; }
+}
 export function describeError(raw: string, fallback = "Something went wrong"): ErrorInfo {
+  const conflict = workspaceConflict(raw);
+  if (conflict) return {title: "This folder is already in use", message: `${conflict.title ? `“${conflict.title}” is` : "Another chat is"} still using this working folder. Open that chat, or wait for it to finish before forking. Your conversation has not changed.`};
+  if (/^client[_ ]runner$/.test(raw.trim())) return {title: fallback, message: "The local run stopped without a recorded error. Resume on the computer that started it."};
   if (/daybreak[^\n]*(?:isn|not)[^\n]*available/i.test(raw)) return {title:"Daybreak is unavailable for this account or model",message:"OpenAI refused Daybreak for the selected model on this connection. Check the account’s approved access or explicitly choose Standard. The model and program were not changed automatically."};
   if (/access_program_not_enabled/.test(raw)) return {title:"Cyber access is not enabled",message:"The account is not approved for this program and model. Check its Daybreak access or explicitly choose Standard. The selected model has not been changed."};
   if (/unsupported_access_program/.test(raw)) return {title:"Cyber selection is unsupported on this connection",message:"This connection cannot apply the requested program reliably. Use a supported connection, or explicitly choose Automatic. Your conversation is saved."};
@@ -75,14 +89,15 @@ export function ErrorNotice(p: { error: string; title?: string; onDismiss?: () =
 }
 
 /** A refused action interrupts once, in front of the work, instead of displacing the list it came from. */
-export function ErrorDialog(p: { error: string; title?: string; onClose: () => void }) {
+export function ErrorDialog(p: { error: string; title?: string; actions?: JSX.Element; busy?: boolean; onClose: () => void }) {
   const [copied, setCopied] = createSignal(false);
   const raw = () => p.error.replace(/^Error: /, "");
   const info = createMemo(() => describeError(raw(), p.title ?? "This action couldn’t be completed"));
   const copy = () => void copyText(p.error).then(() => setCopied(true)).catch(() => setCopied(false));
-  return <Dialog size="compact" title={info().title} onClose={p.onClose} footer={<>
+  return <Dialog size="compact" title={info().title} busy={p.busy} onClose={p.onClose} footer={<>
     <DialogButton onClick={copy}>{copied() ? "Copied" : "Copy error"}</DialogButton>
-    <DialogButton variant="primary" onClick={p.onClose}>Close</DialogButton>
+    <DialogButton variant={p.actions ? undefined : "primary"} disabled={p.busy} onClick={p.onClose}>Close</DialogButton>
+    {p.actions}
   </>}>
     <div class="error-dialog" role="alert"><p>{info().message}</p>
       <Show when={info().message !== raw()}><details><summary>Technical details</summary><pre>{p.error}</pre></details></Show>

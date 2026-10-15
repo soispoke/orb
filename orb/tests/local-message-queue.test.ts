@@ -110,7 +110,7 @@ it('retains the real native failure even when the agent produced partial output'
  mocks.active=false;mocks.follow.mockResolvedValue({done:true,text:'Partial',exit_code:0,error:'goal objective must be at most 4000 characters'});
  stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first');await vi.advanceTimersByTimeAsync(10);
  expect(mocks.failure).toHaveBeenCalledWith('mission','goal objective must be at most 4000 characters');
- expect(mocks.status).toHaveBeenCalledWith('mission','failed',expect.anything());
+ expect(mocks.status).toHaveBeenCalledWith('mission','failed',expect.anything(),undefined,'goal objective must be at most 4000 characters');
 });
 
 it('editing removes only a still-unsent message and rejects stale edits',async()=>{
@@ -466,7 +466,7 @@ it('settles a scheduled occurrence when connection retries are exhausted',async(
  stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(65000);
  expect(mocks.launch).toHaveBeenCalledTimes(4);
  expect(mocks.status.mock.calls.slice(0,3).every(call=>call.length===3)).toBe(true);
- expect(mocks.status.mock.calls.at(-1)).toEqual(['mission','failed',expect.anything(),id]);
+ expect(mocks.status.mock.calls.at(-1)).toEqual(['mission','failed',expect.anything(),id,'Local process exited with code 1']);
  expect(queuedLocalMessages('mission')).toHaveLength(0);
 });
 
@@ -589,4 +589,14 @@ it.each(['high', null])('uses the current Antigravity effort at dispatch, includ
  window.dispatchEvent(new Event('orb:queue-wake'));await vi.advanceTimersByTimeAsync(10);
  expect(mocks.launch).toHaveBeenCalledTimes(1);
  expect(mocks.launch.mock.calls[0][0]).toMatchObject({harness:'antigravity',model:'agy-demo',effort:effort??undefined,sessionId:'latest'});
+});
+
+it('persists the actual harness failure with the terminal status', async () => {
+ mocks.active=false;
+ const error='Unrecognized flag: --dir in command opencode run';
+ mocks.follow.mockResolvedValueOnce({done:true,text:'',exit_code:1,error});
+ stop=startLocalQueueWorker();
+ await enqueueLocalMessage(request,'hello');
+ await vi.advanceTimersByTimeAsync(1500);
+ expect(mocks.status).toHaveBeenCalledWith('mission','failed',expect.anything(),undefined,error);
 });

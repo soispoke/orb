@@ -385,11 +385,20 @@ impl Output {
                 _ => return,
             }
         };
-        let Some(raw_call_id) = item[if opencode { "callID" } else { "id" }].as_str() else {
+        let raw_call_id = if opencode {
+            item["callID"].as_str().or_else(|| item["id"].as_str())
+        } else {
+            item["id"].as_str()
+        };
+        let Some(raw_call_id) = raw_call_id else {
             return;
         };
         let id = if opencode {
-            if let Some(pid) = item["id"].as_str().filter(|pid| *pid != raw_call_id) {
+            if let Some(pid) = item["partID"]
+                .as_str()
+                .or_else(|| item["id"].as_str())
+                .filter(|pid| *pid != raw_call_id)
+            {
                 format!("native:{pid}:{raw_call_id}")
             } else {
                 format!("native:{raw_call_id}")
@@ -443,7 +452,13 @@ impl Output {
             || (opencode && matches!(status, "completed" | "error" | "failed" | "cancelled"))
         {
             activity.finish(
-                if matches!(status, "error" | "failed") || item["success"] == false {
+                if matches!(status, "error" | "failed")
+                    || item["success"] == false
+                    || (opencode
+                        && (item.pointer("/state/metadata/error") == Some(&serde_json::Value::Bool(true))
+                            || item.pointer("/state/metadata/metadata/error")
+                                == Some(&serde_json::Value::Bool(true))))
+                {
                     "failed"
                 } else if status == "cancelled" {
                     "stopped"
@@ -893,6 +908,25 @@ mod tests {
         assert_eq!(rows[0].label, "sandboxed__get_capabilities");
         assert!(rows[0].done && !rows[0].failed);
     }
+    #[test]
+    fn opencode_v2_tool_parts_keep_distinct_ids_and_nested_failures() {
+        let output = Output::default();
+        for (part, error) in [("part-1", false), ("part-2", true)] {
+            output.native_activity(&json!({"type":"tool_use","part":{
+                "partID":part,"id":"call_0","tool":"execute",
+                "state":{"status":"running"}}}));
+            output.native_activity(&json!({"type":"tool_use","part":{
+                "partID":part,"id":"call_0","tool":"execute",
+                "state":{"status":"completed","metadata":{"metadata":{"error":error}},
+                    "output":"public tool result"}}}));
+        }
+        let rows = output.activities();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].done && !rows[0].failed);
+        assert!(rows[1].done && rows[1].failed);
+        assert_ne!(rows[0].id, rows[1].id);
+    }
+
     #[test]
     fn native_tools_preserve_identity_and_terminal_errors() {
         let output = Output::default();

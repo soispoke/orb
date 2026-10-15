@@ -17465,6 +17465,8 @@ pub struct ClientStatusRequest {
     pub run_id: Option<Uuid>,
     pub generation: Option<u64>,
     pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Append one transcript row for a mission the Orb client is executing.
@@ -17548,6 +17550,17 @@ pub async fn set_client_mission_status(
             ))
         }
     };
+    // Preserve the harness failure across reloads and other clients. The
+    // interrupted marker remains stable for continuation ownership checks.
+    let failure = req.error.as_deref().map(str::trim).filter(|e| !e.is_empty());
+    if failure.is_some_and(|e| e.len() > 16 * 1024) {
+        return Err((StatusCode::BAD_REQUEST, "Local failure exceeds 16 KiB".into()));
+    }
+    let terminal_reason = if status == MissionStatus::Failed {
+        failure.unwrap_or("The local run stopped without a recorded error. Resume on the computer that started it.")
+    } else {
+        "client_runner"
+    };
     let control = control_for_user(&state, &user).await;
     if !mission_is_client_placed(&control, id)
         .await
@@ -17564,7 +17577,7 @@ pub async fn set_client_mission_status(
     // Explicit user Stop revokes wake-ups through continuations/cancel instead.
     control
         .mission_store
-        .update_mission_status_with_reason(id, status, Some("client_runner"))
+        .update_mission_status_with_reason(id, status, Some(terminal_reason))
         .await
         .map_err(internal_error)?;
     control
@@ -17577,14 +17590,14 @@ pub async fn set_client_mission_status(
                 MissionStatus::Completed | MissionStatus::AwaitingUser
             ),
             matches!(status, MissionStatus::Failed | MissionStatus::Interrupted)
-                .then(|| "client_runner".to_string()),
+                .then(|| terminal_reason.to_string()),
         )
         .await
         .map_err(internal_error)?;
     if let Some(run) = run {
         control
             .mission_store
-            .finish_mission_run(run.run_id, run.generation, Some("client_runner"))
+            .finish_mission_run(run.run_id, run.generation, Some(terminal_reason))
             .await
             .map_err(internal_error)?;
     }
@@ -17593,7 +17606,7 @@ pub async fn set_client_mission_status(
         execution: None,
         mission_id: id,
         status,
-        summary: Some("client_runner".into()),
+        summary: Some(terminal_reason.into()),
     });
     Ok(Json(serde_json::json!({ "ok": true })))
 }

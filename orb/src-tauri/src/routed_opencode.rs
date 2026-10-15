@@ -3,8 +3,8 @@ use crate::local_agents::{self, StartRequest};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-fn configuration(base: &str, route: &str, mission: &str) -> Value {
-    json!({
+fn configuration(base: &str, route: &str, mission: &str, effort: Option<&str>) -> Value {
+    let mut config = json!({
         "model": format!("orb-routing/{route}"),
         "small_model": format!("orb-routing/{route}"),
         "enabled_providers": ["orb-routing"],
@@ -15,7 +15,35 @@ fn configuration(base: &str, route: &str, mission: &str) -> Value {
                 "headers": {"x-sandboxed-mission-id": mission}},
             "models": {(route): {"name": route, "id": route}}
         }}
-    })
+    });
+    if let Some(effort) = effort {
+        let model = &mut config["provider"]["orb-routing"]["models"][route];
+        model["reasoning"] = json!(true);
+        model["options"] = json!({"reasoningEffort": effort});
+    }
+    config
+}
+
+fn validate_effort(route: &Value, effort: Option<&str>) -> Result<(), String> {
+    let Some(effort) = effort.filter(|e| !e.is_empty()) else {
+        return Ok(());
+    };
+    let supported = route["entries"].as_array().is_some_and(|entries| {
+        !entries.is_empty()
+            && entries.iter().all(|entry| {
+                matches!(
+                    entry["model_id"]
+                        .as_str()
+                        .and_then(|m| m.rsplit('/').next()),
+                    Some("gemini-4-argon" | "gemini-4-argon-eap")
+                )
+            })
+    });
+    if supported && matches!(effort, "low" | "medium" | "high") {
+        Ok(())
+    } else {
+        Err("The selected OpenCode route does not support this reasoning effort. Choose Default or refresh the model list.".into())
+    }
 }
 
 pub async fn start(request: StartRequest, base: &str, token: &str) -> Result<(), String> {
@@ -123,15 +151,19 @@ pub async fn start_fenced(
         .await
         .map_err(|_| "Invalid routing catalog")?;
     let selected = request.model.as_deref().filter(|s| !s.is_empty());
-    let route = routes
+    let chain = routes
         .iter()
         .find(|r| match selected {
             Some(id) => r["id"].as_str() == Some(id),
             None => r["is_default"].as_bool() == Some(true),
         })
-        .and_then(|r| r["id"].as_str())
-        .ok_or("The selected OpenCode route is unavailable. Refresh the model list.")?
+        .ok_or("The selected OpenCode route is unavailable. Refresh the model list.")?;
+    let route = chain["id"]
+        .as_str()
+        .ok_or("The selected OpenCode route has no ID")?
         .to_string();
+    let effort = request.effort.as_deref().filter(|e| !e.is_empty());
+    validate_effort(chain, effort)?;
     // Dedicated key, never the dashboard JWT. It exists only for this run and is
     // revoked on launch failure or termination (including stopped generations).
     let response = http
@@ -156,7 +188,7 @@ pub async fn start_fenced(
         .as_str()
         .ok_or("Missing proxy credential identity")?
         .to_string();
-    let config = configuration(base, &route, &request.id);
+    let config = configuration(base, &route, &request.id, effort);
     request.model = Some(format!("orb-routing/{route}"));
     let mission = request.id.clone();
     launch_env.extend([
@@ -200,9 +232,36 @@ pub async fn start_fenced(
 mod tests {
     use super::*;
     #[test]
+    fn effort_reaches_provider_only_when_every_fallback_supports_it() {
+        let route = json!({"entries":[{"model_id":"google/gemini-4-argon"}]});
+        for effort in ["low", "medium", "high"] {
+            validate_effort(&route, Some(effort)).unwrap();
+            let config = configuration(
+                "https://core.test",
+                "personal-argon",
+                "mission",
+                Some(effort),
+            );
+            assert_eq!(
+                config["provider"]["orb-routing"]["models"]["personal-argon"]["options"]
+                    ["reasoningEffort"],
+                effort
+            );
+        }
+        assert!(validate_effort(&route, Some("max")).is_err());
+        assert!(validate_effort(&json!({"entries":[]}), Some("high")).is_err());
+        assert!(validate_effort(
+            &json!({"entries":[{"model_id":"gemini-4-argon"},{"model_id":"other"}]}),
+            Some("high")
+        )
+        .is_err());
+        validate_effort(&json!({}), None).unwrap();
+    }
+
+    #[test]
     fn preserves_route_identity_and_keeps_secrets_out_of_config() {
         for route in ["builtin/smart", "reviewer", "team/custom"] {
-            let c = configuration("https://core.test/", route, "mission");
+            let c = configuration("https://core.test/", route, "mission", None);
             assert_eq!(c["model"], format!("orb-routing/{route}"));
             assert_eq!(c["provider"]["orb-routing"]["models"][route]["id"], route);
             assert_eq!(

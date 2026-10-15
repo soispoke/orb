@@ -48,8 +48,14 @@ impl Snapshot {
         }
         if let Some(effort) = self.origin.effort.as_deref() {
             let accepted = match self.origin.backend.as_str() {
-                "antigravity" => matches!(effort, "low" | "medium" | "high"),
-                "codex" | "claudecode" => {
+                "antigravity" | "opencode" => matches!(effort, "low" | "medium" | "high"),
+                "claudecode" => {
+                    matches!(
+                        effort,
+                        "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
+                    )
+                }
+                "codex" => {
                     matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
                 }
                 _ => false,
@@ -94,5 +100,83 @@ impl Snapshot {
             return Err("Invalid local folder tags".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(backend: &str, effort: Option<&str>) -> Snapshot {
+        Snapshot {
+            origin: Origin {
+                id: uuid::Uuid::new_v4(),
+                run_id: uuid::Uuid::new_v4(),
+                client_id: uuid::Uuid::new_v4(),
+                title: "Effort regression".into(),
+                project: "test".into(),
+                backend: backend.into(),
+                model: None,
+                effort: effort.map(str::to_owned),
+                service_tier: None,
+                cyber_access: None,
+                cwd: "/tmp/local-effort".into(),
+                prompt: "hello".into(),
+                created_at: "2026-10-15T12:00:00Z".into(),
+                tags: vec![],
+            },
+            sequence: 1,
+            text: String::new(),
+            status: "active".into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn local_effort_accepts_claude_ultracode_through_json_roundtrip() {
+        let original = snapshot("claudecode", Some("ultracode"));
+        let wire = serde_json::to_string(&original).unwrap();
+        let decoded: Snapshot = serde_json::from_str(&wire).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.origin.effort.as_deref(), Some("ultracode"));
+    }
+
+    #[test]
+    fn local_effort_enforces_each_harness_boundary() {
+        for backend in [
+            "claudecode",
+            "codex",
+            "antigravity",
+            "opencode",
+            "vibe",
+            "grok",
+        ] {
+            snapshot(backend, None).validate().unwrap();
+            for effort in [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode",
+                "ultra",
+                "",
+                "typo",
+            ] {
+                let expected = match backend {
+                    "claudecode" => {
+                        ["low", "medium", "high", "xhigh", "max", "ultracode"].contains(&effort)
+                    }
+                    "codex" => ["low", "medium", "high", "xhigh", "max"].contains(&effort),
+                    "antigravity" | "opencode" => ["low", "medium", "high"].contains(&effort),
+                    _ => false,
+                };
+                assert_eq!(
+                    snapshot(backend, Some(effort)).validate().is_ok(),
+                    expected,
+                    "{backend}: {effort}"
+                );
+            }
+        }
     }
 }
