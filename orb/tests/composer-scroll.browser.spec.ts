@@ -41,7 +41,8 @@ test("typing a long reply keeps the transcript and the caret line where they are
   await setup(page);
   const scroll = page.locator(".scroll");
   // Reading the questions a little above the bottom, as when answering them.
-  await scroll.evaluate(el => { el.scrollTop = el.scrollHeight - el.clientHeight - 200; el.dispatchEvent(new Event("scroll")); });
+  // The wheel event marks this as the reader's scroll, which releases the opening pin.
+  await scroll.evaluate(el => { el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -200 })); el.scrollTop = el.scrollHeight - el.clientHeight - 200; el.dispatchEvent(new Event("scroll")); });
   // Rows near the viewport are measured after this scroll. Start from the settled position.
   await scroll.evaluate(async el => { let last = -1; for (let still = 0, frames = 0; still < 5 && frames < 120; frames++) { await new Promise(requestAnimationFrame); still = el.scrollTop === last ? still + 1 : 0; last = el.scrollTop; } });
   const before = await scroll.evaluate(el => el.scrollTop);
