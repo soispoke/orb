@@ -11,6 +11,46 @@ out of this public repository).
 | **Thomas / old-agent compute** | `ssh old-agent` | Sandboxed node only |
 | **Ben** | `ssh ben-backend` | (private) |
 
+## Personal Docker Compose Core deployments
+
+Some personal instances run Core as the `sandboxed-sh` Compose service and
+CLIProxyAPI as `cli-proxy` with `network_mode: service:sandboxed-sh`. These are
+separate from the systemd services documented below. Recreating Core alone
+leaves the proxy attached to the old container's network namespace, even when
+both containers appear to be running. Core's health endpoint can still return
+200 while every Claude request fails.
+
+Use `scripts/compose-core.py` for this topology. From the Compose project
+directory, with the script installed under `scripts/`:
+
+```bash
+# Read-only readiness check (also the default action).
+python3 scripts/compose-core.py check
+
+# Deployment: recreates both services, then checks readiness.
+# This interrupts active jobs; schedule it with the user.
+python3 scripts/compose-core.py restart
+
+# Repair an orphaned proxy without recreating Core.
+# This interrupts proxy requests, so use it only when needed.
+python3 scripts/compose-core.py repair-proxy
+```
+
+The default Compose files are `docker-compose.yml`,
+`docker-compose.override.yml`, and `docker-compose.proxy.yml`. Use repeated
+`--file` arguments for another file set, or `--directory` for the project path.
+The script requires Python 3 inside Core and its existing `CLI_PROXY_API_BASE_URL`
+and `CLI_PROXY_API_KEY` environment variables. It never builds or pulls images.
+
+Readiness requires a running Core and proxy, a proxy attached to the current
+Core container, Core's health endpoint, and an authenticated, nonempty model
+catalog reached from inside Core. Credentials stay inside the container. The
+catalog may initially be empty while account discovery starts, so the script
+retries checks without repeating the restart. A failed check exits nonzero;
+it never restarts services automatically. This checks transport readiness,
+not each model's inference compatibility: also verify the native harness path
+after a deployment before declaring the incident resolved.
+
 ## Backend Services (Thomas / agent-core)
 
 `agent-core` is the only Thomas
