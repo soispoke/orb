@@ -154,6 +154,7 @@ export function restoreLocalBindings(): Promise<void> {
 const [scanning, setScanning] = createSignal(false);
 export const localAgentsScanning = scanning;
 let scanPromise: Promise<ScanRow[]> | undefined;
+let scanFallbackPromise: Promise<ScanRow[]> | undefined;
 let scannedAt = 0;
 let scannedPaths = "";
 /** A known binary can start while inventory refreshes. Native spawn validates its path. */
@@ -176,8 +177,8 @@ function refreshLocalAntigravityModels() {
   }).finally(() => localModelRequests.delete(path));
 }
 
-export function refreshLocalAgents(force = false): Promise<ScanRow[]> {
-  if (scanPromise) return scanPromise;
+export function refreshLocalAgents(force = false, strict = false): Promise<ScanRow[]> {
+  if (scanPromise) return strict ? scanPromise : scanFallbackPromise!;
   const paths = pathOverrides();
   const key = JSON.stringify(paths);
   if (!force && key === scannedPaths && Date.now() - scannedAt < 60_000) return Promise.resolve(installed());
@@ -185,17 +186,16 @@ export function refreshLocalAgents(force = false): Promise<ScanRow[]> {
   scanPromise = (async () => {
     const invoke = tauriInvoke();
     if (!invoke) { setInstalled([]); return []; }
-    try {
-      const rows = await invoke("local_agents_scan", { request: { overrides: paths } }) as ScanRow[];
-      // Older desktop builds tied `installed` to the version probe succeeding.
-      // Vibe also checks its bridge interpreter; retain that native preflight result.
-      setInstalled(Array.isArray(rows) ? rows.map(row => ({...row, installed: !!row.path && (row.id !== "vibe" || row.installed)})) : []);
-      scannedAt = Date.now(); scannedPaths = key;
-      refreshLocalAntigravityModels();
-      return installed();
-    } catch { return installed(); }
-  })().finally(() => { setScanning(false); scanPromise = undefined; });
-  return scanPromise;
+    const rows = await invoke("local_agents_scan", { request: { overrides: paths } }) as ScanRow[];
+    // Older desktop builds tied `installed` to the version probe succeeding.
+    // Vibe also checks its bridge interpreter; retain that native preflight result.
+    setInstalled(Array.isArray(rows) ? rows.map(row => ({...row, installed: !!row.path && (row.id !== "vibe" || row.installed)})) : []);
+    scannedAt = Date.now(); scannedPaths = key;
+    refreshLocalAntigravityModels();
+    return installed();
+  })().finally(() => { setScanning(false); scanPromise = undefined; scanFallbackPromise = undefined; });
+  scanFallbackPromise = scanPromise.catch(() => installed());
+  return strict ? scanPromise : scanFallbackPromise;
 }
 
 export function installedIds(): string[] {

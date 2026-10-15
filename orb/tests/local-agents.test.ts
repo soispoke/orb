@@ -368,3 +368,16 @@ it('does not mark a local run settled when native recovery is blocked by a runni
   }
 });
 
+
+it('fails closed on a strict transfer scan instead of trusting a cached CLI',async()=>{
+ const {refreshLocalAgents}=await import('../src/localAgents');
+ const host=window as any,previous=host.__TAURI__;
+ const invoke=vi.fn().mockResolvedValue([{id:'claudecode',bin:'claude',path:'/claude',installed:true}]);
+ host.__TAURI__={core:{invoke}};
+ try {
+  await refreshLocalAgents(true);
+  invoke.mockRejectedValue(new Error('Native scan failed'));
+  await expect(refreshLocalAgents(true,true)).rejects.toThrow('Native scan failed');
+  expect((await refreshLocalAgents(true))[0].id).toBe('claudecode');
+ }finally{host.__TAURI__=previous;}
+});
