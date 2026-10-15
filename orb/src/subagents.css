@@ -24,7 +24,7 @@
 @media (prefers-reduced-motion: reduce) { .subagent-dot { animation: none !important; transition: none; } .subagents-chevron { transition: none; } }
 @media (max-width: 440px) { .subagent-toggle { gap: 7px; padding-inline: 8px; } .subagent-status { max-width: 90px; } }
 
-.subagents-overview { display:flex; gap:16px; padding:6px 12px 12px; color:var(--fg-3); font-size:11px; }
+.subagents-overview { display:flex; flex-wrap:wrap; gap:16px; padding:6px 12px 12px; color:var(--fg-3); font-size:11px; }
 .subagent { border:1px solid var(--stroke); border-radius:9px; margin:6px 4px; background:var(--hover); }
 .subagent-toggle { min-height:58px; }
 .subagent-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:5px; }
