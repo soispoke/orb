@@ -78,7 +78,7 @@ it('preserves the launch time when a terminal lifecycle event has no start times
 it('loads real Workflow children through the mission-scoped API and cancels on unmount', async () => {
   const receipt: StreamItem = {...call, name:'Workflow', result:'Workflow launched in background.\nTranscript dir: /root/.claude/subagents/workflows/wf_test\nRun ID: wf_test'};
   const journal = [{type:'started',agentId:'a',label:'subagent-1',phase:'Wait'}, {type:'started',agentId:'b',label:'subagent-2'}, {type:'result',agentId:'a',result:{ok:true}}].map(x=>JSON.stringify(x)).join('\n');
-  const fetcher = vi.fn().mockResolvedValue(new Response(journal));
+  const fetcher = vi.fn(async (url:string) => url.includes('journal.jsonl') ? new Response(journal) : new Response('',{status:404}));
   vi.stubGlobal('fetch', fetcher);
   const {unmount,container} = render(() => <Subagents items={[receipt]} missionId="mission" workspaceId="workspace"/>);
   await screen.findByRole('button', {name:/subagent-1/});
@@ -94,7 +94,7 @@ it('loads real Workflow children through the mission-scoped API and cancels on u
 
 it('keeps an expanded Workflow child mounted when another workflow appears or history refreshes', async () => {
   const receipt=(id:string):StreamItem=>({...call,callId:id,name:'Workflow',result:`Transcript dir: /root/.claude/subagents/workflows/${id}\nRun ID: ${id}`});
-  vi.stubGlobal('fetch',vi.fn().mockImplementation(async()=>new Response(JSON.stringify({type:'started',agentId:'a',label:'Stable child'}))));
+  vi.stubGlobal('fetch',vi.fn().mockImplementation(async(url:string)=>url.includes('journal.jsonl') ? new Response(JSON.stringify({type:'started',agentId:'a',label:'Stable child'})) : new Response('',{status:404})));
   const [items,setItems]=createSignal<StreamItem[]>([receipt('first')]);
   render(()=><Subagents items={items()} missionId="m" workspaceId="w"/>);
   const row=await screen.findByRole('button',{name:/Stable child/});
@@ -109,33 +109,33 @@ it('keeps an expanded Workflow child mounted when another workflow appears or hi
 
 it('does not restart Workflow polling when mission metadata refreshes with the same workspace', async () => {
   const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/.claude/subagents/workflows/stable\nRun ID: stable'};
-  const fetcher=vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({type:'started',agentId:'a',label:'Metadata stable'}))).mockReturnValue(new Promise(()=>{}));
+  const fetcher=vi.fn(async(url:string)=>url.includes('journal.jsonl') ? new Response(JSON.stringify({type:'started',agentId:'a',label:'Metadata stable'})) : new Response('',{status:404}));
   vi.stubGlobal('fetch',fetcher);
   const [mission,setMission]=createSignal({id:'m',workspace_id:'w',status:'active'});
   render(()=><Subagents items={[receipt]} missionId={mission().id} workspaceId={mission().workspace_id}/>);
   const row=await screen.findByRole('button',{name:/Metadata stable/});
   fireEvent.click(row);
-  expect(fetcher).toHaveBeenCalledTimes(2); // journal + the expanded child transcript
+  expect(fetcher).toHaveBeenCalledTimes(3); // journal, saved state and expanded child transcript
   setMission({id:'m',workspace_id:'w',status:'idle'});
   expect(screen.getByRole('button',{name:/Metadata stable/})).toBe(row);
   expect(row.getAttribute('aria-expanded')).toBe('true');
-  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(fetcher).toHaveBeenCalledTimes(3);
 });
 
 it('loads child activity only when expanded and keeps lifecycle status from the journal', async () => {
  const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/.claude/subagents/workflows/live\nRun ID: live'};
- const fetcher=vi.fn(async(url:string)=>new Response(url.includes('journal.jsonl')
+ const fetcher=vi.fn(async(url:string)=>!url.includes('.jsonl') ? new Response('',{status:404}) : new Response(url.includes('journal.jsonl')
    ? JSON.stringify({type:'started',agentId:'agent1',label:'Live child'})
    : JSON.stringify({type:'assistant',timestamp:'2026-10-14T17:00:00Z',message:{model:'test-model',content:[{type:'tool_use',name:'Bash',input:{description:'Checking proof results'}}]}})));
  vi.stubGlobal('fetch',fetcher);
  const view=render(()=><Subagents items={[receipt]} missionId="m" workspaceId="w"/>);
  const row=await screen.findByRole('button',{name:/Live child/});
- expect(fetcher).toHaveBeenCalledTimes(1);
+ expect(fetcher).toHaveBeenCalledTimes(2);
  fireEvent.click(row);
  expect(await screen.findByText('Bash: Checking proof results')).toBeTruthy();
  expect(screen.getByText(/Last recorded activity:/)).toBeTruthy();
  expect(row.textContent).toContain('Status unconfirmed');
- expect(fetcher.mock.calls[1][0]).toContain('agent-agent1.jsonl');
+ expect(fetcher.mock.calls[2][0]).toContain('agent-agent1.jsonl');
  view.unmount();
 });
 
@@ -161,4 +161,30 @@ it('keeps prior children unconfirmed when an interrupted mission resumes', () =>
  expect(collectSubagents(items)[0].status).toBe('unknown');
  items=applyStreamEvent(items,{type:'subagent_update',sequence:4,data:{agent:{id:'a',description:'A',status:'running'}}});
  expect(collectSubagents(items)[0].status).toBe('running');
+});
+
+it('shows all queued native workflow children, deduplicates journal starts and keeps disclosures on start', async()=>{
+ const make=(started:boolean):StreamItem[]=>Array.from({length:10},(_,i)=>({kind:'subagent',key:`native-${i}`,text:`Reviewer ${i+1}`,agent:{id:`native-${i}`,workflowTaskId:'task',workflowIndex:i+1,workflowAgentId:i<2?`a${i}`:undefined,description:`Reviewer ${i+1}`,status:i<2||started&&i===2?'running':'queued'}}));
+ const [items,setItems]=createSignal(make(false));
+ const {container}=render(()=><Subagents items={items()}/>);
+ expect(container.querySelectorAll('.subagent')).toHaveLength(10);
+ expect(screen.getByText('8 queued')).toBeTruthy();
+ const row=screen.getByRole('button',{name:/Reviewer 3/});fireEvent.click(row);
+ setItems(make(true));
+ expect(screen.getByRole('button',{name:/Reviewer 3/})).toBe(row);
+ expect(row.getAttribute('aria-expanded')).toBe('true');expect(row.textContent).toContain('Working');
+});
+
+it('recovers a stopped native workflow with two started and eight never-started reviewers', async()=>{
+ const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/session/subagents/workflows/wf_review\nRun ID: wf_review'};
+ vi.stubGlobal('fetch',vi.fn(async(url:string)=>new Response(url.includes('journal.jsonl')
+  ? [0,1].map(i=>JSON.stringify({type:'started',agentId:`a${i}`})).join('\n')
+  : JSON.stringify({runId:'wf_review',taskId:'task',status:'killed',timestamp:'2026-10-15T05:20:20Z',workflowProgress:Array.from({length:10},(_,i)=>({type:'workflow_agent',index:i+1,label:`Reviewer ${i+1}`,state:i<2?'progress':'start',...(i<2?{agentId:`a${i}`,startedAt:1000}:{})}))}))));
+ const {container}=render(()=><Subagents items={[receipt]} missionId="m" workspaceId="w"/>);
+ await screen.findByText('10 stopped');
+ fireEvent.click(screen.getByRole('button',{name:'Show all 10 agents'}));
+ expect(container.querySelectorAll('.subagent')).toHaveLength(10);
+ expect(container.querySelectorAll('[data-state="running"]')).toHaveLength(0);
+ fireEvent.click(screen.getByRole('button',{name:/Reviewer 10/}));
+ expect(container.querySelector('.subagent-details:not([hidden])')?.textContent).toContain('The workflow stopped before this agent started.');
 });

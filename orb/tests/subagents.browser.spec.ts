@@ -86,3 +86,25 @@ test('historical workflows stay unconfirmed across polls and settle on a failure
  await expect(row).toHaveAttribute('aria-expanded','true');
  await expect(page.getByText('The workflow recorded an agent failure.')).toBeVisible();
 });
+
+test('native workflow recovery shows every reviewer and stays open across refreshes',async({page},testInfo)=>{
+ let polls=0;
+ await page.addInitScript(()=>localStorage.setItem('orb.apiUrl',location.origin));
+ await page.route('**/api/fs/download?**',async route=>{
+  const path=new URL(route.request().url()).searchParams.get('path')!;
+  if(path.endsWith('journal.jsonl')) {polls++;await route.fulfill({body:[0,1].map(i=>JSON.stringify({type:'started',agentId:`a${i}`})).join('\n')});}
+  else if(path.endsWith('/workflows/test.json')) await route.fulfill({body:JSON.stringify({runId:'test',taskId:'task',status:'killed',timestamp:'2026-10-15T05:20:20Z',workflowProgress:Array.from({length:10},(_,i)=>({type:'workflow_agent',index:i+1,label:`Reviewer ${i+1}`,state:i<2?'progress':'start',phaseTitle:'Review',model:'Claude Opus',...(i<2?{agentId:`a${i}`,startedAt:Date.parse('2026-10-15T05:09:35Z'),tokens:200000}:{})}))})});
+  else await route.fulfill({status:404,body:''});
+ });
+ await page.goto('/tests/subagents.html?workflow');
+ await expect(page.getByText('10 stopped',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Show all 10 agents'}).click();
+ const row=page.getByRole('button',{name:/Reviewer 10/});await row.click();
+ await expect(page.locator('.subagent-details:not([hidden])').getByText('The workflow stopped before this agent started.')).toBeVisible();
+ await expect.poll(()=>polls,{timeout:6000}).toBeGreaterThan(1);
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(page.locator('.subagent')).toHaveCount(10);
+ await page.screenshot({path:testInfo.outputPath('workflow-recovery.png')});
+ await page.setViewportSize({width:390,height:844});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});

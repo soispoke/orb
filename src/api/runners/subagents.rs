@@ -6,19 +6,55 @@ use std::collections::{BTreeMap, HashSet};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Subagent {
     pub id: String,
     pub tool_call_id: Option<String>,
     pub description: String,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(
+        default,
+        rename = "workflowTaskId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_task_id: Option<String>,
+    #[serde(
+        default,
+        rename = "workflowIndex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_index: Option<u64>,
+    #[serde(
+        default,
+        rename = "workflowAgentId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_agent_id: Option<String>,
+    #[serde(default, rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    #[serde(
+        default,
+        rename = "finishedAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub finished_at: Option<u64>,
+    #[serde(default, rename = "model", skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, rename = "tokens", skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    #[serde(default, rename = "phase", skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 #[derive(Default)]
 pub struct ClaudeSubagents {
     agents: BTreeMap<String, Subagent>,
     calls: HashSet<String>,
+    workflow_runs: BTreeMap<String, String>,
+    workflow_terminals: HashSet<(String, String)>,
 }
 impl ClaudeSubagents {
     pub fn consume(&mut self, event: &Value) -> Vec<Subagent> {
@@ -41,16 +77,26 @@ impl ClaudeSubagents {
         let before = self.agents.clone();
         match event["subtype"].as_str() {
             Some("task_started" | "task_progress" | "task_notification") => self.upsert(event),
+            Some("task_updated") => {
+                let mut update = event.clone();
+                if let Some(patch) = event["patch"].as_object() {
+                    for (key, value) in patch {
+                        update[key] = value.clone();
+                    }
+                    self.upsert(&update);
+                }
+            }
             Some("background_tasks_changed") => {
                 if let Some(tasks) = event["tasks"].as_array() {
                     for task in tasks {
                         self.upsert(task);
                     }
                     for agent in self.agents.values_mut() {
-                        if agent.status == "running"
-                            && !tasks
-                                .iter()
-                                .any(|t| t["task_id"].as_str() == Some(&agent.id))
+                        if matches!(agent.status.as_str(), "running" | "queued" | "waiting")
+                            && !tasks.iter().any(|t| {
+                                t["task_id"].as_str()
+                                    == Some(agent.workflow_task_id.as_deref().unwrap_or(&agent.id))
+                            })
                         {
                             // A missing task is no longer confirmed live. Only a
                             // terminal receipt can establish its outcome.
@@ -74,6 +120,13 @@ impl ClaudeSubagents {
         let Some(id) = value["task_id"].as_str() else {
             return;
         };
+        if value["workflow_progress"].is_array()
+            || value["task_type"] == "local_workflow"
+            || self.workflow_runs.contains_key(id)
+        {
+            self.upsert_workflow(value, id);
+            return;
+        }
         let call = value["tool_use_id"].as_str();
         let is_agent = value["task_type"]
             .as_str()
@@ -89,6 +142,7 @@ impl ClaudeSubagents {
             description: "Subagent".into(),
             status: "running".into(),
             detail: None,
+            ..Subagent::default()
         });
         if let Some(call) = call {
             agent.tool_call_id = Some(call.into());
@@ -110,13 +164,141 @@ impl ClaudeSubagents {
             }
         }
     }
+    fn upsert_workflow(&mut self, value: &Value, task_id: &str) {
+        let run = value["run_id"].as_str().unwrap_or("");
+        if let Some(previous) = self.workflow_runs.get(task_id) {
+            // Native run ids sort by opening order. Never let a delayed frame
+            // from a prior run stop or resurrect the current run's children.
+            if run < previous.as_str() {
+                return;
+            }
+        }
+        self.workflow_runs.insert(task_id.into(), run.into());
+        let parent_terminal = terminal_status(value["status"].as_str());
+        let run_key = (task_id.to_owned(), run.to_owned());
+        let was_terminal = self.workflow_terminals.contains(&run_key);
+        if parent_terminal.is_some() {
+            self.workflow_terminals.insert(run_key);
+        }
+        if let Some(progress) = value["workflow_progress"].as_array() {
+            for item in progress.iter().take(2048) {
+                if item["type"] != "workflow_agent" {
+                    continue;
+                }
+                let Some(index) = item["index"].as_u64().filter(|i| *i > 0) else {
+                    continue;
+                };
+                let child_terminal = matches!(item["state"].as_str(), Some("done" | "error"));
+                if was_terminal && !child_terminal {
+                    continue;
+                }
+                let id = format!("workflow:{task_id}:{run}:{index:08}");
+                let agent = self.agents.entry(id.clone()).or_insert_with(|| Subagent {
+                    id,
+                    description: format!("Workflow agent {index}"),
+                    status: "unknown".into(),
+                    workflow_task_id: Some(task_id.into()),
+                    workflow_index: Some(index),
+                    ..Subagent::default()
+                });
+                if is_terminal(&agent.status) && !(agent.status == "stopped" && child_terminal) {
+                    continue;
+                }
+                let previous = agent.clone();
+                if let Some(label) = item["label"].as_str() {
+                    agent.description = label.chars().take(240).collect();
+                }
+                agent.workflow_agent_id = item["agentId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| agent.workflow_agent_id.clone());
+                agent.started_at = item["startedAt"].as_u64().or(agent.started_at);
+                agent.model = item["model"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| agent.model.clone());
+                agent.phase = item["phaseTitle"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| agent.phase.clone());
+                agent.tokens = item["tokens"].as_u64().or(agent.tokens);
+                agent.status = match item["state"].as_str() {
+                    Some("done") => "completed",
+                    Some("error") => "failed",
+                    Some("start") if agent.started_at.is_none() => "queued",
+                    Some("start" | "progress") => "running",
+                    _ => "unknown",
+                }
+                .into();
+                let detail = match agent.status.as_str() {
+                    "completed" => item["resultPreview"].as_str(),
+                    "failed" => item["error"].as_str(),
+                    "queued" => Some("Waiting for an available workflow slot."),
+                    _ => item["lastToolSummary"]
+                        .as_str()
+                        .or(item["lastToolName"].as_str()),
+                };
+                if let Some(detail) = detail {
+                    agent.detail = Some(detail.chars().take(8000).collect());
+                }
+                if is_terminal(&agent.status) {
+                    agent.finished_at = agent
+                        .started_at
+                        .zip(item["durationMs"].as_u64())
+                        .and_then(|(start, duration)| start.checked_add(duration));
+                }
+                if *agent != previous {
+                    agent.updated_at = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
+                }
+            }
+        }
+        if value["status"] == "paused" {
+            for agent in self
+                .agents
+                .values_mut()
+                .filter(|a| a.workflow_task_id.as_deref() == Some(task_id))
+            {
+                if !is_terminal(&agent.status) {
+                    agent.status = "waiting".into();
+                    agent.detail = Some("The workflow is paused.".into());
+                }
+            }
+        }
+        if let Some(status) = parent_terminal {
+            for agent in self
+                .agents
+                .values_mut()
+                .filter(|a| a.workflow_task_id.as_deref() == Some(task_id))
+            {
+                if is_terminal(&agent.status) {
+                    continue;
+                }
+                // A completed parent is not proof every child succeeded.
+                agent.status = if status == "completed" {
+                    "unknown"
+                } else {
+                    "stopped"
+                }
+                .into();
+                agent.detail = Some(
+                    if agent.started_at.is_none() {
+                        "The workflow ended before this agent started."
+                    } else {
+                        "The workflow ended without a completion receipt for this agent."
+                    }
+                    .into(),
+                );
+                agent.finished_at = value["end_time"].as_u64();
+            }
+        }
+    }
 }
 
 fn terminal_status(status: Option<&str>) -> Option<&'static str> {
     match status {
         Some("completed") => Some("completed"),
         Some("failed") => Some("failed"),
-        Some("stopped" | "cancelled" | "canceled") => Some("stopped"),
+        Some("stopped" | "killed" | "cancelled" | "canceled") => Some("stopped"),
         _ => None,
     }
 }
@@ -155,7 +337,7 @@ impl ClaudeSubagentSession {
 impl Drop for ClaudeSubagentSession {
     fn drop(&mut self) {
         for agent in self.tracker.agents.values() {
-            if agent.status == "running" {
+            if matches!(agent.status.as_str(), "running" | "queued" | "waiting") {
                 let mut agent = agent.clone();
                 agent.status = "unknown".into();
                 agent.detail =
@@ -238,5 +420,87 @@ mod lifecycle_regressions {
         assert_eq!(agent.status, "unknown");
         assert_eq!(mission_id, Some(mission));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use serde_json::json;
+    fn progress(run: &str, first: &str) -> Value {
+        json!({"type":"system","subtype":"task_progress","task_id":"wf-task","run_id":run,
+        "workflow_progress":[
+            {"type":"workflow_phase","index":1,"title":"Review"},
+            {"type":"workflow_agent","index":1,"label":"crypto","state":first,"agentId":"a","startedAt":1000,"durationMs":3000,"phaseTitle":"Review","tokens":42,"model":"test","lastToolSummary":"Checking definitions"},
+            {"type":"workflow_agent","index":2,"label":"protocol","state":"start","queuedAt":1000}
+        ]})
+    }
+    #[test]
+    fn queued_children_appear_and_keep_identity_when_starting() {
+        let mut tracker = ClaudeSubagents::default();
+        let agents = tracker.consume(&progress("01", "progress"));
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].status, "running");
+        assert_eq!(agents[0].tokens, Some(42));
+        assert_eq!(agents[1].status, "queued");
+        let queued_id = agents[1].id.clone();
+        let mut event = progress("01", "progress");
+        event["workflow_progress"][2]["startedAt"] = json!(2000);
+        event["workflow_progress"][2]["agentId"] = json!("b");
+        let update = tracker.consume(&event);
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].id, queued_id);
+        assert_eq!(update[0].status, "running");
+        assert_eq!(
+            serde_json::to_value(&update[0]).unwrap()["workflowTaskId"],
+            "wf-task"
+        );
+    }
+    #[test]
+    fn task_updated_kill_stops_children_but_preserves_completed_work() {
+        let mut tracker = ClaudeSubagents::default();
+        tracker.consume(&progress("01", "done"));
+        let updates = tracker.consume(&json!({"type":"system","subtype":"task_updated","task_id":"wf-task","run_id":"01","patch":{"status":"killed","end_time":5000}}));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].status, "stopped");
+        assert!(tracker.consume(&progress("01", "progress")).is_empty());
+        assert_eq!(
+            tracker.agents.values().next().unwrap().finished_at,
+            Some(4000)
+        );
+    }
+    #[test]
+    fn membership_tracks_workflow_parent_and_does_not_invent_success_on_disconnect() {
+        let mut tracker = ClaudeSubagents::default();
+        tracker.consume(&progress("01", "progress"));
+        let same = tracker.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"wf-task","run_id":"01","task_type":"local_workflow"}]}));
+        assert!(same.is_empty());
+        let missing = tracker
+            .consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}));
+        assert_eq!(missing.len(), 2);
+        assert!(missing.iter().all(|a| a.status == "unknown"));
+    }
+    #[test]
+    fn late_frames_cannot_add_live_children_but_can_deliver_a_final_receipt() {
+        let mut tracker = ClaudeSubagents::default();
+        tracker.consume(&progress("01", "progress"));
+        tracker.consume(&json!({"type":"system","subtype":"task_updated","task_id":"wf-task","run_id":"01","patch":{"status":"killed"}}));
+        let mut late = progress("01", "progress");
+        late["workflow_progress"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"workflow_agent","index":3,"state":"progress","startedAt":2000}));
+        assert!(tracker.consume(&late).is_empty());
+        assert_eq!(tracker.agents.len(), 2);
+        let final_receipt = tracker.consume(&progress("01", "done"));
+        assert_eq!(final_receipt.len(), 1);
+        assert_eq!(final_receipt[0].status, "completed");
+    }
+    #[test]
+    fn late_prior_run_cannot_stop_new_workflow_run() {
+        let mut tracker = ClaudeSubagents::default();
+        tracker.consume(&progress("02", "progress"));
+        assert!(tracker.consume(&json!({"type":"system","subtype":"task_updated","task_id":"wf-task","run_id":"01","patch":{"status":"killed"}})).is_empty());
+        assert!(tracker.agents.values().any(|a| a.status == "running"));
     }
 }

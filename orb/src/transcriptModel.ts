@@ -163,7 +163,7 @@ export class TranscriptReducer {
         const index = this.items.findIndex(i => i.kind === "subagent" && i.agent.id === agent.id);
         const previous = index < 0 ? undefined : this.items[index];
         const old = previous?.kind === "subagent" ? previous.agent : undefined;
-        if (old && ["completed", "finished", "failed", "stopped"].includes(old.status) && ["running", "waiting", "unknown"].includes(agent.status)) break;
+        if (old && ["completed", "finished", "failed", "stopped"].includes(old.status) && ["running", "waiting", "queued", "unknown"].includes(agent.status)) break;
         const parsed = Date.parse(ev.timestamp ?? "");
         const time = Number.isFinite(parsed) ? parsed : undefined;
         const terminal = ["completed", "finished", "failed", "stopped"].includes(agent.status);
@@ -293,7 +293,7 @@ export class TranscriptReducer {
         if (["failed", "not_feasible", "interrupted", "cancelled", "canceled", "paused"].includes(status)) {
           for (let i = 0; i < this.items.length; i++) {
             const item = this.items[i];
-            if (item.kind === "subagent" && ["running", "waiting"].includes(item.agent.status))
+            if (item.kind === "subagent" && ["running", "waiting", "queued"].includes(item.agent.status))
               this.put(i, {...item, agent: {...item.agent, status: "unknown"}});
           }
         }
