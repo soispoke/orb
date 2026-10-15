@@ -8,10 +8,19 @@ import { requestDone } from "./diagnostics";
 
 const URL_KEY = "orb.apiUrl";
 const JWT_KEY = "orb.jwt";
-const DEFAULT_URL = "https://agent-backend.thomas.md";
 
+// No built-in default: the password must only go to a backend the user entered.
 export function getApiUrl(): string {
-  return localStorage.getItem(URL_KEY) ?? DEFAULT_URL;
+  return localStorage.getItem(URL_KEY) ?? "";
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 export function setApiUrl(url: string) {
@@ -70,7 +79,10 @@ export function clearConnection() {
 }
 
 export async function login(password: string): Promise<void> {
-  const res = await fetch(`${getApiUrl()}/api/auth/login`, {
+  const base = getApiUrl();
+  if (!base) throw new Error("Enter your backend’s API URL before connecting.");
+  if (!isHttpUrl(base)) throw new Error("The API URL must be a full http:// or https:// address, for example https://agent-backend.example.com.");
+  const res = await fetch(`${base}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password }),

@@ -160,7 +160,7 @@ function BackendTab() {
           <input
             class="s-input"
             value={url()}
-            placeholder="https://agent-backend.thomas.md"
+            placeholder="https://agent-backend.example.com"
             onInput={(e) => setUrl(e.currentTarget.value)}
           />
         </Row>
@@ -182,7 +182,7 @@ function BackendTab() {
           <Show
             when={isConnected()}
             fallback={
-              <button class="s-btn primary" disabled={busy() || !password()} onClick={() => void connect()}>
+              <button class="s-btn primary" disabled={busy() || !password() || !url().trim()} onClick={() => void connect()}>
                 {busy() ? "Connecting…" : "Connect"}
               </button>
             }

@@ -280,16 +280,24 @@ fun OrbSetupView(
 ) {
     val scope = rememberCoroutineScope()
     val savedBase by core.baseURLFlow.collectAsState()
-    var urlInput by remember(savedBase) {
-        mutableStateOf(savedBase.ifEmpty { "https://agent-backend.thomas.md" })
-    }
+    // No built-in default: the password must only go to a backend the user entered.
+    var urlInput by remember(savedBase) { mutableStateOf(savedBase) }
     var passwordInput by remember { mutableStateOf("") }
     var isConnecting by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
     fun connect() {
         val cleanBase = urlInput.trim().trimEnd('/')
-        if (cleanBase.isEmpty()) return
+        val uri = Uri.parse(cleanBase)
+        val scheme = uri.scheme?.lowercase()
+        if ((scheme != "http" && scheme != "https") || uri.host.isNullOrEmpty()) {
+            errorMessage = if (cleanBase.isEmpty()) {
+                "Enter your backend URL before connecting."
+            } else {
+                "The backend URL must be a full http:// or https:// address, for example https://agent-backend.example.com."
+            }
+            return
+        }
         isConnecting = true
         errorMessage = null
         scope.launch {
@@ -382,7 +390,7 @@ fun OrbSetupView(
                     .padding(horizontal = 14.dp, vertical = 13.dp)
             ) {
                 if (urlInput.isEmpty()) {
-                    Text("https://agent-backend.thomas.md", color = OrbStyle.textMuted, fontSize = 15.sp)
+                    Text("https://agent-backend.example.com", color = OrbStyle.textMuted, fontSize = 15.sp)
                 }
                 BasicTextField(
                     value = urlInput,
