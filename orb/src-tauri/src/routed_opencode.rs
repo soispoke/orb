@@ -84,37 +84,40 @@ pub async fn start_fenced(
         .json()
         .await
         .map_err(|_| "Invalid mission project identity")?;
-    if let Some(project) = mission["project"]
-        .as_str()
-        .or_else(|| mission["project"]["project"].as_str())
-    {
-        crate::context_service::project_skills_prepare(
-            crate::context_service::Request {
-                endpoint: base.into(),
-                token: token.into(),
-                project: project.into(),
-                paths: vec![],
-            },
-            request.cwd.clone(),
-            request.harness.clone(),
-            Some(request.bin.clone()),
-        )
-        .await?;
-    } else {
-        let output = std::process::Command::new("sh")
-            .args([
-                "-c",
-                include_str!("../../../shared/prepare_project_skills.sh"),
-                "orb-project-skills",
-                "",
-                &request.harness,
-                include_str!("../../../shared/prepare_project_skills.py"),
-                &request.cwd,
-            ])
-            .output()
-            .map_err(|e| format!("Prepare project skills: {e}"))?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    // Shared launches must not rewrite another active chat's on-disk skills.
+    if !local_agents::workspace_busy(std::path::Path::new(&request.cwd))? {
+        if let Some(project) = mission["project"]
+            .as_str()
+            .or_else(|| mission["project"]["project"].as_str())
+        {
+            crate::context_service::project_skills_prepare(
+                crate::context_service::Request {
+                    endpoint: base.into(),
+                    token: token.into(),
+                    project: project.into(),
+                    paths: vec![],
+                },
+                request.cwd.clone(),
+                request.harness.clone(),
+                Some(request.bin.clone()),
+            )
+            .await?;
+        } else {
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    include_str!("../../../shared/prepare_project_skills.sh"),
+                    "orb-project-skills",
+                    "",
+                    &request.harness,
+                    include_str!("../../../shared/prepare_project_skills.py"),
+                    &request.cwd,
+                ])
+                .output()
+                .map_err(|e| format!("Prepare project skills: {e}"))?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
         }
     }
     let mut launch_env = crate::mcp_launch::environment(&request.id, base, token).await?;

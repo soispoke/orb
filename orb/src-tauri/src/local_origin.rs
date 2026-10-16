@@ -13,6 +13,8 @@ use std::{
 use tokio::sync::Mutex;
 #[derive(Deserialize)]
 pub struct Draft {
+    #[serde(default)]
+    pub share_folder: bool,
     pub key: String,
     pub title: String,
     pub project: String,
@@ -104,8 +106,12 @@ fn view(r: &Record) -> Value {
     let (status, title) = confirmed::shown(r.confirmed.as_ref(), pending(r), &s.status, &o.title);
     json!({"id":o.id,"title":title,"status":status,"project":o.project,"tags":o.tags.iter().cloned().chain(std::iter::once("placement:client".into())).collect::<Vec<_>>(),"backend":o.backend,"agent":o.initial_agent(),"model_override":o.model,"model_effort":o.effort,"service_tier":o.service_tier,"working_directory":o.cwd,"created_at":o.created_at,"updated_at":o.created_at,"history":[{"role":"user","content":o.prompt},{"role":"assistant","content":s.text}],"goal_mode":objective.is_some(),"goal_objective":objective,"status_message":s.error,"local_sync_pending":r.acked<s.sequence,"local_run_active":s.status=="active","local_sync_error":r.error})
 }
-fn initial_binding(request: &local_agents::StartRequest, origin: &Origin) -> Value {
-    json!({"harness":request.harness,"bin":request.bin,"cwd":request.cwd,"model":request.model,"effort":request.effort,"planMode":origin.initial_agent() == Some("plan")})
+fn initial_binding(
+    request: &local_agents::StartRequest,
+    origin: &Origin,
+    share_folder: bool,
+) -> Value {
+    json!({"shareFolder":share_folder,"harness":request.harness,"bin":request.bin,"cwd":request.cwd,"model":request.model,"effort":request.effort,"planMode":origin.initial_agent() == Some("plan")})
 }
 
 fn workers() -> &'static Mutex<HashSet<PathBuf>> {
@@ -403,25 +409,29 @@ pub async fn local_origin_launch(
     }
 
     // Serialize check-through-spawn for new origins. Same-draft replay above
-    // remains idempotent; different drafts cannot reserve the same directory.
+    // remains idempotent; overlapping folders require an explicit sharing choice.
     static LAUNCH: OnceLock<Mutex<()>> = OnceLock::new();
     let _launch = LAUNCH.get_or_init(|| Mutex::new(())).lock().await;
-    if local_agents::workspace_busy(Path::new(&request.cwd))? {
+    let busy = local_agents::workspace_busy(Path::new(&request.cwd))?;
+    if busy && !draft.share_folder {
         return Err("This directory already has a running local mission. Choose a separate directory or worktree.".into());
     }
 
-    crate::context_service::project_skills_prepare(
-        crate::context_service::Request {
-            endpoint: connection.api_url.clone(),
-            token: connection.token.clone(),
-            project: draft.project.clone(),
-            paths: vec![],
-        },
-        request.cwd.clone(),
-        request.harness.clone(),
-        Some(request.bin.clone()),
-    )
-    .await?;
+    // Do not rewrite shared harness configuration under a running chat.
+    if !busy {
+        crate::context_service::project_skills_prepare(
+            crate::context_service::Request {
+                endpoint: connection.api_url.clone(),
+                token: connection.token.clone(),
+                project: draft.project.clone(),
+                paths: vec![],
+            },
+            request.cwd.clone(),
+            request.harness.clone(),
+            Some(request.bin.clone()),
+        )
+        .await?;
+    }
 
     // Execution stays in the chosen directory; the journal above remains private.
     let snapshot = Snapshot {
@@ -460,7 +470,11 @@ pub async fn local_origin_launch(
     write(&path, &record)?;
     crate::local_bindings(
         Some(id.to_string()),
-        Some(initial_binding(&request, &record.snapshot.origin)),
+        Some(initial_binding(
+            &request,
+            &record.snapshot.origin,
+            draft.share_folder,
+        )),
     )?;
     // Core must know the durable identity before it can issue this mission's
     // MCP grant. Registering the snapshot never dispatches a second harness.
@@ -570,10 +584,15 @@ mod rejection_tests {
                 prompt: prompt.into(),
                 ..Default::default()
             };
-            let binding = initial_binding(&request, &record.snapshot.origin);
+            let binding = initial_binding(&request, &record.snapshot.origin, false);
             // The launch persists this exact value before starting the native process.
             let restored: Value = serde_json::from_str(&binding.to_string()).unwrap();
             assert_eq!(restored["planMode"], plan);
+            assert_eq!(restored["shareFolder"], false);
+            assert_eq!(
+                initial_binding(&request, &record.snapshot.origin, true)["shareFolder"],
+                true
+            );
             assert_eq!(view(&record)["agent"].as_str(), plan.then_some("plan"));
             if backend == "vibe" {
                 let next_turn = crate::vibe::args(

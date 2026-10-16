@@ -1,3 +1,4 @@
+import {LocalWorkspaceChoice, type LocalWorkspaceMode} from "../src/LocalWorkspaceChoice";
 import {CodexSpeedPicker} from '../src/CodexSpeedPicker';
 import type {CodexServiceTier} from '../src/api';
 import {FindBar} from "../src/FindBar";
@@ -19,6 +20,7 @@ import "./overlays.css";
 document.documentElement.dataset.theme = new URLSearchParams(location.search).get("theme") ?? "dark";
 const longTitle = "Connect a provider for a project with a long descriptive name";
 function Gallery() {
+  const [workspaceMode,setWorkspaceMode] = createSignal<LocalWorkspaceMode>("shared");
   const [open,setOpen] = createSignal("");
   const [effort,setEffort] = createSignal("low"), [revision,setRevision] = createSignal(0);
   onMount(()=>{const timer=setInterval(()=>setRevision(n=>n+1),250);onCleanup(()=>clearInterval(timer));});
@@ -52,6 +54,7 @@ function Gallery() {
     <Show when={new URLSearchParams(location.search).has("speed")}><CodexSpeedPicker model="gpt-6.1-sol" value={speed()} onChange={setSpeed}/></Show>
 
     </section>
+    <Show when={new URLSearchParams(location.search).has("workspace")}><LocalWorkspaceChoice value={workspaceMode()} disabled={false} onChange={setWorkspaceMode}/></Show>
     <p role="status">Save attempts: {attempts()} · Selected: {selected()}</p>
     <section class="gallery-message" aria-label="Message editor example"><UserTurn text="Document the exact prompt an agent needs to continue this work, including the full scope, acceptance criteria and the evidence already collected." onSend={async()=>true}/></section>
     <Show when={open()==="name"}><NameDialog title="Rename agent" label="Agent name" value={name()} onInput={setName} action="Rename" disabled={!name().trim()} busy={busy()} error={error()} onAction={()=>void save()} onClose={close}/></Show>

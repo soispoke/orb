@@ -41,6 +41,7 @@ export interface ScanRow {
 }
 
 export interface LocalBinding {
+  shareFolder?: boolean;
   harness: string;
   bin: string;
   cwd: string;
@@ -590,7 +591,7 @@ export async function localSessionGit(cwd: string): Promise<{ repository: string
 }
 
 /** Initial runs have a native-generated identity and a durable synchronization journal. */
-export async function startLocalOrigin(request: Omit<StartLocal,"id">, draft: {key:string;title:string;project:string;prompt:string;tags:string[]}): Promise<import("./api").Mission> {
+export async function startLocalOrigin(request: Omit<StartLocal,"id">, draft: {key:string;title:string;project:string;prompt:string;tags:string[];share_folder?:boolean}): Promise<import("./api").Mission> {
  const invoke=tauriInvoke();if(!invoke)throw new Error("Open Orb desktop to start on this computer.");
  if(request.harness==='codex'){await requireCyberSupport();await requireLocalCyber(invoke);}
  await import("./localWakeups").then(m=>m.replayLocalWakeupStops());

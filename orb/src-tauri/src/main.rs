@@ -35,6 +35,7 @@ mod context_service;
 mod file_browser;
 mod interactions;
 mod local_agents;
+mod local_workspaces;
 mod local_stream;
 mod local_wakeups;
 mod machine_metrics;
@@ -206,6 +207,7 @@ fn main() {
             local_agents::local_antigravity_models,
             local_agents::local_agents_workspace,
             local_agents::local_agents_directory,
+            local_workspaces::local_worktree,
             local_agents::local_agents_write,
             transfers::local_machine_transfer,
             transfers::local_machine_identity,

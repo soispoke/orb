@@ -10,6 +10,8 @@ import { RemoteQueue, type RemoteQueueHandle } from "./RemoteQueue";
 import { CyberPicker, MissionCyber, draftCyber, setDraftCyber, requireCyberSupport } from "./cyberAccess";
 import {trackScrollbarHover} from "./scrollbarHover";
 import {NextReminder} from "./AutomaticReminder";
+import {LocalWorkspaceChoice, type LocalWorkspaceMode} from "./LocalWorkspaceChoice";
+import {workspacePreparation} from "./localWorkspaces";
 import {WorkingDirectoryPicker} from "./WorkingDirectoryPicker";
 import { MessageCircle } from "./sidebarIcons";
 import {MentionPicker} from "./MentionPicker";
@@ -1314,12 +1316,17 @@ export default function App() {
     if (id === "local") void refreshLocalAgents(false);
   };
   const [workingDirectory, setWorkingDirectory] = createSignal("");
+  const [localWorkspaceMode, setLocalWorkspaceMode] = createSignal<LocalWorkspaceMode>("shared");
+  const preparedWorkspace = workspacePreparation();
   const directoryKey = () => `orb.directory:${getApiUrl()}:${effectiveNewProject()}:${newMachine()}`;
   createEffect(() => {
     const key = directoryKey();
+    preparedWorkspace.reset();
+    setLocalWorkspaceMode("shared");
     try { setWorkingDirectory(localStorage.getItem(key) ?? ""); } catch { setWorkingDirectory(""); }
   });
   const chooseDirectory = (value: string) => {
+    preparedWorkspace.reset();
     setWorkingDirectory(value);
     try { localStorage.setItem(directoryKey(), value); } catch { /* Keep the draft in memory. */ }
   };
@@ -1776,16 +1783,19 @@ export default function App() {
     const row = await localAgentForLaunch(pick.backend);
     if (!row?.path) throw new Error("That CLI is not installed on this computer. Set its path in Settings → Local agents. Your draft is kept.");
     const plan = await materializeMentions(projectSlug, prompt, attachChips());
-    const root = workingDirectory().trim() ? await localDirectory(workingDirectory()) : await localWorkspace(projectSlug);
+    const source = workingDirectory().trim() ? await localDirectory(workingDirectory()) : await localWorkspace(projectSlug);
+    const mode = localWorkspaceMode();
+    const root = await preparedWorkspace.prepare(source, mode);
     if (plan.files.length) await writeLocalFiles(root, plan.files);
     const imagePaths = await stageLocalImages(root, images);
     const sent = imagePrompt(bindWorkspace(plan.prompt, root), imagePaths, images);
     const effort = normalizeEffort(pick.effort, pick.backend);
     const body = { title, prompt: imagePrompt(typed, imagePaths, images), project: projectSlug, tags: folderTags(projectSlug), backend: pick.backend, model_override: pick.model, placement: "client" as const, working_directory: root, ...(effort ? { model_effort: effort } : {}) };
-    const signature = JSON.stringify({...body, cyber_access:selectedCyber});
+    const signature = JSON.stringify({...body, cyber_access:selectedCyber, workspace_mode:mode});
     if (launchAttempt?.signature !== signature) launchAttempt = { signature, key: crypto.randomUUID() };
-    const m=await startLocalOrigin({harness:pick.backend,bin:row.path,cwd:root,prompt:sent,model:pick.model,effort:["antigravity", "claudecode"].includes(pick.backend) ? effort ?? undefined : undefined,cyber_access:pick.backend === "codex" ? selectedCyber : undefined,service_tier:pick.backend === "codex" ? pick.service_tier??"standard" : undefined,imagePaths}, {key:launchAttempt.key,title,project:projectSlug,prompt:body.prompt,tags:body.tags});
+    const m=await startLocalOrigin({harness:pick.backend,bin:row.path,cwd:root,prompt:sent,model:pick.model,effort:["antigravity", "claudecode"].includes(pick.backend) ? effort ?? undefined : undefined,cyber_access:pick.backend === "codex" ? selectedCyber : undefined,service_tier:pick.backend === "codex" ? pick.service_tier??"standard" : undefined,imagePaths}, {key:launchAttempt.key,title,project:projectSlug,prompt:body.prompt,tags:body.tags,share_folder:mode === "shared"});
     launchAttempt = undefined;
+    preparedWorkspace.reset();
     setDraftCyber("automatic");
     setAttachChips([]);
     rememberLaunch(m.id, {messageKey:launchPreview()?.messageKey,prompt:imagePrompt(typed,imagePaths,images),images,nodeId:"local",destination:"This computer"});
@@ -2351,6 +2361,7 @@ export default function App() {
                     </Show>
                   </div><WorkingDirectoryPicker machine={newMachine()} machineName={machineLabel()} missions={missions()} value={workingDirectory()} disabled={creating()} onChange={chooseDirectory}/>
                 </div>
+                <Show when={newMachine() === "local"}><LocalWorkspaceChoice value={localWorkspaceMode()} disabled={creating()} onChange={setLocalWorkspaceMode}/></Show>
 
                 {/* NativeMissionView owns the preview through acceptance; failures restore this composer. */}
                 <div hidden={!!launchPreview()}>

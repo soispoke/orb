@@ -75,6 +75,7 @@ fn live_native_mcp_roundtrip() {
                 shared_cwd_with: None,
             },
             local_origin::Draft {
+                share_folder: false,
                 key: uuid::Uuid::new_v4().to_string(),
                 title: format!("Orb MCP live validation: {harness}"),
                 project: "unified-mcp-validation".into(),

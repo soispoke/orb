@@ -326,6 +326,16 @@ pub(crate) fn start_with_env_fenced(
     env: &[(String, String)],
     expected_stop: Option<u64>,
 ) -> Result<(), String> {
+    let bindings = crate::local_bindings(None, None)?;
+    start_with_bindings(request, env, expected_stop, &bindings)
+}
+
+fn start_with_bindings(
+    request: StartRequest,
+    env: &[(String, String)],
+    expected_stop: Option<u64>,
+    bindings: &Value,
+) -> Result<(), String> {
     let fence = launch_fence(&request.id);
     let generation = fence.lock().map_err(|e| e.to_string())?;
     if expected_stop.is_some_and(|expected| expected != *generation) {
@@ -353,6 +363,7 @@ pub(crate) fn start_with_env_fenced(
     }
     let software_execution =
         crate::agent_software::begin(&request.id, &request.harness, Some(&bin))?;
+    let share_folder = crate::local_workspaces::binding_shares(&bindings[&request.id], &cwd);
     let mut map = runs().lock().map_err(|e| e.to_string())?;
     if let Some(previous) = map.get(&request.id) {
         if !previous.done.load(Ordering::SeqCst) {
@@ -365,14 +376,17 @@ pub(crate) fn start_with_env_fenced(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if map.iter().any(|(id, run)| {
-        id != &request.id
-            && shared_parent != Some(id.as_str())
-            && run.shared_cwd_with.as_deref() != Some(request.id.as_str())
-            && (shared_parent.is_none() || run.shared_cwd_with.as_deref() != shared_parent)
-            && !run.done.load(Ordering::SeqCst)
-            && run.cwd.canonicalize().ok().as_ref() == Some(&canonical_cwd)
-    }) {
+    if !share_folder
+        && map.iter().any(|(id, run)| {
+            !crate::local_workspaces::binding_shares(&bindings[id], &canonical_cwd)
+                && id != &request.id
+                && shared_parent != Some(id.as_str())
+                && run.shared_cwd_with.as_deref() != Some(request.id.as_str())
+                && (shared_parent.is_none() || run.shared_cwd_with.as_deref() != shared_parent)
+                && !run.done.load(Ordering::SeqCst)
+                && run.cwd.canonicalize().ok().as_ref() == Some(&canonical_cwd)
+        })
+    {
         return Err(DIRECTORY_BUSY.into());
     }
     // Completed handles are retained for reconnect snapshots until the next turn.
@@ -4420,18 +4434,37 @@ pub fn workspace_busy_for(
 ) -> Result<bool, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let shared_parent = shared_cwd_with.map(str::trim).filter(|s| !s.is_empty());
+    let bindings = crate::local_bindings(None, None)?;
+    if self_id.is_some_and(|id| crate::local_workspaces::binding_shares(&bindings[id], &root)) {
+        return Ok(false);
+    }
     Ok(runs()
         .lock()
         .map_err(|e| e.to_string())?
         .iter()
         .any(|(id, run)| {
             self_id != Some(id.as_str())
+                && !(self_id.is_some()
+                    && crate::local_workspaces::binding_shares(&bindings[id], &root))
                 && shared_parent != Some(id.as_str())
                 && (self_id.is_none() || run.shared_cwd_with.as_deref() != self_id)
                 && (shared_parent.is_none() || run.shared_cwd_with.as_deref() != shared_parent)
                 && !run.done.load(Ordering::SeqCst)
                 && run.cwd.canonicalize().ok().as_ref() == Some(&root)
         }))
+}
+
+pub(crate) fn shared_peer_pids(root: &Path) -> Result<Vec<u32>, String> {
+    let bindings = crate::local_bindings(None, None)?;
+    let runs = runs().lock().map_err(|e| e.to_string())?;
+    Ok(runs
+        .iter()
+        .filter(|(id, run)| {
+            !run.done.load(Ordering::SeqCst)
+                && crate::local_workspaces::binding_shares(&bindings[*id], root)
+        })
+        .filter_map(|(_, run)| run.child.lock().ok().map(|child| child.id()))
+        .collect())
 }
 
 pub fn native_generation(id: &str) -> Option<String> {
@@ -4526,10 +4559,36 @@ mod directory_tests {
             workspace_busy_for(root.path(), Some(&uuid::Uuid::new_v4().to_string()), None).unwrap(),
             "unrelated mission must still see directory as busy"
         );
+        // Explicit sharing allows a second independent chat, but never a second
+        // process for the same chat. It does not weaken transfer admission.
+        let shared_id = uuid::Uuid::new_v4().to_string();
+        let shared_request = StartRequest {
+            id: shared_id.clone(),
+            ..request.clone()
+        };
+        let shared_bindings = json!({&shared_id: {"cwd":request.cwd,"shareFolder":true}});
+        start_with_bindings(shared_request.clone(), &[], None, &shared_bindings).unwrap();
+        assert!(
+            start_with_bindings(shared_request, &[], None, &shared_bindings)
+                .unwrap_err()
+                .contains("still running locally")
+        );
+        assert!(
+            workspace_busy(root.path()).unwrap(),
+            "transfers still see live shared work"
+        );
+        assert!(!local_agents_poll(first.clone()).unwrap().done);
         local_agents_stop(side_id.clone()).unwrap();
         runs().lock().unwrap().remove(&side_id);
         local_agents_stop(first.clone()).unwrap();
         runs().lock().unwrap().remove(&first);
+        // The original chat can start its next turn while the opted-in peer runs.
+        start_with_bindings(request.clone(), &[], None, &shared_bindings).unwrap();
+        assert!(!local_agents_poll(shared_id.clone()).unwrap().done);
+        local_agents_stop(first.clone()).unwrap();
+        runs().lock().unwrap().remove(&first);
+        local_agents_stop(shared_id.clone()).unwrap();
+        runs().lock().unwrap().remove(&shared_id);
         assert!(second
             .unwrap_err()
             .contains("directory already has a running local mission"));

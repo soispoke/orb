@@ -156,6 +156,11 @@ fn child_git_repo_process_does_not_block_parent_workspace_recovery() {
 }
 
 fn workspace_quiet(cwd: &str) -> Result<(), String> {
+    let root = std::fs::canonicalize(cwd).map_err(|e| e.to_string())?;
+    workspace_quiet_except(cwd, &local_agents::shared_peer_pids(&root)?)
+}
+
+fn workspace_quiet_except(cwd: &str, shared_peers: &[u32]) -> Result<(), String> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let root = std::fs::canonicalize(cwd).map_err(|e| e.to_string())?;
     let mut system = System::new();
@@ -169,6 +174,20 @@ fn workspace_quiet(cwd: &str) -> Result<(), String> {
     let self_pid = std::process::id();
     for (pid, process) in system.processes() {
         if pid.as_u32() == self_pid {
+            continue;
+        }
+        // Only the opted-in peer and its descendants are exempt. Unknown
+        // processes and the recovering mission's own processes remain fenced.
+        let mut ancestor = Some(*pid);
+        let mut shared = false;
+        while let Some(parent) = ancestor {
+            if shared_peers.contains(&parent.as_u32()) {
+                shared = true;
+                break;
+            }
+            ancestor = system.process(parent).and_then(|p| p.parent());
+        }
+        if shared {
             continue;
         }
         let name = process.name().to_string_lossy().to_lowercase();
@@ -275,10 +294,12 @@ async fn inspect_and_settle_for(
             "An agent process may still be using this workspace. Stop it before retrying.".into(),
         );
     }
-    if shared_cwd_with
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_none()
+    let bindings = crate::local_bindings(None, None)?;
+    if !crate::local_workspaces::binding_shares(&bindings[id], Path::new(cwd))
+        && shared_cwd_with
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
     {
         workspace_quiet(cwd)?;
     }
@@ -682,10 +703,28 @@ mod process_tests {
             .current_dir(root.path())
             .spawn()
             .unwrap();
-        let result = workspace_quiet(root.path().to_str().unwrap());
+        let cwd = root.path().to_str().unwrap();
+        let result = workspace_quiet(cwd);
+        let shared = workspace_quiet_except(cwd, &[child.id()]);
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(root.path())
+            .spawn()
+            .unwrap();
+        let still_blocked = workspace_quiet_except(cwd, &[child.id()]);
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(result.is_err());
+        assert!(
+            shared.is_ok(),
+            "known shared peers may remain alive during recovery"
+        );
+        assert!(
+            still_blocked.is_err(),
+            "sharing must not hide an unknown workspace process"
+        );
         assert!(workspace_quiet(root.path().to_str().unwrap()).is_ok());
     }
     #[test]
