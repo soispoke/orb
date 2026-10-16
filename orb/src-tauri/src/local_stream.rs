@@ -161,6 +161,34 @@ impl Output {
     pub fn activities(&self) -> Vec<Activity> {
         self.2.lock().unwrap().clone()
     }
+    pub fn claude_quota_wait(&self, reset: Option<&str>) {
+        let mut activities = self.2.lock().unwrap();
+        let index = activities.iter().position(|a| a.id == "claude:quota");
+        if let Some(reset) = reset {
+            let mut item = Activity::new(
+                "claude:quota".into(),
+                format!("Waiting for Claude quota · resumes {reset}"),
+                "quota",
+                false,
+            );
+            item.status = "waiting".into();
+            if let Some(index) = index {
+                activities[index] = item;
+            } else {
+                activities.push(item);
+            }
+        } else if let Some(index) = index {
+            if activities[index].done {
+                return;
+            }
+            activities[index].label = "Claude quota wait finished".into();
+            activities[index].finish("completed");
+        } else {
+            return;
+        }
+        drop(activities);
+        self.publish_activities();
+    }
     pub fn codex_reconnecting(&self, message: Option<&str>) {
         let mut activities = self.2.lock().unwrap();
         let index = activities.iter().position(|a| a.id == "codex:connection");
@@ -455,7 +483,8 @@ impl Output {
                 if matches!(status, "error" | "failed")
                     || item["success"] == false
                     || (opencode
-                        && (item.pointer("/state/metadata/error") == Some(&serde_json::Value::Bool(true))
+                        && (item.pointer("/state/metadata/error")
+                            == Some(&serde_json::Value::Bool(true))
                             || item.pointer("/state/metadata/metadata/error")
                                 == Some(&serde_json::Value::Bool(true))))
                 {

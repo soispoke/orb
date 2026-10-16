@@ -1,4 +1,4 @@
-//! Per-process routing. Never rewrites the user's OpenCode configuration.
+//! Per-process routing for native Claude and OpenCode. User logins and config stay untouched.
 use crate::local_agents::{self, StartRequest};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -44,6 +44,28 @@ fn validate_effort(route: &Value, effort: Option<&str>) -> Result<(), String> {
     } else {
         Err("The selected OpenCode route does not support this reasoning effort. Choose Default or refresh the model list.".into())
     }
+}
+
+/// Quota-exhausted subscriptions still belong to the pool: Core owns the
+/// reset/fallback decision. A disabled or API-key-only account does not opt in.
+fn claude_subscription_pool(catalog: &Value) -> Result<bool, String> {
+    let providers = catalog
+        .as_array()
+        .ok_or("Invalid Core subscription catalog")?;
+    Ok(providers.iter().any(|p| {
+        p["provider_type"] == "anthropic" && p["enabled"] == true && p["has_oauth"] == true
+    }))
+}
+
+fn claude_environment(base: &str, key: &str) -> Vec<(String, String)> {
+    vec![
+        ("ORB_CLAUDE_CORE_ROUTING".into(), "1".into()),
+        (
+            "ANTHROPIC_BASE_URL".into(),
+            base.trim_end_matches('/').into(),
+        ),
+        ("ANTHROPIC_AUTH_TOKEN".into(), key.into()),
+    ]
 }
 
 pub async fn start(request: StartRequest, base: &str, token: &str) -> Result<(), String> {
@@ -129,56 +151,86 @@ pub async fn start_fenced(
         },
         run_generation,
     )?;
-    if request.harness != "opencode" {
+    if !matches!(request.harness.as_str(), "opencode" | "claudecode") {
         return local_agents::start_with_env_fenced(request, &launch_env, stop_generation);
     }
     let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|_| "Could not initialize routing connection")?;
     let base = base.trim_end_matches('/');
-    let response = http
-        .get(format!("{base}/api/model-routing/chains"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|_| "Could not load OpenCode routes")?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Could not load OpenCode routes ({})",
-            response.status()
-        ));
-    }
-    let routes: Vec<Value> = response
-        .json()
-        .await
-        .map_err(|_| "Invalid routing catalog")?;
-    let selected = request.model.as_deref().filter(|s| !s.is_empty());
-    let chain = routes
-        .iter()
-        .find(|r| match selected {
-            Some(id) => r["id"].as_str() == Some(id),
-            None => r["is_default"].as_bool() == Some(true),
-        })
-        .ok_or("The selected OpenCode route is unavailable. Refresh the model list.")?;
-    let route = chain["id"]
-        .as_str()
-        .ok_or("The selected OpenCode route has no ID")?
-        .to_string();
-    let effort = request.effort.as_deref().filter(|e| !e.is_empty());
-    validate_effort(chain, effort)?;
+    let claude = request.harness == "claudecode";
+    let config = if claude {
+        let response = http
+            .get(format!("{base}/api/ai/providers"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| "Cannot read Core subscriptions for local Claude")?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Cannot read Core subscriptions for local Claude ({})",
+                response.status()
+            ));
+        }
+        let catalog: Value = response
+            .json()
+            .await
+            .map_err(|_| "Invalid Core subscription catalog")?;
+        if !claude_subscription_pool(&catalog)? {
+            // No connected subscription: retain the native Mac login.
+            return local_agents::start_with_env_fenced(request, &launch_env, stop_generation);
+        }
+        None
+    } else {
+        let response = http
+            .get(format!("{base}/api/model-routing/chains"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| "Could not load OpenCode routes")?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Could not load OpenCode routes ({})",
+                response.status()
+            ));
+        }
+        let routes: Vec<Value> = response
+            .json()
+            .await
+            .map_err(|_| "Invalid routing catalog")?;
+        let selected = request.model.as_deref().filter(|s| !s.is_empty());
+        let chain = routes
+            .iter()
+            .find(|r| match selected {
+                Some(id) => r["id"].as_str() == Some(id),
+                None => r["is_default"].as_bool() == Some(true),
+            })
+            .ok_or("The selected OpenCode route is unavailable. Refresh the model list.")?;
+        let route = chain["id"]
+            .as_str()
+            .ok_or("The selected OpenCode route has no ID")?
+            .to_string();
+        let effort = request.effort.as_deref().filter(|e| !e.is_empty());
+        validate_effort(chain, effort)?;
+        let config = configuration(base, &route, &request.id, effort);
+        request.model = Some(format!("orb-routing/{route}"));
+        Some(config)
+    };
+    let harness = if claude { "Claude" } else { "OpenCode" };
     // Dedicated key, never the dashboard JWT. It exists only for this run and is
     // revoked on launch failure or termination (including stopped generations).
     let response = http
         .post(format!("{base}/api/proxy-keys"))
         .bearer_auth(token)
-        .json(&json!({"name":format!("Orb OpenCode run {}",request.id)}))
+        .json(&json!({"name":format!("Orb {harness} run {}",request.id)}))
         .send()
         .await
-        .map_err(|_| "Could not authorize OpenCode routing")?;
+        .map_err(|_| format!("Could not authorize {harness} routing"))?;
     if !response.status().is_success() {
         return Err(format!(
-            "Could not authorize OpenCode routing ({})",
+            "Could not authorize {harness} routing ({})",
             response.status()
         ));
     }
@@ -191,13 +243,15 @@ pub async fn start_fenced(
         .as_str()
         .ok_or("Missing proxy credential identity")?
         .to_string();
-    let config = configuration(base, &route, &request.id, effort);
-    request.model = Some(format!("orb-routing/{route}"));
     let mission = request.id.clone();
-    launch_env.extend([
-        ("OPENCODE_CONFIG_CONTENT".into(), config.to_string()),
-        ("ORB_ROUTING_KEY".into(), secret.into()),
-    ]);
+    if let Some(config) = config {
+        launch_env.extend([
+            ("OPENCODE_CONFIG_CONTENT".into(), config.to_string()),
+            ("ORB_ROUTING_KEY".into(), secret.into()),
+        ]);
+    } else {
+        launch_env.extend(claude_environment(base, secret));
+    }
     let started = local_agents::start_with_env_fenced(request, &launch_env, stop_generation);
     let generation = local_agents::native_generation(&mission);
     let (base, token) = (base.to_string(), token.to_string());
@@ -234,6 +288,43 @@ pub async fn start_fenced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_pool_includes_exhausted_subscriptions_but_not_disabled_or_api_only() {
+        assert!(claude_subscription_pool(&json!([{"provider_type":"anthropic","enabled":true,"has_oauth":true,"status":"quota_exhausted"}])).unwrap());
+        for catalog in [
+            json!([]),
+            json!([{"provider_type":"anthropic","enabled":false,"has_oauth":true}]),
+            json!([{"provider_type":"anthropic","enabled":true,"has_api_key":true}]),
+            json!([{"provider_type":"openai","enabled":true,"has_oauth":true}]),
+        ] {
+            assert!(!claude_subscription_pool(&catalog).unwrap());
+        }
+        assert!(claude_subscription_pool(&json!({"error":"unavailable"})).is_err());
+    }
+
+    #[test]
+    fn claude_route_uses_an_ephemeral_proxy_key_without_rewriting_native_identity() {
+        let env = claude_environment("https://core.test/", "run-proxy-key");
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
+                .unwrap()
+                .1,
+            "https://core.test"
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "ANTHROPIC_AUTH_TOKEN")
+                .unwrap()
+                .1,
+            "run-proxy-key"
+        );
+        assert!(!env.iter().any(|(k, _)| matches!(
+            k.as_str(),
+            "HOME" | "CLAUDE_CONFIG_DIR" | "CLAUDE_CODE_OAUTH_TOKEN"
+        )));
+    }
+
     #[test]
     fn effort_reaches_provider_only_when_every_fallback_supports_it() {
         let route = json!({"entries":[{"model_id":"google/gemini-4-argon"}]});

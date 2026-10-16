@@ -1408,6 +1408,23 @@ fn mission_command(request: &StartRequest, env: &[(String, String)]) -> Command 
     } else {
         harness_command(&request.bin)
     };
+    if request.harness == "claudecode"
+        && env
+            .iter()
+            .any(|(key, value)| key == "ORB_CLAUDE_CORE_ROUTING" && value == "1")
+    {
+        // Explicit routing must win over credentials/cloud selectors inherited
+        // from the desktop's shell. Never edit the user's stored CLI login.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            command.env_remove(name);
+        }
+    }
     command.envs(env.iter().map(|(key, value)| (key, value)));
     command
 }
@@ -1494,6 +1511,7 @@ fn spawn_claude(
             let delays = recheck_delays(&request.id);
             thread::spawn(move || recheck.run(&stdin, &delays));
         }
+        let quota_id = request.id.clone();
         let mission_id = crate::interactions::session(&request.id);
         let resumed = request.session_id.as_deref().is_some_and(|s| !s.is_empty());
         let wakeup_command = crate::local_wakeups::command(&request.id);
@@ -1669,15 +1687,31 @@ fn spawn_claude(
                             stale_result_skipped = true;
                             continue;
                         }
-                        if let Some(piece) = claude_text.consume(&event) {
-                            output.append(&piece);
+                        if let Some(message) = claude_quota_result(&event) {
+                            if let Some((delay, label)) =
+                                claude_quota_delay(&message, chrono::Utc::now())
+                            {
+                                output.waiting_on_background(false);
+                                output.claude_quota_wait(Some(&label));
+                                recheck.quota(quota_wait_delay(&quota_id, delay));
+                                continue;
+                            }
                         }
-                        if event["is_error"] == true {
+                        if event["is_error"] == true || event["subtype"] == "error" {
                             return Err(event["result"]
                                 .as_str()
                                 .unwrap_or("Claude ended with an error")
                                 .to_owned());
                         }
+                        if let Some(piece) = claude_text.consume(&event) {
+                            output.append(&piece);
+                        }
+                        // A background notification may finish while quota is
+                        // exhausted; it must not cancel the pending continuation.
+                        if recheck.quota_pending() {
+                            continue;
+                        }
+                        output.claude_quota_wait(None);
                         // A result ends one turn, not the session: background agents
                         // can trigger more turns and permission requests afterwards.
                         if background.running() {
@@ -1734,6 +1768,23 @@ fn spawn_piped(
     }
     if request.harness == "opencode" {
         command.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
+    }
+    if request.harness == "claudecode"
+        && env
+            .iter()
+            .any(|(key, value)| key == "ORB_CLAUDE_CORE_ROUTING" && value == "1")
+    {
+        // Explicit routing must win over credentials/cloud selectors inherited
+        // from the desktop's shell. Never edit the user's stored CLI login.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            command.env_remove(name);
+        }
     }
     command.envs(env.iter().map(|(key, value)| (key, value)));
     if request.harness == "opencode" {
@@ -2676,6 +2727,63 @@ fn background_question(title: &str, tasks: &[BackgroundTask]) -> String {
     )
 }
 
+// Claude sometimes reports a quota notice as a successful result. Only
+// recognize a standalone provider notice there, not prose quoting an error.
+fn claude_quota_result(event: &Value) -> Option<String> {
+    if event["type"] != "result" {
+        return None;
+    }
+    let message = event["result"].as_str().map(str::to_owned).or_else(|| {
+        event["errors"].as_array().map(|errors| {
+            errors
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    })?;
+    let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
+    let explicit = event["is_error"] == true
+        || event["subtype"] == "error"
+        || [
+            "you've hit your ",
+            "you have hit your ",
+            "you're out of ",
+            "you are out of ",
+            "api error:",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    (explicit && crate::account_limits::is_usage_limit_message(&message)).then_some(message)
+}
+
+fn quota_wait_delay(_id: &str, delay: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(delay) = tests::quota_delays().lock().unwrap().get(_id) {
+        return *delay;
+    }
+    delay
+}
+
+/// Only provider usage exhaustion is retried here, never authentication or
+/// safeguard failures. A stale/reset-less reply gets a bounded backoff.
+fn claude_quota_delay(
+    message: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(Duration, String)> {
+    if !crate::account_limits::is_usage_limit_message(message) {
+        return None;
+    }
+    let zone = crate::account_limits::Zone::system();
+    let reset = crate::account_limits::limit_reset(message, now, zone);
+    let seconds = (reset.at - now).num_seconds().saturating_add(5).max(60);
+    let at = now + chrono::Duration::seconds(seconds);
+    Some((
+        Duration::from_secs(seconds as u64),
+        crate::account_limits::format_reset(at, zone),
+    ))
+}
+
 /// Asks the agent again about background tasks it has waited on for long.
 #[derive(Default)]
 struct Recheck(Mutex<RecheckState>, std::sync::Condvar);
@@ -2684,10 +2792,23 @@ struct RecheckState {
     waiting: Option<(Instant, Vec<BackgroundTask>)>,
     asked: usize,
     closed: bool,
+    quota: Option<Instant>,
 }
 impl Recheck {
+    fn quota(&self, delay: Duration) {
+        let mut state = self.0.lock().unwrap();
+        state.waiting = None;
+        state.quota = Some(Instant::now() + delay);
+        self.1.notify_all();
+    }
+    fn quota_pending(&self) -> bool {
+        self.0.lock().unwrap().quota.is_some()
+    }
     fn waiting(&self, tasks: Option<Vec<BackgroundTask>>) {
         let mut state = self.0.lock().unwrap();
+        if state.quota.is_some() {
+            return;
+        }
         let since = state.waiting.as_ref().map(|(since, _)| *since);
         if tasks.is_none() && since.is_none() {
             return;
@@ -2711,9 +2832,25 @@ impl Recheck {
         self.0.lock().unwrap().closed = true;
         self.1.notify_all();
     }
-    fn run(&self, stdin: &Mutex<std::process::ChildStdin>, delays: &[Duration]) {
+    fn run(&self, stdin: &Mutex<impl Write>, delays: &[Duration]) {
         let mut state = self.0.lock().unwrap();
         while !state.closed {
+            if let Some(until) = state.quota {
+                let left = until.saturating_duration_since(Instant::now());
+                if !left.is_zero() {
+                    state = self.1.wait_timeout(state, left).unwrap().0;
+                    continue;
+                }
+                state.quota = None;
+                drop(state);
+                let line = json!({"type":"user","message":{"role":"user","content":
+                    "[Automatic continuation after the Claude quota wait] Continue the existing task from its saved state. Check running tasks and saved results first; do not restart builds or redo completed work."}});
+                if write_line(&mut *stdin.lock().unwrap(), &line.to_string()).is_err() {
+                    return;
+                }
+                state = self.0.lock().unwrap();
+                continue;
+            }
             let Some((since, _)) = &state.waiting else {
                 state = self.1.wait(state).unwrap();
                 continue;
@@ -3863,6 +4000,212 @@ printf '%s\n' '{"type":"result"}'
         assert!(!state.running());
         state.consume(&json!({"type":"system","subtype":"task_started","task_id":"stale"}));
         assert!(!state.running());
+    }
+
+    pub(super) fn quota_delays() -> &'static Mutex<HashMap<String, Duration>> {
+        static DELAYS: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
+        DELAYS.get_or_init(Default::default)
+    }
+
+    #[test]
+    fn claude_core_routing_removes_competing_auth_only_for_the_routed_process() {
+        let request = StartRequest {
+            harness: "claudecode".into(),
+            bin: "claude".into(),
+            ..Default::default()
+        };
+        let env = vec![
+            ("ORB_CLAUDE_CORE_ROUTING".into(), "1".into()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), "ephemeral-proxy-key".into()),
+        ];
+        let command = mission_command(&request, &env);
+        let vars = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            vars["ANTHROPIC_AUTH_TOKEN"].as_deref(),
+            Some("ephemeral-proxy-key")
+        );
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            assert_eq!(vars.get(name), Some(&None));
+        }
+        assert!(!vars.contains_key("HOME") && !vars.contains_key("CLAUDE_CONFIG_DIR"));
+        assert_eq!(mission_command(&request, &[]).get_envs().count(), 0);
+    }
+
+    #[test]
+    fn claude_quota_reset_respects_timezone_and_does_not_retry_other_errors() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T10:56:46Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (delay, _) = claude_quota_delay(
+            "You've hit your session limit · resets 2:40pm (Europe/Lisbon)",
+            now,
+        )
+        .unwrap();
+        assert_eq!(delay.as_secs(), 9799); // 13:40 UTC plus five seconds
+        assert!(claude_quota_delay("authentication_error: login required", now).is_none());
+        assert!(claude_quota_delay("Request rejected by safeguard", now).is_none());
+        assert_eq!(
+            claude_quota_delay("You've hit your session limit", now)
+                .unwrap()
+                .0
+                .as_secs(),
+            3605
+        );
+        assert_eq!(
+            claude_quota_delay(
+                "You've hit your session limit · resets 11:55am (Europe/Lisbon)",
+                now
+            )
+            .unwrap()
+            .0
+            .as_secs(),
+            60
+        );
+    }
+
+    #[test]
+    fn claude_quota_result_covers_cli_success_and_error_envelopes_only() {
+        let message = "You've hit your session limit · resets 2:40pm (Europe/Lisbon)";
+        for event in [
+            json!({"type":"result","is_error":true,"result":message}),
+            json!({"type":"result","is_error":false,"result":message}),
+            json!({"type":"result","is_error":true,"errors":[message]}),
+        ] {
+            assert_eq!(claude_quota_result(&event).as_deref(), Some(message));
+        }
+        for event in [
+            json!({"type":"result","result":format!("I fixed the error: {message}")}),
+            json!({"type":"assistant","message":{"content":[{"text":message}]}}),
+            json!({"type":"result","is_error":true,"result":"authentication_error"}),
+        ] {
+            assert!(claude_quota_result(&event).is_none());
+        }
+    }
+
+    #[test]
+    fn claude_quota_timer_is_single_shot_and_stop_cancels_it() {
+        let timer = Arc::new(Recheck::default());
+        let input = Arc::new(Mutex::new(Vec::<u8>::new()));
+        timer.quota(Duration::from_millis(80));
+        timer.waiting(Some(vec![])); // task events cannot replace the quota deadline
+        let t = Arc::clone(&timer);
+        let i = Arc::clone(&input);
+        let worker = thread::spawn(move || t.run(&i, &[Duration::from_millis(1)]));
+        assert!(input.lock().unwrap().is_empty());
+        let until = Instant::now() + Duration::from_secs(2);
+        while input.lock().unwrap().is_empty() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        timer.close();
+        worker.join().unwrap();
+        let bytes = input.lock().unwrap();
+        let lines = String::from_utf8_lossy(&bytes);
+        assert_eq!(lines.lines().count(), 1);
+        assert!(lines.contains("do not restart builds"));
+        let stopped = Recheck::default();
+        stopped.quota(Duration::ZERO);
+        stopped.close();
+        let empty = Mutex::new(Vec::<u8>::new());
+        stopped.run(&empty, &[Duration::ZERO]);
+        assert!(empty.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_quota_wait_preserves_session_and_child_until_continuation() {
+        use std::os::unix::fs::PermissionsExt;
+        for is_error in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("claude-fixture");
+            let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '2.1.295 (Claude Code)\n'; exit; fi
+read -r init
+read -r prompt
+printf '%s\n' "$*" > args
+sleep 20 &
+job=$!
+trap 'kill "$job" 2>/dev/null; wait "$job" 2>/dev/null' EXIT
+printf '%s\n' '{"type":"result","is_error":IS_ERROR,"result":"You have hit your session limit"}'
+read -r next || exit 21
+kill -0 "$job" || exit 22
+printf '%s\n' "$next" > next.json
+printf '%s\n' '{"type":"result","result":"Continued in the same session."}'
+"#
+            .replace("IS_ERROR", if is_error { "true" } else { "false" });
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let id = format!("claude-quota-{}", uuid_like());
+            quota_delays()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Duration::from_millis(200));
+            local_agents_start(StartRequest {
+                service_tier: None,
+                effort: None,
+                cyber_revision: None,
+                cyber_access: None,
+                id: id.clone(),
+                harness: "claudecode".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Continue".into(),
+                model: None,
+                session_id: Some("12345678-1234-1234-1234-123456789abc".into()),
+                image_paths: vec![],
+                shared_cwd_with: None,
+            })
+            .unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut saw_wait = false;
+            loop {
+                let state = local_agents_poll(id.clone()).unwrap();
+                if state
+                    .activities
+                    .iter()
+                    .any(|a| a.id == "claude:quota" && a.status == "waiting")
+                {
+                    saw_wait = true;
+                    assert!(!state.done);
+                    assert!(state.waiting_since.is_none());
+                }
+                if state.done {
+                    assert!(state.error.is_none(), "{:?}", state.error);
+                    assert!(state.text.contains("Continued in the same session."));
+                    break;
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(saw_wait);
+            assert!(std::fs::read_to_string(dir.path().join("args"))
+                .unwrap()
+                .contains("--resume 12345678-1234-1234-1234-123456789abc"));
+            let next: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("next.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(next["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("do not restart builds"));
+            quota_delays().lock().unwrap().remove(&id);
+            runs().lock().unwrap().remove(&id);
+        }
     }
 
     /// Shorter delays for the run of one test.

@@ -12,6 +12,9 @@ pub mod file_notifications;
 #[path = "../../../shared/vibe.rs"]
 mod vibe;
 
+#[allow(dead_code)]
+#[path = "../../../src/account_limits.rs"]
+mod account_limits;
 mod connection_store;
 #[cfg(test)]
 mod live_mcp_tests;
@@ -35,9 +38,9 @@ mod context_service;
 mod file_browser;
 mod interactions;
 mod local_agents;
-mod local_workspaces;
 mod local_stream;
 mod local_wakeups;
+mod local_workspaces;
 mod machine_metrics;
 mod routed_opencode;
 mod session_preview;

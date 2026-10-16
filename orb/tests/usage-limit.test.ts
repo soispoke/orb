@@ -19,3 +19,14 @@ it("leaves a filesystem quota error alone", () => {
   expect(providerLimit("Disk quota exceeded (os error 122)")).toBeUndefined();
   expect(providerLimit("Gemini: quota exceeded for this project")?.kind).toBe("quota");
 });
+
+
+it("recognizes Claude session and model quota notices without treating auth errors as quota", () => {
+  for (const kind of ["session", "weekly", "Opus", "Sonnet"]) {
+    const notice = providerLimit(`You've hit your ${kind} limit · resets 2:40pm (Europe/Lisbon)`);
+    expect(notice?.kind).toBe("quota");
+    expect(notice?.resets).toBe("2:40pm (Europe/Lisbon)");
+  }
+  expect(providerLimit("authentication_error: please log in")).toBeUndefined();
+  expect(providerLimit("Request rejected by safeguard")).toBeUndefined();
+});
