@@ -51,6 +51,24 @@ it never restarts services automatically. This checks transport readiness,
 not each model's inference compatibility: also verify the native harness path
 after a deployment before declaring the incident resolved.
 
+### Shared local workspace blocked by a deleted chat's transfer
+
+A transfer left in `preparing` can fence every local chat using the same source
+folder. Previously, deleting its source mission left the transfer row behind,
+and the cancel endpoint returned 404 because that mission no longer existed.
+`src/api/mission_store/transfer_cleanup.sql` now cancels unfinished transfers
+atomically when their source mission is deleted, including bulk cleanup. It
+preserves receipts and increments their revisions to reject stale adapter
+writes. Startup also cancels existing orphans; quiet transfers with an existing
+source are never expired by age. The rule persists in the database and can be
+installed without restarting Core or interrupting local builds.
+
+Validate the exact migration with `python3 scripts/test_orb_transfer_cleanup.py`.
+Before a live install, inspect orphan metadata, back up affected rows and record
+whether the trigger existed. Do not clear valid transfer fences or restart a
+build to resolve this error. Retry the queued local message on its owning Mac
+once the stale fence is cancelled.
+
 ## Backend Services (Thomas / agent-core)
 
 `agent-core` is the only Thomas

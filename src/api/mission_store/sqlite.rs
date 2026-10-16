@@ -1107,6 +1107,10 @@ impl SqliteMissionStore {
 
             // Run migrations for existing databases
             Self::run_migrations(&conn)?;
+            // Install after the missions table exists. Also repairs abandoned
+            // transfers whose source was deleted by an older build.
+            conn.execute_batch(include_str!("transfer_cleanup.sql"))
+                .map_err(|e| format!("Failed to install transfer cleanup: {e}"))?;
 
             let mut readers = Vec::with_capacity(READ_CONNECTIONS);
             for _ in 0..READ_CONNECTIONS {
