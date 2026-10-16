@@ -591,7 +591,7 @@ pub struct Mission {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_objective: Option<String>,
     /// When the user first opened this mission *since it last entered
-    /// AwaitingUser*. Drives the 1-hour ack grace timer and the "opened"
+    /// AwaitingUser*. Drives the "opened"
     /// dot on Finished missions. Cleared when the mission goes back to
     /// Active via a new user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2627,22 +2627,22 @@ pub trait MissionStore: Send + Sync {
     /// Record the first time the user opened this mission, if not already set.
     /// Returns `Some(timestamp)` if the field was set by this call, or `None`
     /// if it was already populated (no-op). Used by the new
-    /// `POST /missions/:id/opened` endpoint to start the AwaitingUser ack
-    /// grace timer.
+    /// `POST /missions/:id/opened` endpoint for read receipts only.
     async fn set_mission_first_viewed_at_if_unset(
         &self,
         id: Uuid,
         timestamp: &str,
     ) -> Result<Option<String>, String>;
 
-    /// Atomically flip any AwaitingUser mission whose `first_viewed_at` is
-    /// older than `grace_seconds` to `Acknowledged`. Returns the IDs that
-    /// were promoted so the caller can broadcast `MissionStatusChanged`
-    /// events for them.
+    /// Compatibility hook for retired archive sweeps. Reading a chat or leaving
+    /// it idle is never consent to archive it; callers must use an explicit
+    /// status update. Kept as a no-op so old callers cannot hide chats.
     async fn acknowledge_stale_awaiting_user_missions(
         &self,
-        grace_seconds: u64,
-    ) -> Result<Vec<Uuid>, String>;
+        _grace_seconds: u64,
+    ) -> Result<Vec<Uuid>, String> {
+        Ok(Vec::new())
+    }
 
     /// IDs of missions currently parked in `WaitingBackground` — the agent's
     /// turn ended but tracked background shell jobs are (or were) still live.
@@ -2650,7 +2650,7 @@ pub trait MissionStore: Send + Sync {
     /// Used by the background-task auto-resume watcher to reconcile the
     /// persisted status against the in-memory registry: a `WaitingBackground`
     /// mission with no live jobs left must be flipped back to `AwaitingUser` so
-    /// the normal ack flow can settle it, instead of being stranded forever
+    /// it stays visible for the user, instead of being stranded forever
     /// (e.g. after a restart drops the in-memory registry). Default impl scans
     /// via `list_missions`; the sqlite store overrides it with a targeted query.
     async fn get_waiting_background_mission_ids(&self) -> Result<Vec<Uuid>, String> {
@@ -4296,6 +4296,72 @@ mod id_prefix_default_impl_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn viewed_idle_chats_require_explicit_archive_in_every_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores: Vec<Box<dyn MissionStore>> = vec![
+            Box::new(InMemoryMissionStore::new()),
+            Box::new(
+                FileMissionStore::new(dir.path().join("file"), "archive")
+                    .await
+                    .unwrap(),
+            ),
+            Box::new(
+                SqliteMissionStore::new(dir.path().join("sqlite"), "archive")
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        for store in stores {
+            let chat = store
+                .create_mission(Some("visible"), None, None, None, None, None, None)
+                .await
+                .unwrap();
+            for status in [
+                MissionStatus::AwaitingUser,
+                MissionStatus::WaitingBackground,
+                MissionStatus::Paused,
+                MissionStatus::Interrupted,
+            ] {
+                store.update_mission_status(chat.id, status).await.unwrap();
+                store
+                    .set_mission_first_viewed_at_if_unset(chat.id, "2000-01-01T00:00:00Z")
+                    .await
+                    .unwrap();
+                let before = store.get_mission(chat.id).await.unwrap().unwrap();
+                assert!(store
+                    .acknowledge_stale_awaiting_user_missions(0)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                let after = store.get_mission(chat.id).await.unwrap().unwrap();
+                assert_eq!(after.status, status);
+                assert_eq!(after.updated_at, before.updated_at);
+                assert_eq!(after.first_viewed_at, before.first_viewed_at);
+            }
+            store
+                .update_mission_status(chat.id, MissionStatus::AwaitingUser)
+                .await
+                .unwrap();
+            store
+                .update_mission_status(chat.id, MissionStatus::Acknowledged)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_mission(chat.id).await.unwrap().unwrap().status,
+                MissionStatus::Acknowledged
+            );
+            store
+                .update_mission_status(chat.id, MissionStatus::Paused)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get_mission(chat.id).await.unwrap().unwrap().status,
+                MissionStatus::Paused
+            );
+        }
+    }
 
     /// Test that missions are created with Pending status (not Active).
     /// This is critical to prevent the race condition where startup recovery

@@ -69,7 +69,7 @@ use uuid::Uuid;
 
 #[allow(unused_imports)]
 use super::supervision::{
-    ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
+    background_task_autoresume_loop, cleanup_stale_active_missions_once,
     recover_server_shutdown_missions, reset_waiting_background_on_boot, stale_mission_cleanup_loop,
     stuck_mission_watchdog_loop, watchdog_skips_control_owned_mission,
 };
@@ -409,25 +409,14 @@ pub(crate) fn stuck_seconds() -> u64 {
         .unwrap_or(STUCK_SECONDS)
 }
 
-/// Grace period after the user first opens an `AwaitingUser` mission before
-/// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
-/// Resets whenever the user sends a new message (status returns to Active and
-/// `first_viewed_at` is cleared).
-pub(crate) const ACK_GRACE_SECONDS: u64 = 3600;
-
-/// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
-pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(60);
-
 /// Whether an incoming user message (a real one, or the background-task
 /// auto-resume synthetic message) should re-activate `status` to `Active`.
 ///
 /// Kept as one predicate so every message-dequeue site agrees. It deliberately
 /// includes `WaitingBackground`: a resume delivered while background jobs were
 /// still live must flip the mission to `Active` — which clears `first_viewed_at`
-/// (see `MissionStore::update_mission_status`) — otherwise the stale timestamp
-/// survives the later demotion back to `AwaitingUser` and the ack-promotion
-/// sweep can archive a mission whose next turn just started.
+/// (see `MissionStore::update_mission_status`) so read receipts belong to the
+/// new turn. Neither opening a chat nor an old read receipt archives it.
 /// Reason written when a cancel's JoinHandle never resolves. During a
 /// deploy/SIGTERM drain this must stay `server_shutdown` so boot recovery
 /// and reconcile resume the writer instead of leaving it stranded.
@@ -9970,14 +9959,8 @@ fn status_holds_pr_writer_lease(status: MissionStatus, reason: Option<&str>) -> 
 
 /// Grace window during which an `AwaitingUser` PR writer keeps its lease.
 ///
-/// `AwaitingUser` is non-terminal on purpose — a writer waiting for a human
-/// reply must not lose its branch. But agent-created writers are often never
-/// opened in the dashboard, so the view-gated ack-promotion tick never
-/// archives them, and a finished writer can hold its PR lease indefinitely
-/// (phantom lease: observed 2026-08-01, a writer 13h idle in a tenant store
-/// blocked every replacement while reading 404 from another tenant). After
-/// this many seconds without any update, the lease check itself releases the
-/// holder by acknowledging it.
+/// Expired PR-writer leases stop blocking replacement writers, but the chat
+/// remains visible. Lease ownership and explicit chat archiving are separate.
 pub(crate) fn pr_writer_awaiting_grace_secs() -> i64 {
     std::env::var("PR_WRITER_AWAITING_GRACE_SECS")
         .ok()
@@ -9996,35 +9979,14 @@ fn awaiting_pr_writer_lease_expired(updated_at: &str) -> bool {
     idle.num_seconds() > pr_writer_awaiting_grace_secs()
 }
 
-/// Gate a matched writer through the awaiting-grace policy. Fresh holders are
-/// returned as the lease; lapsed `AwaitingUser` holders are acknowledged in
-/// place (best effort) so the durable state converges with the release.
+/// Release an expired writer lease without archiving its conversation.
 async fn resolve_writer_lease_or_release(
-    store: &Arc<dyn MissionStore>,
+    _store: &Arc<dyn MissionStore>,
     mission: &Mission,
 ) -> Result<Option<PrWriterLease>, String> {
     if mission.status == MissionStatus::AwaitingUser
         && awaiting_pr_writer_lease_expired(&mission.updated_at)
     {
-        tracing::info!(
-            mission_id = %mission.id,
-            updated_at = %mission.updated_at,
-            "releasing lapsed AwaitingUser PR-writer lease (auto-acknowledge)"
-        );
-        if let Err(error) = store
-            .update_mission_status(mission.id, MissionStatus::Acknowledged)
-            .await
-        {
-            // The holder could not be archived (read-only store, race). Keep
-            // treating the lease as released for this decision: the mission is
-            // provably idle past grace, and exclusivity failing open here only
-            // after a long idle window is the lesser risk than a permanent
-            // phantom lease.
-            tracing::warn!(
-                mission_id = %mission.id,
-                "failed to acknowledge lapsed PR-writer holder: {error}"
-            );
-        }
         return Ok(None);
     }
     Ok(Some(pr_writer_lease(mission)))
@@ -17409,8 +17371,7 @@ pub async fn load_mission(
 /// entered `AwaitingUser`. Sets `first_viewed_at` to now (no-op if already set)
 /// and broadcasts a `MissionStatusChanged` event so other clients can render
 /// the "opened" dot. The dashboard and iOS clients call this from their
-/// mission-detail entry points; the periodic ack-promotion tick uses the
-/// timestamp to decide when to move the mission to `Acknowledged`.
+/// mission-detail entry points. Opening a chat never schedules archiving.
 pub async fn mark_mission_opened(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -21456,10 +21417,6 @@ fn spawn_control_session(
             Arc::clone(&tool_hub),
             workspaces.clone(),
             config.working_dir.clone(),
-        ));
-        tokio::spawn(ack_promotion_loop(
-            Arc::clone(&state.mission_store),
-            events_tx.clone(),
         ));
     }
 
@@ -34350,6 +34307,29 @@ mod tests {
         );
         assert!(canonical_goal_message("/goals are nice").is_none());
         assert!(canonical_goal_message("plain message").is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_writer_lease_does_not_archive_chat() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mut mission = store
+            .create_mission(Some("writer"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        mission.status = MissionStatus::AwaitingUser;
+        mission.updated_at = "2000-01-01T00:00:00Z".into();
+        assert!(resolve_writer_lease_or_release(&store, &mission)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_mission(mission.id).await.unwrap().unwrap().status,
+            MissionStatus::AwaitingUser
+        );
     }
 
     #[test]
