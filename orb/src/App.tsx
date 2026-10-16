@@ -2814,6 +2814,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   let sendChain: Promise<void> = Promise.resolve();
   const beginSend = (draft:{text:string;images:DraftImage[];retry?:()=>void}|null) => {
     if(!draft)return;
+    openingAtLatest = false;
     const prevErr = sendError();
     const firstOpt = optimistic();
     const nextId = prevErr && firstOpt?.text === draft.text ? firstOpt.id : crypto.randomUUID();
@@ -2830,8 +2831,8 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
       return [...prev, { ...draft, id: nextId, waiting }];
     });
     if (!addedWaiting) {
-      nearBottom = true; inspectingAgents = false;
-      queueMicrotask(scrollIfPinned);
+      nearBottom = true; allowTailRepin = true; inspectingAgents = false;
+      queueMicrotask(() => scrollIfPinned(true));
     }
   };
   createEffect(()=>{
@@ -2877,25 +2878,51 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   const [followAttach, setFollowAttach] = createSignal<AttachChip[]>([]);
   let scroller: HTMLDivElement | undefined;
   let nearBottom = true;
+  let allowTailRepin = true;
   // Layout scroll events must not release the initial tail pin before paint.
   let openingAtLatest = true;
   let inspectingAgents = false;
-  const beginManualScroll = () => { openingAtLatest = false; inspectingAgents = false; };
+  let lastTouchY: number | undefined;
+  const beginManualScroll = (unpin = false) => {
+    openingAtLatest = false; inspectingAgents = false;
+    // WebKit can deliver scroll after the next stream/layout callback. Honor
+    // upward intent immediately so that callback cannot pull the reader back.
+    allowTailRepin = !unpin;
+    if (unpin) nearBottom = false;
+  };
+  const finishOpeningPin = () => {
+    if (!openingAtLatest) return;
+    // Programmatic composer autofocus is part of opening the chat. Only user
+    // interaction ends the opening pin, after its first layout has settled.
+    openingAtLatest = false; inspectingAgents = false;
+    nearBottom = allowTailRepin && (!scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80);
+  };
   createEffect(()=>{if(p.id)cacheRemember(`m:${p.id}`);});
 
-  const scrollIfPinned = () => {
-    if (nearBottom && !inspectingAgents && !scroller?.dataset.panelResizing && !scroller?.querySelector(".user.editing")) scroller?.scrollTo({ top: scroller.scrollHeight });
+  let followedContentHeight: number | undefined;
+  const scrollIfPinned = (force = false) => {
+    const content = scroller?.querySelector<HTMLElement>(".col");
+    if (!scroller || !content) return;
+    // Dock padding changes when a draft clears or a queued follow-up appears.
+    // That is not new transcript content: following scrollHeight on those
+    // updates moves the reply the user is reading by the queue's height.
+    const style = getComputedStyle(content);
+    const height = content.getBoundingClientRect().height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const changed = followedContentHeight === undefined || Math.abs(height - followedContentHeight) > 0.5;
+    followedContentHeight = height;
+    if ((force || changed || openingAtLatest) && nearBottom && !inspectingAgents && !scroller.dataset.panelResizing && !scroller.querySelector(".user.editing")) scroller.scrollTo({ top: scroller.scrollHeight });
   };
   // Resize notifications run after streaming Markdown has changed layout.
   onMount(() => {
     if (!scroller) return;
     const older=()=>{if(!openingAtLatest&&scroller!.scrollTop<800&&peekReadyTranscript(p.id)?.hasOlder)void loadOlder().catch(e=>setError(String(e)));};
     scroller.addEventListener('scroll',older,{passive:true});onCleanup(()=>scroller?.removeEventListener('scroll',older));
-    const initialFrame = requestAnimationFrame(scrollIfPinned);
+    const initialFrame = requestAnimationFrame(() => scrollIfPinned(true));
     onCleanup(() => cancelAnimationFrame(initialFrame));
     const observer = frameResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
     const content = scroller.querySelector(".col");
-    if (content) observer.observe(content);
+    if (content) observer.observe(content, {box: "border-box"});
+    observer.observe(scroller);
     onCleanup(() => observer.disconnect());
   });
 
@@ -3295,8 +3322,8 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     if(resend()?.state==='sending')return true;
     if(resend()?.state==='error'&&!resendKnown())return false;
     setResend({id:crypto.randomUUID(),text,waiting:busy(),state:"accepted"});
-    nearBottom=true; inspectingAgents=false;
-    queueMicrotask(scrollIfPinned);
+    nearBottom=true; allowTailRepin=true; inspectingAgents=false;
+    queueMicrotask(() => scrollIfPinned(true));
     void deliverResend();
     return true;
   };
@@ -3364,13 +3391,22 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
       <div
         class="scroll"
         ref={scroller}
-        onWheel={beginManualScroll}
-        onTouchMove={beginManualScroll}
-        onPointerDown={beginManualScroll}
-        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) beginManualScroll(); }}
+        onWheel={event => beginManualScroll(event.deltaY < 0)}
+        onTouchStart={event => { lastTouchY = event.touches[0]?.clientY; }}
+        onTouchMove={event => {
+          const y = event.touches[0]?.clientY;
+          beginManualScroll(y === undefined || lastTouchY === undefined || y > lastTouchY);
+          lastTouchY = y;
+        }}
+        onTouchEnd={() => { lastTouchY = undefined; }}
+        onPointerDown={() => beginManualScroll()}
+        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) beginManualScroll(["ArrowUp", "PageUp", "Home"].includes(event.key)); }}
         onScroll={() => {
           if(openingAtLatest || scroller?.dataset.panelResizing)return;
-          nearBottom = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+          const atTail = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+          // Layout/virtualization scroll events are not consent to follow again.
+          // Only a subsequent downward gesture (or an explicit send) can repin.
+          nearBottom = atTail && allowTailRepin;
         }}
       >
         <div class="col" style={peekTranscriptHeight(p.id) && awaiting() ? { "min-height": `${peekTranscriptHeight(p.id)}px` } : undefined}>
@@ -3417,7 +3453,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
           <Show when={refreshing()}><div class="agent-wait-status" role="status">Refreshing conversation…</div></Show>
         </div>
       </div>
-      <div class="dock" ref={floatingDock}>
+      <div class="dock" ref={floatingDock} onPointerDown={finishOpeningPin} onKeyDown={finishOpeningPin}>
         <div class="col">
           <Show when={p.id}><SideQuestions mission={p.id} items={viewItems()} ref={handle=>sideQuestions=handle} onTransfer={text=>setSideRevision({text,append:true})} onOpenSession={p.onFork?async id=>p.onFork?.(await getMission(id)):undefined}/></Show>
           <RemoteQueue mission={p.id}
