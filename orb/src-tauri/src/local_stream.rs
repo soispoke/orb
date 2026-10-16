@@ -124,6 +124,8 @@ pub struct Output(
     /// the epoch), or zero.
     std::sync::atomic::AtomicU64,
     std::sync::atomic::AtomicBool,
+    /// Bounded native stderr, used only when the process actually fails.
+    Mutex<Option<String>>,
 );
 
 pub struct ReaderGuard(Arc<Output>);
@@ -135,6 +137,12 @@ impl Drop for ReaderGuard {
     }
 }
 impl Output {
+    pub fn set_diagnostic(&self, message: String) {
+        *self.7.lock().unwrap() = Some(message);
+    }
+    pub fn diagnostic(&self) -> Option<String> {
+        self.7.lock().unwrap().clone()
+    }
     pub fn set_retryable(&self, retryable: bool) {
         self.6.store(retryable, Ordering::SeqCst);
     }

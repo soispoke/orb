@@ -30,3 +30,9 @@ Validation covers reset parsing and timezones, cancellation, the native stream
 remaining open, child-process survival, unchanged session identity, inherited
 auth precedence and subscription-catalog selection. A tools-disabled synthetic
 Claude request through Core verifies the installed CLI's gateway compatibility.
+
+Claude may print a notice that claude.ai connectors are unavailable while a
+gateway authentication source is active. This is diagnostic output, not a
+failed turn. Orb uses the structured result and process exit status to decide
+success, keeps stderr out of assistant replies, and retains a bounded diagnostic
+for a failing process. An exit without a final result remains a failure.

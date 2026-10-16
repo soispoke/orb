@@ -490,6 +490,18 @@ fn watch_exit(
             *slot = status.and_then(|status| status.code());
         }
         output.wait_drained(None);
+        // stderr is diagnostic, not an outcome. Claude emits informational
+        // gateway/connector notices here even after a successful native result.
+        if *exit_code.lock().unwrap() != Some(0) {
+            if let Some(diagnostic) = output.diagnostic() {
+                let mut slot = error.lock().unwrap();
+                if slot.is_none()
+                    || slot.as_deref() == Some("Claude stopped without a final result")
+                {
+                    *slot = Some(format!("Claude process failed: {diagnostic}"));
+                }
+            }
+        }
         if strict_terminal {
             let failed = error.lock().is_ok_and(|error| error.is_some());
             if let Ok(mut slot) = exit_code.lock() {
@@ -1542,6 +1554,7 @@ fn spawn_claude(
                 let mut background = ClaudeBackground::default();
                 let mut request_started = false;
                 let mut stale_result_skipped = false;
+                let mut completed = false;
                 // The turn gave its result and only background tasks remain.
                 let mut answered = false;
                 let mut wakeups: HashMap<String, Value> = HashMap::new();
@@ -1733,12 +1746,17 @@ fn spawn_claude(
                             say("Implement the approved plan.")?;
                             continue;
                         }
+                        completed = true;
                         break;
                     } else if let Some(piece) = claude_text.consume(&event) {
                         output.append(&piece);
                     }
                 }
-                Ok(())
+                if completed {
+                    Ok(())
+                } else {
+                    Err("Claude stopped without a final result".into())
+                }
             })();
             recheck.close();
             crate::interactions::finish(&mission_id);
@@ -1746,7 +1764,23 @@ fn spawn_claude(
                 *failures.lock().unwrap() = Some(e);
             }
         });
-        pipe_output(None, child.stderr.take(), text, error, true, None, None);
+        if let Some(stderr) = child.stderr.take() {
+            let output = Arc::clone(text);
+            let guard = output.reader();
+            thread::spawn(move || {
+                let _guard = guard;
+                // Drain the entire pipe, retaining only a bounded prefix. Never
+                // publish diagnostic text as an assistant reply or a live error.
+                let mut reader = BufReader::new(stderr);
+                let mut prefix = Vec::new();
+                let _ = reader.by_ref().take(16 * 1024).read_to_end(&mut prefix);
+                let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                let clean = strip_terminal_codes(&String::from_utf8_lossy(&prefix));
+                if !clean.trim().is_empty() {
+                    output.set_diagnostic(clean.trim().chars().take(1000).collect());
+                }
+            });
+        }
         return Ok(child);
     }
 }
@@ -4005,6 +4039,137 @@ printf '%s\n' '{"type":"result"}'
     pub(super) fn quota_delays() -> &'static Mutex<HashMap<String, Duration>> {
         static DELAYS: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
         DELAYS.get_or_init(Default::default)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_diagnostic_warning_does_not_fail_success_and_real_failures_remain_visible() {
+        use std::os::unix::fs::PermissionsExt;
+        let warning = "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login · Unset it to load your organization's connectors";
+        for (name, result, code, expected) in [
+            (
+                "warning-success",
+                r#"{"type":"result","is_error":false,"result":"Finished the task."}"#,
+                0,
+                None,
+            ),
+            (
+                "protocol-error",
+                r#"{"type":"result","is_error":true,"result":"Authentication failed"}"#,
+                0,
+                Some("Authentication failed"),
+            ),
+            (
+                "process-failure",
+                r#"{"type":"result","is_error":false,"result":"Partial work."}"#,
+                9,
+                Some("Claude process failed"),
+            ),
+            (
+                "missing-result",
+                "",
+                0,
+                Some("Claude stopped without a final result"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("claude-fixture");
+            let warning = warning.replace('\'', "'\\''");
+            let script = format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.295 (Claude Code)'; exit; fi\nread -r init\nread -r prompt\nprintf '%s\\n' '{warning}' >&2\nprintf '%s\\n' '{result}'\nexit {code}\n");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let id = format!("claude-diagnostic-{name}-{}", uuid_like());
+            local_agents_start(StartRequest {
+                id: id.clone(),
+                harness: "claudecode".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Continue".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state = local_agents_poll(id.clone()).unwrap();
+                if state.done {
+                    assert_eq!(state.exit_code, Some(code));
+                    match expected {
+                        Some(message) => assert!(
+                            state.error.as_deref().unwrap_or("").contains(message),
+                            "{name}: {:?}",
+                            state.error
+                        ),
+                        None => {
+                            assert!(state.error.is_none(), "{:?}", state.error);
+                            assert_eq!(state.text, "Finished the task.");
+                        }
+                    }
+                    assert!(!state.text.contains("connectors are disabled"));
+                    break;
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(5));
+            }
+            runs().lock().unwrap().remove(&id);
+        }
+    }
+
+    /// Opt in with a short-lived Core proxy key, never the desktop owner token.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires installed Claude and an explicitly supplied ephemeral Core key"]
+    fn claude_core_warning_canary_uses_native_orb_lifecycle() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::var("ORB_CANARY_BASE_URL").expect("supply Core URL");
+        assert!(base.starts_with("https://"));
+        let key = std::env::var("ORB_CANARY_PROXY_KEY").expect("supply ephemeral proxy key");
+        let cli = std::env::var("ORB_CANARY_CLAUDE_BIN").expect("supply installed Claude path");
+        let model = std::env::var("ORB_CANARY_MODEL").expect("supply model");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-canary");
+        let cli = cli.replace('\'', "'\\''");
+        std::fs::write(&bin, format!("#!/bin/sh\nexec '{cli}' \"$@\" --tools '' --no-session-persistence --strict-mcp-config --mcp-config '{{\"mcpServers\":{{}}}}'\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-warning-canary-{}", uuid_like());
+        start_with_env(
+            StartRequest {
+                id: id.clone(),
+                harness: "claudecode".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Reply with exactly OK. Do not use tools.".into(),
+                model: Some(model),
+                ..Default::default()
+            },
+            &[
+                ("ORB_CLAUDE_CORE_ROUTING".into(), "1".into()),
+                ("ANTHROPIC_BASE_URL".into(), base),
+                ("ANTHROPIC_AUTH_TOKEN".into(), key),
+            ],
+        )
+        .expect("native canary should start");
+        let until = Instant::now() + Duration::from_secs(90);
+        loop {
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                assert_eq!(state.exit_code, Some(0));
+                assert!(state.error.is_none(), "native lifecycle reported an error");
+                assert_eq!(state.text.trim(), "OK");
+                let run = runs().lock().unwrap().remove(&id).unwrap();
+                assert!(
+                    run.text
+                        .diagnostic()
+                        .is_some_and(|text| text.contains("connectors are disabled")),
+                    "canary must exercise the real connector warning"
+                );
+                break;
+            }
+            if Instant::now() >= until {
+                let _ = local_agents_stop(id.clone());
+                panic!("native canary timed out");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]
