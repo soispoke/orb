@@ -806,7 +806,12 @@ export function isBtwMission(mission: Pick<Mission, "tags">): boolean {
 export async function listProjectMissions(slug: string): Promise<Mission[]> {
   const origins=await import("./localOrigins"),observedAt=origins.observe();
   const local=(await origins.localOrigins()).filter(m=>m.project===slug && !isBtwMission(m));
-  try{const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);await origins.rememberCoreState(local,remote,observedAt);const pending=local.filter(origins.localPending).map(row=>origins.withCoreEffort(row,remote.find(m=>m.id===row.id)));return [...pending,...remote.filter(m=>!isBtwMission(m) && !pending.some(l=>l.id===m.id))];}catch(error){if(local.length)return local;throw error;}
+  try {
+    const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);
+    const unlisted=await origins.unlistedCoreState(local,remote,id=>api<Mission>(`/api/control/missions/${id}`,{signal:AbortSignal.timeout(3000)}));
+    await origins.rememberCoreState(local,[...unlisted,...remote],observedAt);
+    return origins.mergeLocalOrigins(local,remote,unlisted,true).filter(m=>m.project===slug&&!isBtwMission(m));
+  } catch(error){if(local.length)return local;throw error;}
 }
 
 export async function listProjectFiles(slug: string, path: string): Promise<ProjectFileEntry[]> {
@@ -852,7 +857,12 @@ export async function deleteProjectFile(slug: string, path: string): Promise<voi
 export async function listMissions(limit = 200): Promise<Mission[]> {
   const origins = await import("./localOrigins"), observedAt = origins.observe();
   const local = (await origins.localOrigins()).filter(m=>!isBtwMission(m));
-  try { const remote = await api<Mission[]>(`/api/control/missions?limit=${limit}`, {signal:AbortSignal.timeout(3000)}); await origins.rememberCoreState(local,[...remote,...await origins.unlistedCoreState(local,remote,id=>api<Mission>(`/api/control/missions/${id}`,{signal:AbortSignal.timeout(3000)}))],observedAt); const pending=local.filter(origins.localPending).map(row=>origins.withCoreEffort(row,remote.find(m=>m.id===row.id))); return [...pending,...remote.filter(row=>!isBtwMission(row) && !pending.some(item=>item.id===row.id))]; }
+  try {
+    const remote=await api<Mission[]>(`/api/control/missions?limit=${limit}`,{signal:AbortSignal.timeout(3000)});
+    const unlisted=await origins.unlistedCoreState(local,remote,id=>api<Mission>(`/api/control/missions/${id}`,{signal:AbortSignal.timeout(3000)}));
+    await origins.rememberCoreState(local,[...unlisted,...remote],observedAt);
+    return origins.mergeLocalOrigins(local,remote,unlisted).filter(m=>!isBtwMission(m));
+  }
   catch(error){if(local.length)return local;throw error;}
 }
 

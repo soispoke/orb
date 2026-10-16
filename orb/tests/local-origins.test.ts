@@ -129,7 +129,7 @@ it('learns about an archive the default list leaves out, and keeps an emptied ti
  vi.stubGlobal('fetch',offline());
  expect((await listMissions()).find(m=>m.id==='done')).toMatchObject({status:'acknowledged',title:''});
 });
-it('retires a synchronized local mission once Core confirms 404 or explicit deletion',async()=>{
+it('keeps synchronized local history visible after Core returns 404',async()=>{
  setConnection('http://core.test','token');const {confirmed}=journal([done,unsynced]);
  const {forgetUnlistedReads}=await import('../src/localOrigins');
  forgetUnlistedReads();
@@ -138,11 +138,13 @@ it('retires a synchronized local mission once Core confirms 404 or explicit dele
   if(new URL(url).pathname === '/api/control/missions')return new Response('[]');
   return new Response('Not found',{status:404});
  }));
- await listMissions();
- expect(confirmed.get('done')?.deleted).toBe(true);
+ expect((await listMissions()).map(m=>m.id)).toEqual(['unsynced','done']);
+ expect((await listProjectMissions('test')).map(m=>m.id)).toEqual(['unsynced','done']);
+ expect(await getMission('done')).toMatchObject({id:'done',title:done.title});
+ expect(confirmed.get('done')?.deleted).not.toBe(true);
  expect(confirmed.get('unsynced')).toBeUndefined();
  vi.stubGlobal('fetch',offline());
- expect((await listMissions()).map(m=>m.id)).toEqual(['unsynced']);
+ expect((await listMissions()).map(m=>m.id)).toEqual(['done','unsynced']);
 });
 
 it('shares concurrent native scans and reads fresh rows after completion',async()=>{
@@ -169,4 +171,20 @@ it('keeps local output but reads current Antigravity effort from Core while runn
  expect(await listProjectMissions('test')).toMatchObject([{...local,model_effort:'high'}]);
  effort=null;
  expect(await getMission('done')).toMatchObject({...local,model_effort:null});
+});
+
+it('still retires the local copy after an explicit successful deletion',async()=>{
+ setConnection('http://core.test','token');const {confirmed}=journal([done]);
+ const {confirmDeletedLocalOrigins}=await import('../src/localOrigins');
+ await confirmDeletedLocalOrigins(['done']);
+ expect(confirmed.get('done')?.deleted).toBe(true);
+ vi.stubGlobal('fetch',core([]));
+ expect(await listMissions()).toEqual([]);
+});
+it.each([404,503])('keeps the local copy after a failed lookup (%s), then accepts Core recovery',async(status)=>{
+ setConnection('http://core.test','token');journal([done]);
+ vi.stubGlobal('fetch',vi.fn(async(input:any)=>new Response(String(input).includes('?')?'[]':'unavailable',{status:String(input).includes('?')?200:status})));
+ expect(await listMissions()).toMatchObject([{id:'done',title:done.title}]);
+ vi.stubGlobal('fetch',core([{...done,title:'Recovered on Core'}]));
+ expect(await listMissions()).toMatchObject([{id:'done',title:'Recovered on Core'}]);
 });
