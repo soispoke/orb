@@ -59,6 +59,7 @@ export function FindBar() {
       const target=last??document.activeElement as HTMLElement;
       scope=target?.closest<HTMLElement>('.file-preview,.btw-thread,.scroll,[data-find-conversation]')??target?.closest('.file-panel')?.querySelector<HTMLElement>('.file-preview')??document.querySelector<HTMLElement>('.scroll')??undefined;
       if(!scope)return;
+      scope.dispatchEvent(new CustomEvent("orb:reader-scroll", {detail:{unpin:true}}));
       e.preventDefault();e.stopImmediatePropagation();previousFocus=document.activeElement as HTMLElement;cached=undefined;observer?.disconnect();observer=new MutationObserver(()=>{cached=undefined;clearTimeout(timer);timer=setTimeout(search,120);});if(!transcriptSearch(scope))observer.observe(scope,{subtree:true,childList:true,characterData:true});positionBar();setLabel(scope.matches('.file-preview')?'file':'conversation');setOpen(true);search();searchAbort?.abort();searchAbort=new AbortController();const signal=searchAbort.signal;
       const virtual=transcriptSearch(scope);if(virtual){setFailure('');setLoading(true);void virtual.prepare(signal).then(()=>{if(!signal.aborted)search();}).catch(error=>{if(!signal.aborted)setFailure('History unavailable — reopen search to retry');}).finally(()=>{if(!signal.aborted)setLoading(false);});}
       requestAnimationFrame(()=>{input.focus();input.select();});

@@ -2883,15 +2883,20 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   let openingAtLatest = true;
   let inspectingAgents = false;
   let lastTouchY: number | undefined;
+  let manualScrollUntil = 0;
+  let scrollbarDragging = false;
+  let followFrame = 0;
+  onCleanup(() => cancelAnimationFrame(followFrame));
   const beginManualScroll = (unpin = false) => {
     openingAtLatest = false; inspectingAgents = false;
+    manualScrollUntil = performance.now() + 200;
     // WebKit can deliver scroll after the next stream/layout callback. Honor
     // upward intent immediately so that callback cannot pull the reader back.
     allowTailRepin = !unpin;
     if (unpin) nearBottom = false;
   };
   const finishOpeningPin = () => {
-    if (!openingAtLatest) return;
+    if (!openingAtLatest || awaiting()) return;
     // Programmatic composer autofocus is part of opening the chat. Only user
     // interaction ends the opening pin, after its first layout has settled.
     openingAtLatest = false; inspectingAgents = false;
@@ -2900,26 +2905,63 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   createEffect(()=>{if(p.id)cacheRemember(`m:${p.id}`);});
 
   let followedContentHeight: number | undefined;
-  const scrollIfPinned = (force = false) => {
+  let pinnedPadding: string | undefined;
+  let repairPinUntil = 0;
+  const scrollIfPinned = (force = false, repair = false) => {
     const content = scroller?.querySelector<HTMLElement>(".col");
     if (!scroller || !content) return;
     // Dock padding changes when a draft clears or a queued follow-up appears.
     // That is not new transcript content: following scrollHeight on those
     // updates moves the reply the user is reading by the queue's height.
     const style = getComputedStyle(content);
+    const padding = `${style.paddingTop}:${style.paddingBottom}`;
+    if (repair && (padding !== pinnedPadding || performance.now() > repairPinUntil)) return;
     const height = content.getBoundingClientRect().height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
     const changed = followedContentHeight === undefined || Math.abs(height - followedContentHeight) > 0.5;
     followedContentHeight = height;
-    if ((force || changed || openingAtLatest) && nearBottom && !inspectingAgents && !scroller.dataset.panelResizing && !scroller.querySelector(".user.editing")) scroller.scrollTo({ top: scroller.scrollHeight });
+    if ((force || changed || openingAtLatest) && nearBottom && !inspectingAgents && !scroller.dataset.panelResizing && !scroller.querySelector(".user.editing")) {
+      scroller.scrollTo({ top: scroller.scrollHeight });
+    }
   };
   // Resize notifications run after streaming Markdown has changed layout.
   onMount(() => {
     if (!scroller) return;
     const older=()=>{if(!openingAtLatest&&scroller!.scrollTop<800&&peekReadyTranscript(p.id)?.hasOlder)void loadOlder().catch(e=>setError(String(e)));};
     scroller.addEventListener('scroll',older,{passive:true});onCleanup(()=>scroller?.removeEventListener('scroll',older));
+    // Scroll events also come from layout and virtual row measurements. Only
+    // gestures (including our overlay scrollbar) may change follow intent.
+    const readerScroll = (event: Event) => beginManualScroll((event as CustomEvent).detail?.unpin !== false);
+    const pointerUp = () => { scrollbarDragging = false; };
+    scroller.addEventListener("orb:reader-scroll", readerScroll);
+    window.addEventListener("pointerup", pointerUp);
+    window.addEventListener("pointercancel", pointerUp);
+    onCleanup(() => {
+      scroller?.removeEventListener("orb:reader-scroll", readerScroll);
+      window.removeEventListener("pointerup", pointerUp);
+      window.removeEventListener("pointercancel", pointerUp);
+    });
     const initialFrame = requestAnimationFrame(() => scrollIfPinned(true));
     onCleanup(() => cancelAnimationFrame(initialFrame));
-    const observer = frameResizeObserver(() => { if (nearBottom) scrollIfPinned(); });
+    // Dock measurements temporarily change clientHeight before their negative
+    // margin settles. Only a width change or a window resize is a viewport
+    // change; treating dock growth as one moves the reply when queuing.
+    let viewportWidth = scroller.clientWidth, windowHeight = window.innerHeight;
+    const observer = frameResizeObserver(() => {
+      if (!scroller) return;
+      const viewportChanged = viewportWidth !== scroller.clientWidth || windowHeight !== window.innerHeight;
+      viewportWidth = scroller.clientWidth; windowHeight = window.innerHeight;
+      if (nearBottom) {
+        if (viewportChanged) {
+          const content = scroller.querySelector(".col");
+          if (content) {
+            const style = getComputedStyle(content);
+            pinnedPadding = `${style.paddingTop}:${style.paddingBottom}`;
+            repairPinUntil = performance.now() + 200;
+          }
+        }
+        scrollIfPinned(viewportChanged);
+      }
+    });
     const content = scroller.querySelector(".col");
     if (content) observer.observe(content, {box: "border-box"});
     observer.observe(scroller);
@@ -3399,10 +3441,26 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
           lastTouchY = y;
         }}
         onTouchEnd={() => { lastTouchY = undefined; }}
-        onPointerDown={() => beginManualScroll()}
-        onKeyDown={event => { if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key)) beginManualScroll(["ArrowUp", "PageUp", "Home"].includes(event.key)); }}
+        onPointerDown={event => {
+          finishOpeningPin();
+          if (event.target === scroller) { scrollbarDragging = true; beginManualScroll(); }
+        }}
+        onKeyDown={event => {
+          if ((event.target as HTMLElement).closest("input,textarea,[contenteditable=true]")) return;
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) beginManualScroll(["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey));
+        }}
         onScroll={() => {
           if(openingAtLatest || scroller?.dataset.panelResizing)return;
+          if (!scrollbarDragging && performance.now() > manualScrollUntil) {
+            // WebKit can adjust the scroll position a frame after resizing or
+            // measuring virtual rows, without another resize notification.
+            if (nearBottom && performance.now() <= repairPinUntil && !followFrame) followFrame = requestAnimationFrame(() => {
+              followFrame = 0;
+              if (!disposed) scrollIfPinned(true, true);
+            });
+            return;
+          }
+          manualScrollUntil = performance.now() + 200;
           const atTail = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
           // Layout/virtualization scroll events are not consent to follow again.
           // Only a subsequent downward gesture (or an explicit send) can repin.
