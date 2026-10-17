@@ -3349,6 +3349,38 @@ async fn try_llm_metadata_summarization(
     }
 }
 
+/// Restoring a finished chat preserves its established title. No runner is
+/// dispatched here; the status transition retains the existing resume behavior.
+async fn set_mission_status_preserving_title(
+    store: &Arc<dyn MissionStore>,
+    id: Uuid,
+    status: MissionStatus,
+) -> Result<(), String> {
+    let _title_guard = MISSION_TITLE_UPDATE_LOCK.lock().await;
+    if status == MissionStatus::Paused {
+        let mission = store
+            .get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        if matches!(
+            mission.status,
+            MissionStatus::Acknowledged
+                | MissionStatus::Completed
+                | MissionStatus::Failed
+                | MissionStatus::Interrupted
+        ) {
+            if let Some(title) = mission
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+            {
+                store.update_mission_title(id, title).await?;
+            }
+        }
+    }
+    store.update_mission_status(id, status).await
+}
+
 async fn apply_generated_mission_metadata_updates(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &broadcast::Sender<AgentEvent>,
@@ -3362,12 +3394,24 @@ async fn apply_generated_mission_metadata_updates(
         return false;
     }
 
-    let _title_update_guard = if generated_title.is_some() {
-        Some(MISSION_TITLE_UPDATE_LOCK.lock().await)
-    } else {
-        None
+    // Generation can finish after a user rename/restore. Recheck under the
+    // same lock as those mutations, including description-only refreshes that
+    // could otherwise downgrade metadata_source and unprotect the title.
+    let _title_update_guard = MISSION_TITLE_UPDATE_LOCK.lock().await;
+    let current = match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) => mission,
+        _ => return false,
     };
-
+    let user_managed = current.metadata_source.as_deref() == Some(METADATA_SOURCE_USER);
+    let generated_title = if user_managed { None } else { generated_title };
+    if generated_title.is_none() && generated_short_description.is_none() {
+        return false;
+    }
+    let metadata_source_update = if user_managed {
+        None
+    } else {
+        metadata_source_update
+    };
     let title_to_write = match generated_title {
         Some(title) => Some(disambiguate_generated_title(mission_store, mission_id, &title).await),
         None => None,
@@ -26268,9 +26312,9 @@ async fn control_actor_loop(
                                     }
                                 }
 
-                                let result = mission_store
-                                    .update_mission_status(id, new_status)
-                                    .await;
+                                let result = set_mission_status_preserving_title(
+                                    &mission_store, id, new_status,
+                                ).await;
                                 if result.is_ok() {
                                     let runner_active = running_mission_id == Some(id)
                                         || parallel_runners
@@ -26383,6 +26427,7 @@ async fn control_actor_loop(
                                     if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
                                         dispatch_admission::recover_dispatch(&state, &mission_store, id).await?;
                                     }
+                                    let _title_guard = MISSION_TITLE_UPDATE_LOCK.lock().await;
                                     mission_store.update_mission_title(id, &title).await
                                 }.await;
                                 if result.is_ok() {
@@ -36919,6 +36964,104 @@ And the report:
 
         assert_eq!(updated_title, None);
         assert_eq!(updated_short_description, None);
+    }
+
+    #[tokio::test]
+    async fn test_restored_title_survives_delayed_metadata_updates() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let (events, _) = broadcast::channel(16);
+        for status in [
+            MissionStatus::Acknowledged,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+        ] {
+            let mission = store
+                .create_mission(Some("Kohaku review"), None, None, None, None, None, None)
+                .await
+                .unwrap();
+            store
+                .update_mission_status(mission.id, status)
+                .await
+                .unwrap();
+            set_mission_status_preserving_title(&store, mission.id, MissionStatus::Paused)
+                .await
+                .unwrap();
+            // Simulate a refresh generated before restore, then a description-only
+            // refresh generated before the name became user-managed.
+            for title in [
+                Some("I'll start from the current synthesis".to_owned()),
+                None,
+            ] {
+                apply_generated_mission_metadata_updates(
+                    &store,
+                    &events,
+                    mission.id,
+                    title,
+                    Some("New description".to_owned()),
+                    Some(Some(METADATA_SOURCE_BACKEND_HEURISTIC)),
+                    Some("model"),
+                )
+                .await;
+                let updated = store.get_mission(mission.id).await.unwrap().unwrap();
+                assert_eq!(updated.status, MissionStatus::Paused);
+                assert_eq!(updated.title.as_deref(), Some("Kohaku review"));
+                assert_eq!(
+                    updated.metadata_source.as_deref(),
+                    Some(METADATA_SOURCE_USER)
+                );
+                assert_eq!(
+                    updated.short_description.as_deref(),
+                    Some("New description")
+                );
+                assert!(updated.history.is_empty());
+                assert_eq!(updated.session_id, mission.session_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_title_survives_delayed_generation() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let (events, _) = broadcast::channel(16);
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            apply_generated_mission_metadata_updates(
+                &store,
+                &events,
+                mission.id,
+                Some("Generated name".to_owned()),
+                None,
+                Some(Some(METADATA_SOURCE_BACKEND_HEURISTIC)),
+                None
+            )
+            .await
+        );
+        store
+            .update_mission_title(mission.id, "User name")
+            .await
+            .unwrap();
+        assert!(
+            !apply_generated_mission_metadata_updates(
+                &store,
+                &events,
+                mission.id,
+                Some("Stale name".to_owned()),
+                None,
+                Some(Some(METADATA_SOURCE_BACKEND_HEURISTIC)),
+                None
+            )
+            .await
+        );
+        let updated = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(updated.title.as_deref(), Some("User name"));
+        assert_eq!(
+            updated.metadata_source.as_deref(),
+            Some(METADATA_SOURCE_USER)
+        );
     }
 
     #[tokio::test]

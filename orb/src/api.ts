@@ -1113,11 +1113,17 @@ export async function reopenMission(id: string): Promise<void> {
   if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
   if (!["completed", "failed", "interrupted", "acknowledged", "cancelled"].includes(mission.status)
     || mission.execution?.state === "running") throw new Error("This mission is no longer finished. Refresh its status before reopening it.");
+  // Preserve the established name across restore, including against older Core
+  // versions that refresh generated metadata when the status changes.
+  if (mission.title?.trim()) {
+    await renameMission(id, mission.title);
+    if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
+  }
   await api(`/api/control/missions/${encodeURIComponent(id)}/status`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ status: "paused" }),
   });
-  await confirmCoreChange({ id, status: "paused" });
+  await confirmCoreChange({ id, status: "paused", ...(mission.title ? { title: mission.title } : {}) });
 }
 
 /** Rename the conversation without changing its execution settings. */

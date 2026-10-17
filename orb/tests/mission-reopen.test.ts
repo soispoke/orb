@@ -24,3 +24,24 @@ it.each([
   await expect(reopenMission("mission")).rejects.toThrow(/no longer finished/);
   expect(fetcher).toHaveBeenCalledTimes(1);
 });
+
+it("pins the exact title before restoring, without launching work", async () => {
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce(Response.json({ id: "mission", status: "acknowledged", title: "Kohaku review" }))
+    .mockResolvedValueOnce(Response.json({}))
+    .mockResolvedValueOnce(Response.json({}));
+  vi.stubGlobal("fetch", fetcher);
+  await reopenMission("mission");
+  expect(fetcher.mock.calls.slice(1).map(([url, init]) => [url.split("/mission/")[1], JSON.parse(init.body)]))
+    .toEqual([["title", {title: "Kohaku review"}], ["status", {status: "paused"}]]);
+});
+
+it("does not restore when preserving the title fails", async () => {
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce(Response.json({ id: "mission", status: "acknowledged", title: "Keep me" }))
+    .mockResolvedValueOnce(new Response("Title save failed", {status: 500}));
+  vi.stubGlobal("fetch", fetcher);
+  await expect(reopenMission("mission")).rejects.toThrow();
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(fetcher.mock.calls[1][0]).toMatch(/\/title$/);
+});

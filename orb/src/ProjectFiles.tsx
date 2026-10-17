@@ -74,7 +74,7 @@ import { cacheCanPrefetch, cacheLoad, cachePeek, cachePrefetch, cachePut, cacheR
 import { SidebarTree } from "./Tree";
 import { visibleTree, type TreeNode, type TreeRow } from "./treeModel";
 import { FileSkeleton } from "./Skeleton";
-import { countNested, holds, nestMissions, missionParent, missionSubtree, missionTreeRows, archiveOnlyRows, isSupersededInTree, ARCHIVE_DAY_MS, ARCHIVE_WEEK_MS, filterArchivedMissionsByAge, expandMissionDescendants, type NestedMission } from "./missionTree";
+import { countNested, holds, nestMissions, missionParent, missionSubtree, missionTreeRows, archiveOnlyRows, ARCHIVE_DAY_MS, ARCHIVE_WEEK_MS, filterArchivedMissionsByAge, expandMissionDescendants, type NestedMission } from "./missionTree";
 
 const [deletingIds, setDeletingIds] = createSignal<ReadonlySet<string>>(new Set());
 export const isMissionDeleting = (id: string): boolean => deletingIds().has(id);
@@ -200,9 +200,9 @@ export function LiveProjectsSection(p: {
       : rows;
     const extraArchived = archivedMissions().filter(m => (m.project ?? "") === slug && !withCurrent.some(r => r.id === m.id));
     const allRows = [...withCurrent, ...extraArchived];
-    const byId = new Map(allRows.map(m => [m.id, m]));
-    const selectedId = p.selected()?.startsWith("m:") ? p.selected()!.slice(2) : undefined;
-    return missionTreeRows(allRows, m => !isArchived(m) && (m.id === selectedId || !isSupersededInTree(m, byId)));
+    // Workflow tags are not an archive action. In particular, restoring a
+    // superseded attempt must keep it visible after selection or polling changes.
+    return missionTreeRows(allRows, m => !isArchived(m));
   };
   const allKnownMissions = (): Mission[] => {
     const byId = new Map<string, Mission>();
@@ -1479,6 +1479,7 @@ export function LiveProjectsSection(p: {
             ...targets.map(t => ({ ...t, status })),
             ...(rows ?? []).filter(m => !targetIds.has(m.id)),
           ]);
+          p.onProjectMissions?.(slug, missions[slug] ?? []);
           setExpanded(slug, true);
           void loadDir(slug, "");
           const segments = missionFolder(mission).split("/").filter(Boolean);

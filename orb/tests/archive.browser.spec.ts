@@ -4,7 +4,7 @@ test('archive is immediate, preserves the project, and rolls back a failed reque
  await page.addInitScript(()=>{localStorage.setItem('orb.apiUrl',location.origin);localStorage.setItem('orb.jwt','test');});
  let projects=0,release!:()=>void;
  const hold=new Promise<void>(r=>release=r);
- const mission={id:'archive-test',title:'Archive this conversation',status:'awaiting_user',history:[],tags:[]};
+ const mission={id:'archive-test',title:'Archive this conversation',status:'awaiting_user',project:'test',history:[],tags:[]};
  await page.route('**/api/**',async route=>{
   const path=new URL(route.request().url()).pathname;
   if(path.endsWith('/archive-test/status')){await hold;return route.fulfill({status:500,body:'Archive failed'});}
@@ -27,7 +27,7 @@ test('one collapsed archive spans projects, while completion stays in place; res
  const missions=[
   {id:'completed',title:'Completed but not archived',status:'completed',project:'one',tags:[]},
   {id:'failed',title:'Failed but not archived',status:'failed',project:'one',tags:[]},
-  {id:'archived',title:'Archived nested conversation',status:'acknowledged',project:'two',tags:['orb-folder:notes/deep']},
+  {id:'archived',title:'Archived nested conversation',status:'acknowledged',project:'two',tags:['orb-folder:notes/deep','superseded']},
  ];
  const writes:any[]=[];
  await page.route('**/api/**',async route=>{
@@ -74,14 +74,23 @@ test('one collapsed archive spans projects, while completion stays in place; res
  await expect(projects.getByRole('button',{name:'Second project',exact:true})).toHaveAttribute('aria-expanded','true');
  await expect(page.getByRole('button',{name:'notes',exact:true})).toHaveAttribute('aria-expanded','true');
  await expect(page.getByRole('button',{name:'deep',exact:true})).toHaveAttribute('aria-expanded','true');
- expect(writes).toEqual([{path:'/api/control/missions/archived/status',body:{status:'paused'}}]);
- expect(missions[2].tags).toEqual(['orb-folder:notes/deep']);
+ expect(writes).toEqual([{path:'/api/control/missions/archived/title',body:{title:'Archived nested conversation'}},{path:'/api/control/missions/archived/status',body:{status:'paused'}}]);
+ expect(missions[2].tags).toEqual(['orb-folder:notes/deep','superseded']);
+ // Reload and reselect another chat: restored tagged attempts remain discoverable.
+ await page.reload();
+ await projects.getByRole('button',{name:'Second project',exact:true}).click();
+ const notes = projects.getByRole('button',{name:'notes',exact:true});
+ if(await notes.getAttribute('aria-expanded')!=='true')await notes.click();
+ const deep = projects.getByRole('button',{name:'deep',exact:true});
+ if(await deep.getAttribute('aria-expanded')!=='true')await deep.click();
+ await expect(restoredRow).toBeVisible();
  await page.screenshot({path:'/tmp/orb-shared-archives.png'});
  await restoredRow.click({button:'right'});await page.getByRole('menuitem',{name:'Delete agent…',exact:true}).click();
  await page.getByRole('dialog').getByRole('button',{name:'Delete',exact:true}).click();
  await expect(page.getByRole('dialog')).toHaveCount(0);
  await expect(restoredRow).toHaveCount(0);
  expect(writes).toEqual([
+  {path:'/api/control/missions/archived/title',body:{title:'Archived nested conversation'}},
   {path:'/api/control/missions/archived/status',body:{status:'paused'}},
   {path:'/api/control/missions/archived/status',body:{status:'acknowledged'}},
   {path:'/api/control/missions/archived',method:'DELETE'},
