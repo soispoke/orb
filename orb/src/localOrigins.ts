@@ -69,6 +69,7 @@ const HIDDEN_STATUSES=new Set(["acknowledged","completed","absorbed"]);
 export async function unlistedCoreState(local:Mission[],listed:Mission[],read:(id:string)=>Promise<Mission>):Promise<Mission[]>{
  const version=connectionVersion();
  if(unlistedVersion!==version){forgetUnlistedReads();unlistedVersion=version;}
+ const revision=unlistedRevision;
  const seen=new Set(listed.map(mission=>mission.id));
  // An affirmative list response supersedes an older cached archive observation.
  for(const mission of listed)unlistedReads.delete(mission.id);
@@ -78,13 +79,18 @@ export async function unlistedCoreState(local:Mission[],listed:Mission[],read:(i
   let value:Mission|undefined;
   try{const result=await read(mission.id);if(result?.id===mission.id&&typeof result.status==="string")value=result;}
   catch{/* Missing or unavailable Core data leaves the local copy recoverable. */}
-  if(version===connectionVersion())unlistedReads.set(mission.id,{at:Date.now(),mission:value});
+  if(version===connectionVersion()&&revision===unlistedRevision)unlistedReads.set(mission.id,{at:Date.now(),mission:value});
  }));
- if(version!==connectionVersion())return [];
+ if(version!==connectionVersion()||revision!==unlistedRevision)return [];
  return missing.flatMap(mission=>{const value=unlistedReads.get(mission.id)?.mission;return value?[value]:[];});
 }
 const UNLISTED_LIVE_MS=30_000,UNLISTED_SETTLED_MS=10*60_000;
 const LIVE_STATUSES=new Set(["active","running","pending","queued","starting","resuming"]);
 const unlistedReads=new Map<string,{at:number;mission?:Mission}>();
 let unlistedVersion=-1;
-export function forgetUnlistedReads(){unlistedReads.clear();}
+let unlistedRevision=0;
+/** A successful user mutation supersedes both cached and in-flight lookups. */
+export function forgetUnlistedReads(id?:string){
+ unlistedRevision++;
+ if(id)unlistedReads.delete(id);else unlistedReads.clear();
+}

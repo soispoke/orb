@@ -57,3 +57,15 @@ test("bounded lookups eventually cover more than twenty missing chats",async()=>
 test("invalid lookup identities do not replace the saved local chat",async()=>{
  expect(await unlistedCoreState([mission('one','interrupted')],[],async()=>mission('different','acknowledged'))).toEqual([]);
 });
+
+test("a lookup started before restore cannot repopulate the archive cache", async () => {
+ let resolve!:(m:Mission)=>void;
+ const rows=[mission('restored','interrupted')];
+ const stale=unlistedCoreState(rows,[],()=>new Promise(r=>resolve=r));
+ forgetUnlistedReads('restored');
+ resolve(mission('restored','acknowledged'));
+ expect(await stale).toEqual([]);
+ const read=vi.fn(async()=>mission('restored','paused'));
+ expect(await unlistedCoreState(rows,[],read)).toEqual([mission('restored','paused')]);
+ expect(read).toHaveBeenCalledOnce();
+});

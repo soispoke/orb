@@ -188,3 +188,17 @@ it.each([404,503])('keeps the local copy after a failed lookup (%s), then accept
  vi.stubGlobal('fetch',core([{...done,title:'Recovered on Core'}]));
  expect(await listMissions()).toMatchObject([{id:'done',title:'Recovered on Core'}]);
 });
+
+it('restoring invalidates a cached archive when Core omits the chat from its list',async()=>{
+ setConnection('http://restore-cache.test','token');journal([done]);
+ const {unlistedCoreState}=await import('../src/localOrigins');
+ await unlistedCoreState([done as any],[],async()=>({...done,status:'acknowledged'}) as any);
+ const state={...done,status:'acknowledged'};
+ vi.stubGlobal('fetch',vi.fn(async(input:any,init?:any)=>{
+  const url=String(input);
+  if(url.endsWith('/status'))state.status=JSON.parse(init.body).status;
+  return Response.json(init?.method==='POST'?{}:url.endsWith('/done')?state:[]);
+ }));
+ await reopenMission('done');
+ expect(await listMissions()).toMatchObject([{id:'done',status:'paused',title:done.title}]);
+});

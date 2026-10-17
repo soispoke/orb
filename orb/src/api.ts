@@ -1137,7 +1137,10 @@ export async function renameMission(id: string, title: string): Promise<void> {
 }
 /** Core accepted the change just now: any list requested earlier is older than this. */
 async function confirmCoreChange(change: { id: string; status?: string; title?: string }): Promise<void> {
-  await import("./localOrigins").then(m => m.confirmLocalOrigins([{ ...change, observed_at: m.observe() }]));
+  await import("./localOrigins").then(m => {
+    m.forgetUnlistedReads(change.id);
+    return m.confirmLocalOrigins([{ ...change, observed_at: m.observe() }]);
+  });
 }
 
 export async function cancelMission(id: string): Promise<void> {
