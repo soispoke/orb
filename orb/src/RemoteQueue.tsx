@@ -22,6 +22,7 @@ export function RemoteQueue(p: {
   onSendImmediate?: (ordered: {id: string; content: string; attached?: boolean}[], liveInjected?: {id: string; content: string; attached?: boolean}[]) => Promise<void>;
   onRows: (ids: string[]) => void;
   onCancel: (id: string) => void;
+  onRetract?: (id: string) => void;
   ref?: (handle: RemoteQueueHandle) => void;
 }) {
   let revision = 0, destroyed = false;
@@ -67,7 +68,7 @@ export function RemoteQueue(p: {
     untrack(() => { setRows([]); setError(""); p.onRows([]); });
     let disposed = false, loading = false;
     const refresh = async () => {
-      if (loading || !mission) return;
+      if (loading || !mission || untrack(working)) return;
       loading = true;
       const started = revision;
       // Only reconcile receipts that existed before this read. A new send may
@@ -130,39 +131,63 @@ export function RemoteQueue(p: {
     const list = visibleRows();
     const target = targetId ? list.find(r => r.id === targetId) : list[0];
     if (!target) return;
-    setWorking(true); setError(""); deliveryErrorId = target.id;
+    setWorking(true); setError(""); deliveryErrorId = target.id; revision++;
     const version = connectionVersion(), mission = p.mission;
+    // Optimistic: the message leaves the queue and shows in the thread right away (same id, so
+    // the later receipt dedupes); it returns to the queue only if Core refuses.
+    const injected = { id: target.id, content: messagePresentation(target.content).text, attached: target.attached || messagePresentation(target.content).attached || undefined };
+    const before = rows();
+    deletedIds.add(target.id);
+    setRows(previous => previous.filter(row => row.id !== target.id));
+    void p.onSendImmediate?.([], [injected]);
     try {
+      // A network error or timeout does not prove the message was not delivered:
+      // it must never fall through to delete-and-resend. Only an explicit
+      // `delivered: false` from Core means "no live injection, stop then send".
       const live = await api<{ ok?: boolean; delivered?: boolean }>(`/api/control/queue/${encodeURIComponent(target.id)}/send-now`, { method: "POST" });
+      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
       if (live?.delivered) {
-        if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
         revision++;
-        deletedIds.add(target.id);
-        setRows(previous => previous.filter(row => row.id !== target.id));
         p.onRows(rows().map(row => row.id));
         p.onCancel(target.id);
-        await p.onSendImmediate?.([], [{ id: target.id, content: messagePresentation(target.content).text, attached: target.attached || messagePresentation(target.content).attached || undefined }]);
         return;
       }
+      if (live?.delivered !== false) throw new Error("Delivery was not confirmed. Your message remains queued.");
+      // The fallback below shows its own copy while it stops the turn and sends.
+      p.onRetract?.(target.id);
+      const ordered = [target, ...list.filter(r => r.id !== target.id)];
+      const payload = ordered.map(r => {
+        const presented = messagePresentation(r.content);
+        return { id: r.id, content: presented.text, attached: r.attached || presented.attached || undefined };
+      });
+      await Promise.allSettled(ordered.map(r => api(`/api/control/queue/${encodeURIComponent(r.id)}`, { method: "DELETE" })));
       if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
-      setError("This run cannot accept a live message right now. Your message is still queued; it will be sent when the run is ready.");
+      revision++;
+      for (const r of ordered) deletedIds.add(r.id);
+      setRows([]); p.onRows([]);
+      for (const r of ordered) p.onCancel(r.id);
+      await p.onSendImmediate?.(payload);
     } catch (e) {
-      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
-      const message = e instanceof Error ? e.message : String(e);
-      if (/^404\b/.test(message)) {
-        // The consumer won the race. Absence does not prove delivery, and must
-        // never trigger a second send with a fresh identity.
-        revision++; deletedIds.add(target.id);
-        setRows(previous => previous.filter(row => row.id !== target.id));
-        p.onRows(rows().map(row => row.id)); p.onCancel(target.id);
-        setError('');
-      } else if (deletedIds.has(target.id)) {
-        deliveryErrorId = undefined; setError('');
-      } else setError(/abort|timed? ?out/i.test(message)
-        ? "Delivery wasn’t confirmed. Checking the queue; this message won’t be resent automatically."
-        : message);
+      if (!destroyed && version === connectionVersion() && mission === p.mission) {
+        // Refused or unconfirmed: put the queue back as it was, same id, so nothing
+        // looks sent that was not. The next queue read reconciles a late delivery.
+        p.onRetract?.(target.id);
+        const message = e instanceof Error ? e.message : String(e);
+        if (/^404\b/.test(message)) {
+          revision++; deletedIds.add(target.id);
+          setRows(previous => previous.filter(row => row.id !== target.id));
+          p.onRows(rows().map(row => row.id)); p.onCancel(target.id);
+          deliveryErrorId = undefined; setError("");
+        } else {
+          deletedIds.delete(target.id);
+          setRows(before);
+          setError(/abort|timed? ?out/i.test(message)
+            ? "Delivery wasn’t confirmed. Checking the queue; this message won’t be resent automatically."
+            : message);
+        }
+      }
     } finally {
-      setWorking(false);
+      revision++; setWorking(false);
     }
   };
   const replaceEdited: RemoteQueueHandle["replaceEdited"] = async (id, sendReplaced, replayAfter) => {

@@ -238,3 +238,30 @@ it('opens at the latest message despite initial layout scroll events, then respe
  await new Promise(resolve=>setTimeout(resolve,40));
  expect(scroller.scrollTo).not.toHaveBeenCalled();
 });
+
+it('stops and sends on an explicit refusal, reusing the same id across stopping retries',async()=>{
+ const {getMission,sendMissionMessage}=await import('../src/api');
+ vi.mocked(sendMissionMessage).mockReset();
+ let stopped=false;
+ const requests:{url:string;method:string}[]=[];
+ vi.mocked(getMission).mockImplementation(async()=>({id:'stop-send',status:stopped?'interrupted':'active',history:[],created_at:'',updated_at:''}));
+ vi.mocked(sendMissionMessage).mockRejectedValueOnce(new Error('409 still stopping')).mockImplementationOnce(async(_id,_text,_attachments,id)=>({id:id!,queued:true}));
+ vi.stubGlobal('fetch',vi.fn(async(url,options)=>{
+  const u=String(url),method=options?.method??'GET';requests.push({url:u,method});
+  if(u.endsWith('/send-now'))return Response.json({ok:true,delivered:false});
+  if(u.endsWith('/cancel')){stopped=true;return Response.json({ok:true});}
+  if(method==='DELETE')return Response.json({ok:true});
+  if(u.includes('/queue?'))return Response.json([{id:'queued-id',mission_id:'stop-send',content:'Interrupt and continue',source:'remote-queue'}]);
+  return Response.json([],{headers:{'X-Orb-Events-Protocol':'1','X-Has-More':'false','X-Max-Sequence':'0'}});
+ }));
+ render(()=><NativeMissionView id="stop-send" initial={{id:'stop-send',status:'active',history:[],created_at:'',updated_at:''}}/>);
+ const {fireEvent}=await import('@solidjs/testing-library');
+ await fireEvent.click(await screen.findByRole('button',{name:'Send now: Interrupt and continue'}));
+ await waitFor(()=>expect(sendMissionMessage).toHaveBeenCalledTimes(2));
+ expect(stopped).toBe(true);
+ const calls=vi.mocked(sendMissionMessage).mock.calls;
+ expect(calls[0][0]).toBe('stop-send');
+ expect(calls[0][3]).toBeTruthy();
+ expect(calls[1][3]).toBe(calls[0][3]);
+ expect(requests.filter(r=>r.method==='DELETE')).toHaveLength(1);
+});
