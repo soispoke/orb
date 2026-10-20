@@ -1,12 +1,17 @@
 /* State badges share the identity icon slot, just like folder activity. */
+/* Badges are cut out of the icon so they read on any row or sidebar background. */
+.mission-glyph:has(> .mission-status-mark) > svg { --cut: radial-gradient(circle at calc(100% - 1px) calc(100% - 2px), transparent 6px, #000 6.5px); }
+.mission-glyph:has(> .mission-unread-dot) > svg { --cut: radial-gradient(circle at 100% calc(100% - 1px), transparent 4.5px, #000 5px); }
+.folder-activity-icon:has(> .folder-activity-mark) > svg { --cut: radial-gradient(circle at calc(100% - 2px) calc(100% - 3px), transparent 6px, #000 6.5px); }
+:is(.mission-glyph, .folder-activity-icon) > svg { -webkit-mask-image: var(--cut, none); mask-image: var(--cut, none); }
 .row .row-ico.mission-lead { width: 18px; height: 18px; overflow: visible; }
 .mission-glyph { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 18px; width: 18px; flex: none; color: var(--fg-3); }
-.mission-status-mark { position: absolute; right: -4px; bottom: -3px; display: inline-flex; align-items: center; justify-content: center; width: 12px; height: 12px; border-radius: 50%; background: var(--bg, #141414); }
+.mission-status-mark { position: absolute; right: -4px; bottom: -3px; display: inline-flex; align-items: center; justify-content: center; width: 12px; height: 12px; border-radius: 50%; }
 .mission-status-mark svg { display: block; }
 .mission-glyph.running .mission-status-mark { color: var(--blue); }
 .mission-glyph.success .mission-status-mark { color: var(--green); }
 .mission-glyph.attention .mission-status-mark { color: var(--amber); }
-.mission-unread-dot { position: absolute; right: -2px; bottom: -1px; width: 6px; height: 6px; border-radius: 50%; background: var(--blue); box-shadow: 0 0 0 1.5px var(--bg, #141414); pointer-events: none; }
+.mission-unread-dot { position: absolute; right: -2px; bottom: -1px; width: 6px; height: 6px; border-radius: 50%; background: var(--blue); pointer-events: none; }
 .mission-status-spin { animation: mission-status-spin 1.4s linear infinite; }
 @keyframes mission-status-spin { to { transform: rotate(360deg); } }
 .row.done-toggle .history-chevron { width: 12px; height: 12px; flex: none; color: var(--fg-3); }
@@ -14,7 +19,7 @@
 @media (prefers-reduced-motion: reduce) { .mission-status-spin { animation: none; } }
 
 .folder-activity-icon { position: relative; overflow: visible; }
-.folder-activity-mark { position: absolute; right: -4px; bottom: -3px; display: flex; align-items: center; justify-content: center; width: 12px; height: 12px; border-radius: 50%; background: var(--bg, #141414); color: var(--blue); }
+.folder-activity-mark { position: absolute; right: -4px; bottom: -3px; display: flex; align-items: center; justify-content: center; width: 12px; height: 12px; border-radius: 50%; color: var(--blue); }
 .folder-activity-mark svg { display: block; }
 
 /* Animate only newly mounted rows, never height/layout or every poll. */

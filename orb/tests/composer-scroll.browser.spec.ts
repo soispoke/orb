@@ -165,7 +165,7 @@ for (const turns of [6, 60]) test(`steering in a ${turns}-turn session reveals t
   await expect(page.locator(".composer textarea")).toHaveValue("");
   await expect(page.locator(".user").last()).toHaveText("Please also check the final estimate");
   await expect.poll(() => scroll.evaluate(el => el.scrollHeight-el.scrollTop-el.clientHeight)).toBeLessThan(2);
-  await expect(page.getByText("Sent to the running session. Work continues.",{exact:true})).toBeVisible();
+  await expect(page.getByText("Sent to the running session. The agent reads it after its current step; work continues.",{exact:true})).toBeVisible();
   await expect(page.getByRole("region",{name:"Queued messages"})).toHaveCount(0);
   await expect.poll(() => scroll.evaluate(el => el.scrollHeight-el.scrollTop-el.clientHeight)).toBeLessThan(2);
 });
@@ -500,7 +500,7 @@ for(const delivered of [true,false]) test(`a long submitted draft stays above th
  const draft='Please explain the measurement and preserve the ongoing worker. '.repeat(12);
  const input=page.locator('.composer textarea');await input.fill(draft);
  await page.waitForTimeout(100);await input.press('Enter');
- await expect(page.getByText(delivered?'Sent to the running session. Work continues.':'Queued for the next turn. Work continues.',{exact:true})).toBeVisible();
+ await expect(page.getByText(delivered?'Sent to the running session. The agent reads it after its current step; work continues.':'Queued for the next turn. Work continues.',{exact:true})).toBeVisible();
  if(delivered){
   const bubble=page.locator('.scroll .user').last();await expect(bubble).toHaveText(draft.trim());
   await expect.poll(async()=>{

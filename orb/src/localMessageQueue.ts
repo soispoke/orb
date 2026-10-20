@@ -50,6 +50,7 @@ export function cutByConnection(result:Pick<PollLocal,'text'|'error'|'retryable'
 }
 /** Orb continues a cut turn by itself this many times; after that it waits for the user. */
 const RESUME_LIMIT=3;
+const SETTLED_ERROR_CHECK_MS=60_000;
 const CONNECTION_BACKOFF_MS=[1_000,5_000,15_000,30_000];
 export function connectionRetryDelayMs(resumes:number){
  return CONNECTION_BACKOFF_MS[Math.min(Math.max(resumes-1,0),CONNECTION_BACKOFF_MS.length-1)];
@@ -310,6 +311,7 @@ export function startLocalQueueWorker(){
  // A missing Core record is not permission to discard input or restart a
  // local agent. Retain the queue and back off just this mission's observation.
  const missingMissions = new Map<string, {attempts:number; retryAt:number}>();
+ const settledChecks = new Map<string, number>();
  let retryTimer:ReturnType<typeof setTimeout>|undefined,retryWakeAt=Infinity;
  const clearRetryTimer=()=>{if(retryTimer!==undefined){clearTimeout(retryTimer);retryTimer=undefined;retryWakeAt=Infinity;}};
  batch(()=>{setEntries([]);setAccepted([]);});
@@ -414,10 +416,15 @@ export function startLocalQueueWorker(){
     // Paused means no automatic dispatch or recovery, including after UI restart.
     // Keep every durable row intact until a user sends or explicitly resumes.
     if ((missingMissions.get(row.mission)?.retryAt ?? 0) > Date.now()) continue;
+    // A failed row waits for the user; only a lost connection needs prompt checks.
+    const settledError=row.state==='error'&&!unreachable(row.error)&&!rows.some(r=>r.mission===row.mission&&r.state==='queued');
+    if(settledError&&Date.now()-(settledChecks.get(row.mission)??0)<SETTLED_ERROR_CHECK_MS)continue;
+    if(settledError)settledChecks.set(row.mission,Date.now());else settledChecks.delete(row.mission);
     const observed=await getMission(row.mission).catch(error=>{
      if (error instanceof Error && 'status' in error && error.status === 404) {
       const attempts = (missingMissions.get(row.mission)?.attempts ?? 0) + 1;
-      missingMissions.set(row.mission, {attempts, retryAt:Date.now()+Math.min(60_000, 5_000 * 2 ** Math.min(attempts-1,4))});
+      // A deleted conversation keeps its rows, but stops being polled every minute.
+      missingMissions.set(row.mission, {attempts, retryAt:Date.now()+Math.min(30*60_000, 5_000 * 2 ** Math.min(attempts-1,9))});
      }
      return undefined;
     });
@@ -582,7 +589,7 @@ export function startLocalQueueWorker(){
   finally{busy=false;if(again&&valid()){again=false;queueMicrotask(()=>void tick());}}
  };
  const onWake=()=>void tick();window.addEventListener(wakeEvent,onWake);void tick();// A queued row waits on a turn this window may not be following: look again on its own.
- const timer=setInterval(()=>{if(entries().some(row=>row.state==='queued'||row.state==='dispatching'||!!row.error||!!row.interrupted))onWake();},3000);const onOnline=()=>{missingMissions.clear();onWake();};window.addEventListener('online',onOnline);
+ const timer=setInterval(()=>{if(entries().some(row=>row.state==='queued'||row.state==='dispatching'||!!row.error||!!row.interrupted))onWake();},3000);const onOnline=()=>{missingMissions.clear();settledChecks.clear();onWake();};window.addEventListener('online',onOnline);
  return ()=>{stopped=true;clearRetryTimer();clearInterval(timer);window.removeEventListener(wakeEvent,onWake);window.removeEventListener('online',onOnline);};
 }
 

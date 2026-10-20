@@ -191,15 +191,25 @@ const loadPick = (): HarnessPick | null => {
 const [remoteHarnessChoices, setRemoteHarnessChoices] = createSignal<HarnessChoice[]>([]);
 const [nodeAntigravityModels, setNodeAntigravityModels] = createSignal<Record<string, [string,string][]>>({});
 const nodeModelRequests = new Set<string>();
-async function refreshNodeAntigravityModels(machine: string) {
+// Composers mount constantly; without this, a machine that is not signed in to
+// Antigravity was asked for its models every few seconds. Opening a menu forces.
+const nodeModelChecked = new Map<string, {at: number; ok: boolean}>();
+const NODE_MODELS_FRESH_MS = 10 * 60_000, NODE_MODELS_RETRY_MS = 5 * 60_000;
+async function refreshNodeAntigravityModels(machine: string, force = false) {
   if (machine === "local") return;
   const version = connectionVersion(), key = `${version}:${machine}`;
   if (nodeModelRequests.has(key)) return;
+  const checked = nodeModelChecked.get(key);
+  if (!force && checked && Date.now() - checked.at < (checked.ok ? NODE_MODELS_FRESH_MS : NODE_MODELS_RETRY_MS)) return;
   nodeModelRequests.add(key);
   try {
     const models = await listNodeAntigravityModels(machine);
+    nodeModelChecked.set(key, {at: Date.now(), ok: true});
     if (version === connectionVersion()) setNodeAntigravityModels(old => ({...old, [key]:models}));
-  } catch { if (version === connectionVersion()) setNodeAntigravityModels(old => ({...old, [key]:[]})); }
+  } catch {
+    nodeModelChecked.set(key, {at: Date.now(), ok: false});
+    if (version === connectionVersion()) setNodeAntigravityModels(old => ({...old, [key]:[]}));
+  }
   finally { nodeModelRequests.delete(key); }
 }
 const harnessChoices = (machine = "core"): HarnessChoice[] => {
@@ -1027,7 +1037,7 @@ export function Composer(p: {
               setWhich(opening ? "harness" : null);
               // Discover newly installed CLIs without recreating the composer.
               if (opening && p.harnessIds) void refreshLocalAgents(false);
-              if (opening && p.uploadTarget) void refreshNodeAntigravityModels(p.uploadTarget);
+              if (opening && p.uploadTarget) void refreshNodeAntigravityModels(p.uploadTarget, true);
             }}>
               {choice()?.backend.name ?? "Harness"} <Ic.ChevronDown size={12} />
             </button>
@@ -2115,7 +2125,7 @@ export default function App() {
                     currentMission={openMission()?.id === currentMissionId() ? openMission() ?? undefined : undefined}
                     harnessChoices={harnessChoices()}
                     forkChoices={mission => harnessChoices(mission.remote_node_id ?? "core")}
-                    onForkOpen={mission => void refreshNodeAntigravityModels(mission.remote_node_id ?? "core")}
+                    onForkOpen={mission => void refreshNodeAntigravityModels(mission.remote_node_id ?? "core", true)}
                     onFork={m => { setMissions(ms => [m, ...ms.filter(x => x.id !== m.id)]); bumpProjects(); open(`m:${m.id}`); }}
                     selected={selected}
                     onDeleted={ids => {
@@ -2744,12 +2754,12 @@ function MissionDock(p: {
           <Show when={p.destination === "Core"} fallback={<Show when={p.destination === "This computer"} fallback={<Ic.CloudIcon />}><Ic.LaptopIcon size={13}/></Show>}><Ic.CoreServerIcon size={13}/></Show>
           {p.destination} <Ic.ChevronDown size={10} />
         </button>
-        <Show when={machineOpen() && p.mission}>{m => <ChangeMachine mission={m()} choices={harnessChoices()} choicesFor={machine => harnessChoices(machine.kind === "client" ? "local" : machine.kind === "node" ? machine.id : "core")} onDestination={machine => { if (machine.kind === "client") void refreshLocalAgents(false); else void refreshNodeAntigravityModels(machine.kind === "node" ? machine.id : "core"); }} onClose={() => setMachineOpen(false)} onMoved={mission => p.onMission?.(mission)} />}</Show>
+        <Show when={machineOpen() && p.mission}>{m => <ChangeMachine mission={m()} choices={harnessChoices()} choicesFor={machine => harnessChoices(machine.kind === "client" ? "local" : machine.kind === "node" ? machine.id : "core")} onDestination={machine => { if (machine.kind === "client") void refreshLocalAgents(false); else void refreshNodeAntigravityModels(machine.kind === "node" ? machine.id : "core", true); }} onClose={() => setMachineOpen(false)} onMoved={mission => p.onMission?.(mission)} />}</Show>
       </div>
       <Show when={harnessName()}>
         <span class="under-sep" aria-hidden="true">·</span>
         <div class="fork-anchor"><button class="under-harness fork-trigger" title="Fork with another harness or model" aria-label="Fork conversation" onClick={() => setForkOpen(true)}>{harnessName()} <Ic.ChevronDown size={10} /></button>
-        <Show when={forkOpen() && p.mission}>{m => <ForkMission mission={m()} choices={harnessChoices(catalogMachine())} onOpen={() => { if (catalogMachine() === "local") void refreshLocalAgents(false); else void refreshNodeAntigravityModels(catalogMachine()); }} destination={p.destination} onClose={() => setForkOpen(false)} onFork={forked => { setForkOpen(false); p.onFork?.(forked); }} />}</Show></div>
+        <Show when={forkOpen() && p.mission}>{m => <ForkMission mission={m()} choices={harnessChoices(catalogMachine())} onOpen={() => { if (catalogMachine() === "local") void refreshLocalAgents(false); else void refreshNodeAntigravityModels(catalogMachine(), true); }} destination={p.destination} onClose={() => setForkOpen(false)} onFork={forked => { setForkOpen(false); p.onFork?.(forked); }} />}</Show></div>
         <span class="under-sep" aria-hidden="true">·</span>
         <div class="under-model-wrap">
           <Show
@@ -2926,7 +2936,13 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   let remoteQueue: RemoteQueueHandle | undefined;
   const [liveDelivery, setLiveDelivery] = createLiveDeliveryNotice(id =>
     items().some(item => item.kind === 'user' && item.messageId === id && !item.queued && !item.receipt)
-    || acceptedLocalMessages(p.id).some(row => row.id === id));
+    || acceptedLocalMessages(p.id).some(row => row.id === id),
+    // Keep the receipt until the agent writes back after the message, or the turn ends.
+    id => {
+      if (!busy()) return true;
+      const list = items(), at = list.findIndex(item => item.kind === 'user' && item.messageId === id);
+      return at >= 0 && list.slice(at + 1).some(item => item.kind === 'text' && !!item.text.trim());
+    });
   const deliverMidrun = createMidrunDelivery(() => !staleMission());
   const deliverFollowup = (id: string, content: string, attached: boolean) => {
     const version = connectionVersion();

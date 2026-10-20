@@ -37,7 +37,7 @@ for (const delivered of [true,false]) for (const message of ["Check the next lay
   await expect(page.getByRole('region',{name:'Queued messages'})).toHaveCount(0);
   steer();
   if(delivered){
-   await expect(page.getByText('Sent to the running session. Work continues.',{exact:true})).toBeVisible();
+   await expect(page.getByText('Sent to the running session. The agent reads it after its current step; work continues.',{exact:true})).toBeVisible();
    await expect(page.locator('.user')).toHaveCount(1);
   }else{
    await expect(page.getByRole('region',{name:'Queued messages'})).toContainText(message);

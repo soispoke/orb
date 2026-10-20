@@ -19,7 +19,14 @@ export function cyberError(error:unknown):string {
  if(text.includes('cyberPolicy')||text.includes('cyber_policy'))return 'OpenAI rejected this request under its cyber policy. This can also happen with Daybreak enabled. '+text;
  return text;
 }
-export const getCyber=async(id:string)=>{await requireCyberSupport();return api<CyberSelection>(`/api/control/missions/${id}/cyber`,{cache:"no-store"});};
+// Backend support is fixed per connection; only a successful check is remembered.
+let supportCheck:{version:number;check:Promise<void>}|undefined;
+const requireCyberBackend=()=>{
+ const version=connectionVersion();
+ if(supportCheck?.version!==version){const check=requireCyberSupport();supportCheck={version,check};check.catch(()=>{if(supportCheck?.check===check)supportCheck=undefined;});}
+ return supportCheck.check;
+};
+export const getCyber=async(id:string)=>{await requireCyberBackend();return api<CyberSelection>(`/api/control/missions/${id}/cyber`,{cache:"no-store"});};
 export const saveCyber=(id:string,mode:CyberMode)=>api<CyberSelection>(`/api/control/missions/${id}/cyber`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
 export function CyberPicker(p:{value:CyberMode;model:string;disabled?:boolean;remote?:boolean;note?:string;confirmed?:boolean;onChange:(mode:CyberMode)=>void}) {
  const [open,setOpen]=createSignal(false);let root:HTMLDivElement|undefined;

@@ -3,6 +3,13 @@ use std::collections::HashMap;
 
 pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read and address it at the next tool boundary. Answer direct questions in this chat before continuing unrelated edits or waits. Automatic reminders and worker notices do not take precedence over an unanswered user question. A status question does not cancel the ongoing objective: answer briefly, then continue authorized work. Preserve existing agents and builds. For long jobs, use the native background-task mechanism and completion notifications; do not block the conversation with foreground sleep/poll loops waiting on a background job. Do not restart, duplicate, or stop a job merely to answer a question.";
 
+/// A message typed while Claude works arrives between tool calls. A terse
+/// "eta" or "status" there reads as background unless it is marked as a
+/// question awaiting an answer; the session instructions alone are not enough.
+pub fn midturn_text(text: &str) -> String {
+    format!("{text}\n\n<system-reminder>The user sent this while you were working. Reply to it in your next message (briefly for a status or ETA question), then continue the task.</system-reminder>")
+}
+
 /// An assistant event is not a receipt for queued user input. Only that input's
 /// replayed UUID followed by a result retires its record. This tracks transport
 /// acknowledgement, not whether the model's answer addressed the question.
@@ -34,6 +41,13 @@ impl PendingInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn midturn_messages_keep_the_user_text_and_ask_for_a_reply() {
+        let text = midturn_text("eta");
+        assert!(text.starts_with("eta\n\n<system-reminder>"));
+        assert!(text.contains("Reply to it in your next message"));
+    }
 
     #[test]
     fn earlier_results_and_unrelated_receipts_do_not_drop_followups() {

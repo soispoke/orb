@@ -713,3 +713,26 @@ it('backs off missing missions without discarding input or blocking other chats'
  window.dispatchEvent(new Event('online'));await vi.advanceTimersByTimeAsync(1);
  expect(reads('mission')).toBeGreaterThan(before);
 });
+
+it('checks a failed message that waits for the user at most once a minute, and retry stays immediate',async()=>{
+ mocks.active=false;mocks.append.mockRejectedValue(new Error('409 Local execution already ended or moved'));
+ stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first');await vi.advanceTimersByTimeAsync(2500);
+ const row=queuedLocalMessages('mission')[0];
+ expect(row).toMatchObject({state:'error',interrupted:true});
+ mocks.missionRead.mockClear();
+ await vi.advanceTimersByTimeAsync(60_000);
+ expect(mocks.missionRead.mock.calls.filter(call=>call[0]==='mission').length).toBeLessThanOrEqual(2);
+ mocks.append.mockResolvedValue(undefined);
+ await retryQueuedMessage(row.id);await vi.advanceTimersByTimeAsync(100);
+ expect(mocks.launch).toHaveBeenCalledTimes(2);
+});
+
+it('keeps lengthening the wait for a deleted conversation past one minute',async()=>{
+ await enqueueLocalMessage(request,'saved missing mission input');
+ mocks.missing=true;mocks.missionRead.mockClear();
+ stop=startLocalQueueWorker();
+ await vi.advanceTimersByTimeAsync(30*60_000);
+ // 5s doubling to a 30-minute cap: far fewer than the 30 reads a one-minute cap allowed.
+ expect(mocks.missionRead.mock.calls.filter(call=>call[0]==='mission').length).toBeLessThanOrEqual(10);
+ expect(queuedLocalMessages('mission')[0]).toMatchObject({text:'saved missing mission input',state:'queued'});
+});

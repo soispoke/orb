@@ -5,7 +5,8 @@ import {getApiUrl,getJwt,connectionVersion} from './api';
 import {nativeInvoke} from './clientRuns';
 
 type SyncState={initialized:boolean;pending:unknown[];error?:string|null};
-export function ContextBadge(p:{slug:string}){
+/** `compact` shows only the status dot, for rows that must keep their own label visible. */
+export function ContextBadge(p:{slug:string;compact?:boolean}){
  const[state,setState]=createSignal<SyncState>();
  const[conflicts,setConflicts]=createSignal<string[]>([]);
  const[expanded,setExpanded]=createSignal(false),[retrying,setRetrying]=createSignal(false);
@@ -50,9 +51,9 @@ export function ContextBadge(p:{slug:string}){
   document.addEventListener('visibilitychange',visibility);
   onCleanup(()=>{disposed=true;stop();window.removeEventListener('online',wake);window.removeEventListener('focus',wake);document.removeEventListener('visibilitychange',visibility);});
  });
- return <Show when={label()}><div class="context-sync-state" data-state={conflicts().length||error()?'warning':'syncing'} >
-  <button class="context-sync-trigger" aria-expanded={expanded()} aria-controls={id} onClick={event=>{event.stopPropagation();setExpanded(!expanded());}}>
-   <span class="context-sync-dot" aria-hidden="true"/><span>{label()}</span>
+ return <Show when={label()}><div class="context-sync-state" data-state={conflicts().length||error()?'warning':'syncing'} data-compact={p.compact?'':undefined}>
+  <button class="context-sync-trigger" aria-expanded={expanded()} aria-controls={id} aria-label={p.compact?label():undefined} title={p.compact?label():undefined} onClick={event=>{event.stopPropagation();setExpanded(!expanded());}}>
+   <span class="context-sync-dot" aria-hidden="true"/><Show when={!p.compact}><span>{label()}</span></Show>
   </button>
   <Show when={expanded()}><Popover id={id} class="context-sync-detail" label="Context synchronization" onClose={() => setExpanded(false)}>
    <strong>{conflicts().length?'Changes need review':authError()?'Reconnect to sync context':error()?'Sync interrupted':'Synchronizing context'}</strong>

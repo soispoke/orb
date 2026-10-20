@@ -232,11 +232,18 @@
   .inbox-row-actions { align-self: flex-end; max-width: 100%; }
   .inbox-sec-note { max-width: 50%; text-align: right; }
 }
+@media (max-width: 520px) {
+  /* Project and status share the first line; the title gets the full width. */
+  .inbox-row-title-btn { row-gap: 2px; }
+  .inbox-project-pill { max-width: 70%; }
+  .inbox-row-title-btn > .inbox-sep { display: none; }
+  .inbox-row-title-btn > .inbox-badge { order: 1; }
+  .inbox-row-title-btn > .inbox-headline { order: 2; flex-basis: 100%; }
+}
 @media (max-width: 420px) {
   .inbox-mode-tabs { justify-content: space-between; gap: 8px; }
   .inbox-mode-tab { font-size: 12px; gap: 4px; }
   .inbox-head-right { gap: 2px; }
-  .inbox-project-pill { max-width: 88px; }
   .inbox-row { padding: 10px; }
 }
 

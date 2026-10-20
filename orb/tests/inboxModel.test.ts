@@ -6,6 +6,7 @@ import {
   clipToSentence,
   extractInboxInteraction,
   formatRelativeTime,
+  stripMarkdownToProse,
 } from "../src/inboxModel";
 import type { StreamItem } from "../src/transcriptModel";
 
@@ -42,6 +43,18 @@ describe("clipToSentence", () => {
     const clipped = clipToSentence(raw, 80);
     expect(clipped.endsWith("…")).toBe(true);
     expect(clipped.length).toBeLessThanOrEqual(80);
+  });
+});
+
+describe("stripMarkdownToProse", () => {
+  it("reads tables as rows of cells instead of pipe syntax", () => {
+    expect(stripMarkdownToProse("Results:\n\n| Check | Result |\n| --- | --- |\n| Unit | 1,328 passed |\n| Browser | 312 passed |\n\nDone."))
+      .toBe("Results: Unit: 1,328 passed; Browser: 312 passed; Done.");
+    expect(stripMarkdownToProse("| A | B | C |\n|:--|--:|:-:|\n| 1 | 2 | 3 |")).toBe("1: 2: 3");
+  });
+
+  it("leaves pipes in ordinary prose alone", () => {
+    expect(stripMarkdownToProse("Use a || b, or x | y here.")).toBe("Use a || b, or x | y here.");
   });
 });
 

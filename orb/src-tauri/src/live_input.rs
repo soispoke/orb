@@ -194,7 +194,7 @@ impl ClaudeInput {
             }
             s.pending.insert(id);
             // A write error can be partial: keep the pending record and never replay it.
-            writer.line(json!({"type":"user","uuid":id,"message":{"role":"user","content":text}}))
+            writer.line(json!({"type":"user","uuid":id,"message":{"role":"user","content":claude_followup::midturn_text(&text)}}))
         })
     }
     pub fn consume(&self, event: &Value) {

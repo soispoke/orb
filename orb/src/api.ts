@@ -812,7 +812,12 @@ export function isBtwMission(mission: Pick<Mission, "tags">): boolean {
 }
 
 /** Missions tagged with this project (exact slug match on the backend). */
-export async function listProjectMissions(slug: string): Promise<Mission[]> {
+export function listProjectMissions(slug: string): Promise<Mission[]> {
+  // Opening conversations triggers several list refreshes at once; share one.
+  // Stores patch the objects they hold, so each caller gets its own copy.
+  return sharedRead(`${connectionVersion()}:${getApiUrl()}:project-missions:${slug}`, () => readProjectMissions(slug)).then(rows => structuredClone(rows));
+}
+async function readProjectMissions(slug: string): Promise<Mission[]> {
   const origins=await import("./localOrigins"),observedAt=origins.observe();
   const local=(await origins.localOrigins()).filter(m=>m.project===slug && !isBtwMission(m));
   try {
@@ -863,7 +868,10 @@ export async function deleteProjectFile(slug: string, path: string): Promise<voi
   });
 }
 
-export async function listMissions(limit = 200): Promise<Mission[]> {
+export function listMissions(limit = 200): Promise<Mission[]> {
+  return sharedRead(`${connectionVersion()}:${getApiUrl()}:missions:${limit}`, () => readMissions(limit)).then(rows => structuredClone(rows));
+}
+async function readMissions(limit: number): Promise<Mission[]> {
   const origins = await import("./localOrigins"), observedAt = origins.observe();
   const local = (await origins.localOrigins()).filter(m=>!isBtwMission(m));
   try {

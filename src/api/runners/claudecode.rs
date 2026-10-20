@@ -2175,10 +2175,12 @@ pub fn run_claudecode_turn<'a>(
                 Some(content) = async { midturn_messages.as_mut().expect("guarded by is_some").recv().await }, if midturn_messages.is_some() => {
                     let input_id = Uuid::new_v4().to_string();
                     pending_inputs.insert(&input_id);
+                    // Before the prompt is written the message joins the first turn as is.
+                    let text = if pending_initial_prompt.is_some() { content.clone() } else { claude_followup::midturn_text(&content) };
                     let frame = serde_json::json!({
                         "type": "user",
                         "uuid": input_id,
-                        "message": { "role": "user", "content": [{ "type": "text", "text": content }] }
+                        "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
                     });
                     let delivered = if let Some(prompt) = pending_initial_prompt.as_mut() {
                         *prompt = format!("{prompt}{frame}\n");

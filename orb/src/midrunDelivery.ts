@@ -5,7 +5,7 @@ import { LiveInputUnavailable } from "./liveInputAvailability";
 export type LiveDelivery = "sending" | "accepted" | "queued" | "unavailable" | "unconfirmed";
 export const liveDeliveryLabel = (state: LiveDelivery) => ({
   sending: "Sending to the running session… Work continues.",
-  accepted: "Sent to the running session. Work continues.",
+  accepted: "Sent to the running session. The agent reads it after its current step; work continues.",
   queued: "Queued for the next turn. Work continues.",
   unavailable: new LiveInputUnavailable().message,
   unconfirmed: "Message saved; live delivery is unconfirmed. It won’t be resent automatically.",
@@ -42,9 +42,9 @@ export function createMidrunDelivery(valid: () => boolean) {
 }
 
 
-/** Delivery is a brief receipt, not an indefinite claim that the model has yet
- * to answer. Pending/uncertain messages remain visible until resolved. */
-export function createLiveDeliveryNotice(isDelivered: (id: string) => boolean = () => false){
+/** Pending/uncertain messages remain visible until resolved. An accepted receipt
+ * stays until `isSettled` (the agent answered or the turn ended), else briefly. */
+export function createLiveDeliveryNotice(isDelivered: (id: string) => boolean = () => false, isSettled?: (id: string) => boolean){
   const [notice,setNotice]=createSignal<{id:string;state:LiveDelivery}>();
   createEffect(()=>{
     const current=notice();
@@ -56,6 +56,7 @@ export function createLiveDeliveryNotice(isDelivered: (id: string) => boolean = 
       return;
     }
     if(current?.state!=="accepted")return;
+    if(isSettled){if(isSettled(current.id))setNotice(undefined);return;}
     const timer=setTimeout(()=>setNotice(previous=>previous===current?undefined:previous),6000);
     onCleanup(()=>clearTimeout(timer));
   });

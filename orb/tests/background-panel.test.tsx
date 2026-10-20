@@ -1,9 +1,10 @@
-import {render, fireEvent, screen, cleanup} from '@solidjs/testing-library';
+import {render, fireEvent, screen, cleanup, waitFor} from '@solidjs/testing-library';
+import {createSignal, Show} from 'solid-js';
 import {afterEach, expect, it} from 'vitest';
 import {BackgroundPanel} from '../src/BackgroundPanel';
 afterEach(() => {cleanup();localStorage.clear();});
 it('keeps the panel closed across chat remounts and returns focus to its toggle', () => {
-  const view = () => <BackgroundPanel tasks={<div>Task details</div>}><div>Conversation</div></BackgroundPanel>;
+  const view = () => <BackgroundPanel tasks={<section class="subagents">Task details</section>}><div>Conversation</div></BackgroundPanel>;
   render(view);
   const close = screen.getByRole('button',{name:'Close background tasks'});
   close.focus(); fireEvent.click(close);
@@ -13,4 +14,18 @@ it('keeps the panel closed across chat remounts and returns focus to its toggle'
   expect(screen.getByRole('button',{name:'Background tasks'}).getAttribute('aria-expanded')).toBe('false');
   fireEvent.click(screen.getByRole('button',{name:'Background tasks'}));
   expect(screen.getByRole('complementary').hidden).toBe(false);
+});
+it('stays out of the way while empty until it is asked for', async () => {
+  const [tasks, setTasks] = createSignal(false);
+  render(() => <BackgroundPanel tasks={<Show when={tasks()}><section class="subagents">Task details</section></Show>}><div>Conversation</div></BackgroundPanel>);
+  const toggle = screen.getByRole('button',{name:'Background tasks'});
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  expect(screen.queryByRole('complementary')).toBeNull();
+  setTasks(true);
+  await waitFor(() => expect(toggle.getAttribute('aria-expanded')).toBe('true'));
+  setTasks(false);
+  await waitFor(() => expect(toggle.getAttribute('aria-expanded')).toBe('false'));
+  fireEvent.click(toggle);
+  expect(screen.getByRole('complementary').hidden).toBe(false);
+  expect(screen.getByText(/No background tasks to show/)).toBeTruthy();
 });

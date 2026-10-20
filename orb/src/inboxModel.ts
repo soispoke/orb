@@ -161,6 +161,9 @@ export function stripMarkdownToProse(raw: string): string {
     // Strip image attachment transport markers like [Image #1] or [Uploaded: /path/to/img.png]
     .replace(/\[Image #\d+\]/gi, " ")
     .replace(/\[Uploaded:\s*[^\]]+\]/gi, " ")
+    // Tables -> "cell: cell;" rows, dropping the header row and its separator
+    .replace(/^[ \t]*\|?[^\n]*\|[^\n]*\n[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$/gm, " ")
+    .replace(/^[ \t]*\|(.*)\|[ \t]*$/gm, (_, row: string) => `${row.split("|").map(cell => cell.trim()).filter(Boolean).join(": ")};`)
     // Remove markdown headings, blockquotes, horizontal rules
     .replace(/^\s*#{1,6}\s+/gm, "")
     .replace(/^\s*>\s?/gm, "")
@@ -178,7 +181,8 @@ export function stripMarkdownToProse(raw: string): string {
     .replace(/__([^_]+)__/g, "$1")
     // Collapse whitespace
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    .replace(/;$/, "");
   if (codeHint && (text.length < 36 || text.endsWith(":"))) {
     text = text ? `${text} ${codeHint}` : codeHint;
   }
