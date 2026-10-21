@@ -2893,6 +2893,10 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     });
     if (liveDelivery()?.id === id) setLiveDelivery({id, state});
   };
+  // The message the user just sent, until the agent answers it or the run ends.
+  // Queue receipts and delivery echoes re-label that message several times; the
+  // working indicator must not blink with them.
+  const [awaitingReply, setAwaitingReply] = createSignal<string>();
   let sendingIds:ReturnType<typeof crypto.randomUUID>[]=[];
   let sendChain: Promise<void> = Promise.resolve();
   const beginSend = (draft:{text:string;images:DraftImage[];retry?:()=>void}|null) => {
@@ -2905,6 +2909,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     sendingIds.push(nextId);
     steering.submitted(nextId);
     setSteeringInChat(previous => new Set(previous).add(nextId));
+    setAwaitingReply(nextId);
     setLiveDelivery(busy() ? {id: nextId, state: "sending"} : undefined);
     setSendError(null);
     setOptimisticList(prev => {
@@ -3360,6 +3365,24 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     const phase = missionPhase(mission(), activity());
     return (optimisticList().some(item => !item.waiting && !item.failed) || queuedLocalMessages(p.id).some(row=>!row.error && (!row.waiting || row.state==='dispatching' || row.state==='accepted')) || localRunActive(p.id) || phase.moving) && !activity();
   };
+  /** Output after the given message: the agent has started answering it. */
+  const answered = (id: string) => {
+    const list = viewItems(), at = list.findIndex(item => item.kind === 'user' && (item.messageId === id || item.key === `user:${id}`));
+    return at >= 0 && hasTurnActivity(list.slice(at));
+  };
+  const awaitingAnswer = () => {
+    const id = awaitingReply();
+    if (!id || sendError()) return false;
+    const inFlight = optimisticList().some(item => item.id === id && !item.failed);
+    // A mission parked until a limit resets is not working on the message.
+    const parked = busy() && !inFlight && !missionPhase(mission(), false).moving;
+    return (inFlight || busy()) && !parked && !answered(id);
+  };
+  createEffect(() => {
+    const id = awaitingReply();
+    if (id && (sendError() || answered(id) || (!busy() && !optimisticList().some(item => item.id === id && !item.failed)))) setAwaitingReply(undefined);
+  });
+  const showPending = () => pending() || awaitingAnswer();
   const phaseLabel = () => mission()?.backend === "claudecode" ? "Waiting for Claude Code" : "Working";
 
   const [localProjectionRunId, setLocalProjectionRunId] = createSignal<string>();
@@ -3704,7 +3727,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
             <Show when={!sendError()}>
               <MissionFailure mission={mission()} active={busy() || localQueueActive() || (!clientPlaced() && (remoteQueuedIds().length > 0 || items().some(i => i.kind === "user" && i.queued)))} error={clientPlaced() ? localFailure(p.id) : undefined} onResume={resume} failureInTranscript={visibleTranscript(viewItems()).some(item => item.kind === "error")} />
             </Show>
-            <Show when={pending()}>
+            <Show when={showPending()}>
               <MissionPending destination={missionDestination(mission(), receipt)} label={phaseLabel()} />
             </Show>
           </Show>

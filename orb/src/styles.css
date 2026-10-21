@@ -479,10 +479,10 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
 .transcript-scroll-thumb[hidden] { display:none; }
 .transcript-scroll-thumb.hovered, .transcript-scroll-thumb.dragging { width:8px; background:var(--scroll-thumb-hover); }
 .col { width: 100%; max-width: var(--col); margin: 0 auto; }
-/* Offscreen turns skip style/layout: long transcripts otherwise make every
-   composer keystroke relayout the whole conversation. */
+/* Turns are virtualized ([data-virtual-transcript]); the other children of the
+   column are small status rows. Giving those lazy content-visibility made each
+   newly shown row take a 160px placeholder for a frame, so the chat lurched. */
 .scroll { contain: layout paint; }
-.scroll .col > * { content-visibility: auto; contain-intrinsic-size: auto 160px; }
 .scroll .col { padding: 16px 0 24px; user-select: text; -webkit-user-select: text; cursor: auto; font-size: 13px; line-height: 21px; }
 
 .sk-transcript { margin-top: 8px; }
@@ -503,11 +503,12 @@ button:focus:not(:focus-visible), input:focus:not(:focus-visible), textarea:focu
   background: var(--bg-elev); border: 1px solid var(--stroke);
   border-radius: var(--radius-lg); padding: 8px 40px 8px 10px; margin: 22px 0 14px;
   white-space: pre-wrap; overflow-wrap: anywhere;
-  content-visibility: auto; contain-intrinsic-size: auto 40px;
 }
 .user:first-child { margin-top: 0; }
 .restore { position: absolute; right: 8px; bottom: 7px; }
-.agent-turn { padding: 0 10px; content-visibility: auto; contain-intrinsic-size: auto 400px; }
+/* Virtualized rows are measured as rendered; lazy placeholders (40px/400px)
+   made a new message or reply resize on its first painted frame. */
+.agent-turn { padding: 0 10px; }
 .agent-turn p, .agent-turn ul { margin: 0 0 6px; overflow-wrap: anywhere; }
 .agent-turn ul { padding-left: 28px; }
 .agent-turn li { margin-bottom: 6px; padding-left: 0; }
