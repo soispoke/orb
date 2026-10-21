@@ -9,5 +9,5 @@ export default defineConfig({
     { name: 'webkit', use: { browserName: 'webkit' } },
   ],
   use: { baseURL: `http://127.0.0.1:${port}`, viewport: { width: 1100, height: 900 } },
-  webServer: { command: `pnpm dev --host 127.0.0.1 --port ${port}`, url: `http://127.0.0.1:${port}`, reuseExistingServer: false },
+  webServer: { command: `pnpm exec vite --host 127.0.0.1 --port ${port}`, url: `http://127.0.0.1:${port}`, reuseExistingServer: false },
 });
