@@ -51,15 +51,19 @@ Before shipping, run the checks from `orb/AGENTS.md` (`pnpm exec tsc --noEmit`,
 ```bash
 scripts/orb-ship/core/build.sh                         # builds + runs all lib tests on the server
 ssh thomas@hardness-agent.taile0aa99.ts.net 'python3 - <rev>' < scripts/orb-ship/core/package.py
-ssh thomas@hardness-agent.taile0aa99.ts.net 'python3 - <rev>' < scripts/orb-ship/core/deploy.py
+ssh thomas@hardness-agent.taile0aa99.ts.net 'python3 - <rev> [--resume-live]' < scripts/orb-ship/core/deploy.py
 ```
 
 `package.py` refuses unless the build and every library test passed, then health-checks
 the new image in an isolated container. `deploy.py` refuses while any mission runs,
 a delivery is queued or a machine transfer is open; backs up the database; restarts
 Core and its proxy together; and restores the previous image on any failure.
-Deploying stops nothing by itself — finish or stop running chats first, then send each
-a message afterwards to continue.
+By default the deploy refuses while chats run. With `--resume-live`, it restarts anyway:
+Core's startup recovery marks running chats "Interrupted: server restarted" and resumes
+them with a prompt to check the workspace and background jobs before continuing (a
+Codex goal chat is resumed with its `/goal`). Builds and proofs running inside the
+container stop with the restart, so pick a moment when no long, non-resumable job is
+running. The script waits up to five minutes and reports any chat that did not resume.
 
 ## Rules that keep upgrades safe
 
