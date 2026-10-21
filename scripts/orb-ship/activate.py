@@ -1,9 +1,11 @@
+# Install a staged Orb UI build: python3 -I scripts/orb-ship/activate.py ~/Applications/Orb-<name>-stage
 # Install the staged Orb UI build. Quits only the Orb window process; the
 # execution worker, its runs and Core are left untouched. Keeps a rollback copy.
 from pathlib import Path
-import importlib.util, json, subprocess, time, fcntl, datetime, sqlite3, sys
+import pathlib, importlib.util, json, subprocess, time, fcntl, datetime, sqlite3, sys
 
-spec = importlib.util.spec_from_file_location('guard', '/private/tmp/orb-worker-upgrade/upgrade.py')
+LIB = pathlib.Path(__file__).resolve().parent / 'lib'
+spec = importlib.util.spec_from_file_location('guard', LIB / 'guard.py')
 g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
 stage = Path(sys.argv[1]); app = g.APP  # e.g. /Users/alexis/Applications/Orb-<name>-stage
 v = json.loads((stage / 'VERIFIED.json').read_text()); exe = app / 'Contents/MacOS/orb'
@@ -19,7 +21,7 @@ with open(g.ROOT / 'boot.lock', 'a+') as lock:
           and subprocess.check_output(['ps', '-p', str(p), '-o', 'args='], text=True).strip() == str(exe)]
     assert len(ui) == 1, ui
     assert g.children_clear(rows, ui[0]), 'UI owns live children'
-    queue_rows = [json.loads(l) for l in subprocess.check_output(['python3', '/private/tmp/orb-read-queue-metadata.py'], text=True).splitlines()]
+    queue_rows = [json.loads(l) for l in subprocess.check_output(['python3', '-I', str(LIB / 'queue_metadata.py')], text=True).splitlines()]
     assert all(q.get('decoded') and not any(r.get('state') == 'dispatching' for r in q.get('metadata', []))
                for q in queue_rows if q.get('kind') == 'queue'), 'A message is being delivered; try again in a moment'
     protected = {p: r for p, r in rows.items()
