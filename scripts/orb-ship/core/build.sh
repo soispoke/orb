@@ -13,10 +13,9 @@ dir="/home/thomas/orb-build-$rev"
 ssh -o BatchMode=yes "$host" "test ! -e $dir && mkdir $dir"
 git -C "$repo" archive "$rev" | ssh -o BatchMode=yes "$host" "tar x -C $dir && echo $rev > $dir/SOURCE_COMMIT"
 # The cargo cache volume is shared by builds; CPU/RAM are capped so running agents keep the server.
+ssh -o BatchMode=yes "$host" "cat > $dir/.orb-builder.sh" < "$(dirname "$0")/builder.sh"
 ssh -o BatchMode=yes "$host" "docker run -d --name orb-core-builder-$rev --cpus 24 --memory 64g \
   -v $dir:/work -v orb-core-cargo-target:/target -w /work \
   -e CARGO_TARGET_DIR=/target -e CARGO_PROFILE_DEV_DEBUG=0 -e CARGO_PROFILE_TEST_DEBUG=0 \
-  rust:1.91-bookworm bash -c 'set -o pipefail; \
-    cargo build --locked --bin sandboxed-sh -j 24 2>&1 | tee build.log && cp /target/debug/sandboxed-sh /work/sandboxed-sh && \
-    cargo test --locked --lib -j 24 2>&1 | tee tests.log'"
+  rust:1.91-bookworm bash /work/.orb-builder.sh"
 echo "Building $rev in $dir (container orb-core-builder-$rev). Then run: core/package.py on the server."
