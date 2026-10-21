@@ -44,3 +44,47 @@ pub fn desktop_connection_save(connection: Option<SavedConnection>) -> Result<()
     }
     result
 }
+
+/// The same Core at a new address (a tunnel, a new hostname). Local work is
+/// filed under the address, and a running execution worker keeps computing that
+/// key, so the new address's folder links to the existing one instead of moving
+/// it. Both addresses then show the same local chats; nothing is copied.
+#[tauri::command]
+pub fn desktop_connection_move(from: String, to: String, token: String) -> Result<(), String> {
+    use crate::run_recovery::Connection;
+    let old = crate::local_origin::account(&Connection { api_url: from, token: token.clone() })?;
+    let new = crate::local_origin::account(&Connection { api_url: to, token })?;
+    link_moved(&old, &new)
+}
+/// An address that already has its own folder keeps it.
+fn link_moved(old: &std::path::Path, new: &std::path::Path) -> Result<(), String> {
+    if old == new || std::fs::symlink_metadata(new).is_ok() || !old.is_dir() {
+        return Ok(());
+    }
+    let target = std::fs::canonicalize(old).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink(target, new).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_moved;
+    #[test]
+    fn a_new_address_shows_the_same_local_work() {
+        let root = std::env::temp_dir().join(format!("orb-move-{}", uuid::Uuid::new_v4()));
+        let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("chat.json"), "{}").unwrap();
+        link_moved(&a, &b).unwrap();
+        assert!(b.join("chat.json").exists());
+        // A second move links straight to the real folder.
+        link_moved(&b, &c).unwrap();
+        assert_eq!(std::fs::read_link(&c).unwrap(), std::fs::canonicalize(&a).unwrap());
+        // Moving back never replaces a folder that exists.
+        link_moved(&c, &a).unwrap();
+        assert!(std::fs::symlink_metadata(&a).unwrap().is_dir());
+        // Nothing to link when the old address has no local work.
+        link_moved(&root.join("missing"), &root.join("d")).unwrap();
+        assert!(std::fs::symlink_metadata(root.join("d")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

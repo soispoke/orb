@@ -51,7 +51,7 @@ impl Record {
 fn pending(r: &Record) -> bool {
     !r.rejected() && (r.acked < r.snapshot.sequence || r.snapshot.status == "active")
 }
-fn account(c: &Connection) -> Result<PathBuf, String> {
+pub(crate) fn account(c: &Connection) -> Result<PathBuf, String> {
     use base64::Engine;
     let sub = c
         .token

@@ -12,8 +12,9 @@ Do not build from copies in `/private/tmp`: macOS deletes them after a few days.
 | Desktop app | `~/Applications/Orb.app` (UI process); the execution worker runs from `~/.orb/runtime/image-*/Orb.app` and is upgraded separately |
 | Desktop install records | `~/Applications/Orb-<name>-stage/` (`VERIFIED.json` names the source commit; `ui-rollback.app` is the previous app) |
 | Desktop logs | `~/.orb/logs/orb-YYYY-MM-DD.jsonl` |
-| Core | Docker container `orb-sandboxed-sh-1` on `thomas@hardness-agent.taile0aa99.ts.net`, image pinned in `/home/thomas/orb/docker-compose.override.yml` |
+| Core | Docker container `orb-sandboxed-sh-1` on `arch-fv-autoresearch-01` (SSH through Warpgate, as `thomas`), image pinned in `/home/thomas/orb/docker-compose.override.yml` |
 | Core build records | `/home/thomas/orb-build-<rev>/` (source, build and test logs) and `/home/thomas/orb-stage-<rev>/` (`VERIFIED.json`, `ACTIVATED.json`, rollback override) |
+| How Orb reaches Core | SSH tunnel `127.0.0.1:13000` → Core's `127.0.0.1:3000`, kept up by `~/Library/LaunchAgents/md.thomas.orb-core-tunnel.plist` (log `~/Library/Logs/orb-core-tunnel.log`). Devops policy: no Tailscale, all access through Warpgate. |
 | Core database backups | `/root/.sandboxed-sh/deployment-backups/` inside the container's data volume |
 
 ## History
@@ -50,8 +51,8 @@ Before shipping, run the checks from `orb/AGENTS.md` (`pnpm exec tsc --noEmit`,
 
 ```bash
 scripts/orb-ship/core/build.sh                         # builds + runs all lib tests on the server
-ssh thomas@hardness-agent.taile0aa99.ts.net 'python3 - <rev>' < scripts/orb-ship/core/package.py
-ssh thomas@hardness-agent.taile0aa99.ts.net 'python3 - <rev> [--resume-live]' < scripts/orb-ship/core/deploy.py
+ssh arch-fv-autoresearch-01 'python3 - <rev>' < scripts/orb-ship/core/package.py
+ssh arch-fv-autoresearch-01 'python3 - <rev> [--resume-live]' < scripts/orb-ship/core/deploy.py
 ```
 
 `package.py` refuses unless the build and every library test passed, then health-checks

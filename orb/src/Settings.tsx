@@ -4,7 +4,7 @@ import { Select } from "./Select";
 import { ErrorNotice } from "./ErrorNotice";
 import { For, Show, createSignal, onMount, type JSX } from "solid-js";
 import * as Ic from "./icons";
-import { clearConnection, getApiUrl, isConnected, login, setApiUrl } from "./api";
+import { clearConnection, getApiUrl, isConnected, login, moveConnection, setApiUrl } from "./api";
 import { localInstalled, pathOverrides, refreshLocalAgents, setPathOverride } from "./localAgents";
 import { getThemePref, setThemePref, type ThemePref } from "./theme";
 
@@ -137,6 +137,20 @@ function BackendTab() {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
+  const move = async () => {
+    if (busy()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await moveConnection(url());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const moved = () => isConnected() && url().trim().replace(/\/+$/, "") !== getApiUrl();
+
   const connect = async () => {
     if (busy()) return;
     setApiUrl(url());
@@ -161,7 +175,13 @@ function BackendTab() {
             value={url()}
             placeholder="https://agent-backend.thomas.md"
             onInput={(e) => setUrl(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === "Enter" && moved() && void move()}
           />
+          <Show when={moved()}>
+            <button class="s-btn primary" disabled={busy()} title="Same server at a new address: stay signed in" onClick={() => void move()}>
+              {busy() ? "Checking…" : "Use this address"}
+            </button>
+          </Show>
         </Row>
         <Show when={!isConnected()}>
           <Row title="Password" desc="Dashboard password. The returned JWT is stored in localStorage.">

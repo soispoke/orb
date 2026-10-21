@@ -57,6 +57,21 @@ export function setConnection(url: string, token: string) {
   bumpConnectionVersion(v => v + 1);
 }
 
+/** The same Core at a new address (a tunnel, a new hostname): keep the
+ * sign-in and this computer's local chats, once the address accepts the token. */
+export async function moveConnection(url: string): Promise<void> {
+  const next = url.trim().replace(/\/+$/, ""), token = getJwt();
+  if (!token) throw new Error("Not connected.");
+  if (next === getApiUrl()) return;
+  const res = await fetch(`${next}/api/backends`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(8000) }).catch(() => null);
+  if (!res) throw new Error(`Couldn’t reach ${next}.`);
+  if (res.status === 401 || res.status === 403) throw new Error(`${next} doesn’t accept this sign-in, so it isn’t the same server. Disconnect to sign in there.`);
+  if (!res.ok) throw new Error(`${next} answered ${res.status}.`);
+  const invoke = (window as any).__TAURI__?.core?.invoke;
+  if (invoke) await invoke("desktop_connection_move", { from: getApiUrl(), to: next, token });
+  setConnection(next, token);
+}
+
 export function clearConnection() {
   disconnectNativeSync();
   const hadConnection = connected() || !!getJwt();

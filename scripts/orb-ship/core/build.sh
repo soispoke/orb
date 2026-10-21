@@ -3,7 +3,7 @@
 # Usage: scripts/orb-ship/core/build.sh [rev]        (default HEAD; uncommitted changes are refused)
 # Result: /home/thomas/orb-build-<shortrev>/{sandboxed-sh,build.log,tests.log}. Nothing is deployed.
 set -euo pipefail
-host="${ORB_CORE_HOST:-thomas@hardness-agent.taile0aa99.ts.net}"
+host="${ORB_CORE_HOST:-arch-fv-autoresearch-01}"
 repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 rev="$(git -C "$repo" rev-parse --short "${1:-HEAD}")"
 if [ "${1:-HEAD}" = HEAD ] && ! git -C "$repo" diff --quiet HEAD -- src shared Cargo.toml Cargo.lock; then

@@ -5,7 +5,7 @@
 # has run longer than GRACE_SECONDS, at most MAX_WAIT_SECONDS. Lane driver scripts and
 # monitors are light and ignored; resumable jobs belong to unprotected missions.
 set -euo pipefail
-host="${ORB_CORE_HOST:-thomas@hardness-agent.taile0aa99.ts.net}"
+host="${ORB_CORE_HOST:-arch-fv-autoresearch-01}"
 here="$(cd "$(dirname "$0")" && pwd)"
 rev="$1"; shift
 grace="${GRACE_SECONDS:-180}"; max_wait="${MAX_WAIT_SECONDS:-5400}"; heavy="${HEAVY_KB:-1000000}"

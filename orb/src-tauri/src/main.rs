@@ -219,6 +219,7 @@ fn main() {
             session_preview::local_session_git,
             connection_store::desktop_connection_load,
             connection_store::desktop_connection_save,
+            connection_store::desktop_connection_move,
             uploads::pick_upload_files,
             uploads::pick_working_directory,
             uploads::read_upload_file,
