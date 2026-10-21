@@ -189,3 +189,15 @@ it("preserves explicit remote nodes and other workspace labels", () => {
   expect(missionDestination(mission({workspace_name:"research"}))).toBe("research");
   expect(missionDestination(null)).toBe("selected machine");
 });
+
+describe("usage-limit wait", () => {
+  it("shows a mission parked until a usage limit resets as waiting, not working", () => {
+    const resume = new Date(Date.now() + 6 * 86400_000).toISOString();
+    const parked = missionPhase({ status: "pending", terminal_reason: "usage_limit_wait", not_before: resume } as Mission, false);
+    expect(parked.moving).toBe(false);
+    expect(parked.label).toBe("Waiting for the usage limit");
+    expect(parked.detail).toMatch(/Resumes automatically on .+\. To continue now, switch to another account or model\./);
+    expect(missionPhase({ status: "pending", terminal_reason: "usage_limit_wait", not_before: new Date(Date.now() - 60_000).toISOString() } as Mission, false).moving).toBe(true);
+    expect(missionPhase({ status: "pending" } as Mission, false)).toMatchObject({ label: "Queued", moving: true });
+  });
+});

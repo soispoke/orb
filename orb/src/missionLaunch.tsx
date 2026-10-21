@@ -261,7 +261,15 @@ export function missionPhase(mission: Mission | null, activity: boolean): {label
     return {label:"Remote job accepted",moving:true,detail:"Waiting for the remote node to confirm execution."};
   }
   if (status === "resuming") return {label:"Resuming",moving:true,detail:"Waiting for the runner to resume."};
-  if (["pending","queued"].includes(status)) return {label:"Queued",moving:true,detail:"Request accepted. Waiting for the runner to start."};
+  if (["pending","queued"].includes(status)) {
+    // Parked by Core until a usage limit resets: nothing runs until then.
+    const at = new Date(mission?.not_before ?? "");
+    if (mission?.terminal_reason === "usage_limit_wait" && at.getTime() > Date.now()) {
+      const when = at.toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+      return {label:"Waiting for the usage limit", moving:false, detail:`Resumes automatically on ${when}. To continue now, switch to another account or model.`};
+    }
+    return {label:"Queued",moving:true,detail:"Request accepted. Waiting for the runner to start."};
+  }
   if (["active","running","starting"].includes(status)) return {label:activity?"Running":"Starting",moving:true,detail:activity?"":"Request accepted. Waiting for the first output."};
   return {label:status.replaceAll("_"," "),moving:false,detail:""};
 }
