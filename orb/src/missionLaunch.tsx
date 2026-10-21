@@ -42,7 +42,11 @@ export function missionDestination(mission: Mission | null, receipt?: LaunchRece
   if (mission?.tags?.includes("placement:client") || receipt?.nodeId === "local") return "This computer";
   // Server-owned remote placement or the accepted selection takes precedence
   // over workspace_name, which can still name the host's bookkeeping workspace.
-  return nodeLabel(mission?.remote_job?.node_id ?? mission?.remote_node_id ?? receipt?.nodeId ?? mission?.workspace_name ?? "selected machine");
+  const machine = mission?.remote_job?.node_id ?? mission?.remote_node_id ?? receipt?.nodeId;
+  if (machine) return nodeLabel(machine);
+  // "host" names Core's default workspace, not a separate execution machine.
+  // Normalize only this fallback; an explicitly selected node may itself be named host.
+  return mission?.workspace_name === "host" ? "Core" : nodeLabel(mission?.workspace_name ?? "selected machine");
 }
 export function initialPrompt(mission: Mission | null, receipt?: LaunchReceipt): string | undefined {
   if (receipt?.prompt) return receipt.prompt;

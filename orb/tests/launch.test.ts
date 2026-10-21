@@ -171,3 +171,21 @@ it("preserves the remote job while reconnecting and exposes actionable failures"
  const retry = mission({status:"interrupted",terminal_reason:"usage_limit_wait",recovery:{kind:"transient",reason:"Inference connection interrupted",resume_at:"2026-10-10T12:01:00Z",attempt:1,max_attempts:12}});
  expect(missionPhase(retry,false).detail).toContain("attempt 1/12");
 });
+
+
+it.each(["codex", "claudecode", "opencode"])("labels the Core host workspace consistently for %s", backend => {
+  const m = mission({id:`core-label-${backend}`, backend, workspace_name:"host"});
+  expect(missionDestination(m)).toBe("Core");
+  expect(missionDestination(JSON.parse(JSON.stringify(m)))).toBe("Core");
+  expect(missionDestination({...m, tags:["placement:client"]})).toBe("This computer");
+  expect(missionDestination(m, {nodeId:"local", destination:"This computer", prompt:""})).toBe("This computer");
+});
+
+it("preserves explicit remote nodes and other workspace labels", () => {
+  const m = mission({id:"explicit-host-node", workspace_name:"host", remote_node_id:"host"});
+  expect(missionDestination(m)).toBe("host");
+  expect(missionDestination(mission({workspace_name:"host", remote_job:{job_id:"j", node_id:"host", phase:"observed"}}))).toBe("host");
+  expect(missionDestination(mission({workspace_name:"host"}), {nodeId:"host", destination:"host", prompt:""})).toBe("host");
+  expect(missionDestination(mission({workspace_name:"research"}))).toBe("research");
+  expect(missionDestination(null)).toBe("selected machine");
+});
