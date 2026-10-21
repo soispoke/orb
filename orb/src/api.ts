@@ -376,6 +376,11 @@ export async function listBackendModels(): Promise<Record<string, BackendModelOp
 /** Harness order for the composer: the native agents first, then routers. */
 const HARNESS_ORDER = ["claudecode", "codex", "grok", "opencode", "antigravity", "vibe"];
 
+/** Display names for when the harness catalog has not loaded yet. */
+export const HARNESS_NAMES: Record<string, string> = {
+  claudecode: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode", antigravity: "Antigravity", vibe: "Mistral Vibe",
+};
+
 export async function listHarnessChoices(): Promise<HarnessChoice[]> {
   const [backends, models] = await Promise.all([listBackends(), listBackendModels()]);
   return backends

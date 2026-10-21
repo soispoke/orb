@@ -183,24 +183,48 @@ pub struct ClaudeInput {
 struct ClaudeState {
     closed: bool,
     pending: claude_followup::PendingInputs,
+    unanswered: claude_followup::UnansweredMessage,
+    writer: Option<SharedWriter>,
 }
 impl ClaudeInput {
     pub fn sender(self: &Arc<Self>, writer: SharedWriter) -> Sender {
         let state = self.clone();
+        state.state.lock().unwrap().writer = Some(writer.clone());
         Arc::new(move |id, text| {
             let mut s = state.state.lock().unwrap();
             if s.closed {
                 return Err("Claude finished before steering; message remains queued".into());
             }
             s.pending.insert(id);
+            s.unanswered.asked(text);
             // A write error can be partial: keep the pending record and never replay it.
             writer.line(json!({"type":"user","uuid":id,"message":{"role":"user","content":claude_followup::midturn_text(&text)}}))
         })
     }
     pub fn consume(&self, event: &Value) {
-        if event["type"] == "user" && event["parent_tool_use_id"].is_null() {
+        if !event["parent_tool_use_id"].is_null() {
+            return;
+        }
+        let mut s = self.state.lock().unwrap();
+        if event["type"] == "user" {
             if let Some(id) = event["uuid"].as_str() {
-                self.state.lock().unwrap().pending.acknowledge(id);
+                s.pending.acknowledge(id);
+            }
+        }
+        let blocks = event["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default();
+        for block in blocks {
+            if event["type"] == "assistant" && block["type"] == "text" && block["text"].as_str().is_some_and(|t| !t.is_empty()) {
+                s.unanswered.replied();
+            } else if event["type"] == "user" && block["type"] == "tool_result" && !s.closed {
+                if let Some(nudge) = s.unanswered.tool_result() {
+                    // Tracked like any injected input, so a reminder left
+                    // queued at turn end is still answered in this session.
+                    let id = format!("orb-reminder-{}", uuid::Uuid::new_v4());
+                    s.pending.insert(&id);
+                    if let Some(writer) = &s.writer {
+                        let _ = writer.line(json!({"type":"user","uuid":id,"message":{"role":"user","content":nudge}}));
+                    }
+                }
             }
         }
     }
@@ -248,6 +272,66 @@ mod tests {
             "must not emit turn/interrupt or turn/start"
         );
         assert!(input.consume(&json!({"id":"orb-steer-expired","error":{"message":"late"}})));
+    }
+
+    #[test]
+    fn claude_is_reminded_once_when_it_answers_only_in_thinking() {
+        struct Wire(mpsc::Sender<Value>);
+        impl Write for Wire {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(serde_json::from_slice(bytes).unwrap()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let input = Arc::new(ClaudeInput::default());
+        let send = input.sender(SharedWriter::new(Wire(tx)));
+        send("q", "status").unwrap();
+        assert!(rx.recv().unwrap()["message"]["content"].as_str().unwrap().starts_with("status"));
+        let tool_result = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}});
+        input.consume(&json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":"status: all fine"}]}}));
+        input.consume(&tool_result);
+        input.consume(&json!({"type":"user","parent_tool_use_id":"child","message":{"content":[{"type":"tool_result","tool_use_id":"c"}]}}));
+        assert!(rx.try_recv().is_err(), "a subagent's tool result does not count");
+        input.consume(&tool_result);
+        let nudge = rx.try_recv().unwrap();
+        assert!(nudge["message"]["content"].as_str().unwrap().contains("\"status\""));
+        input.consume(&tool_result);
+        input.consume(&tool_result);
+        assert!(rx.try_recv().is_err(), "only one reminder");
+        // The reminder keeps the session open until Claude consumes it.
+        input.consume(&json!({"type":"user","uuid":"q"}));
+        input.result();
+        assert!(!input.close_if_idle());
+        input.consume(&json!({"type":"user","uuid":nudge["uuid"]}));
+        input.result();
+        assert!(input.close_if_idle());
+    }
+
+    #[test]
+    fn claude_needs_no_reminder_after_a_visible_reply() {
+        let (tx, rx) = mpsc::channel::<Value>();
+        struct Wire(mpsc::Sender<Value>);
+        impl Write for Wire {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(serde_json::from_slice(bytes).unwrap()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = Arc::new(ClaudeInput::default());
+        let send = input.sender(SharedWriter::new(Wire(tx)));
+        send("q", "eta").unwrap();
+        rx.recv().unwrap();
+        input.consume(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"About ten minutes."}]}}));
+        let tool_result = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}});
+        for _ in 0..4 { input.consume(&tool_result); }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

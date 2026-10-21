@@ -7,7 +7,43 @@ pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read 
 /// "eta" or "status" there reads as background unless it is marked as a
 /// question awaiting an answer; the session instructions alone are not enough.
 pub fn midturn_text(text: &str) -> String {
-    format!("{text}\n\n<system-reminder>The user sent this while you were working. Answer it in a visible reply in your next message, not only in your thinking (briefly for a status or ETA question), then continue the task.</system-reminder>")
+    format!("{text}\n\n<system-reminder>The user sent this while you were working and is waiting for an answer. The user cannot see your thinking. Before your next tool call, answer it in plain visible text (briefly for a status or ETA question: what is done, what is running, and an ETA), then continue the task.</system-reminder>")
+}
+
+/// Tool results after a mid-turn message before Claude is reminded once more.
+pub const NUDGE_AFTER_TOOL_RESULTS: u32 = 2;
+
+/// A mid-turn message Claude has not yet answered in visible text. Claude
+/// sometimes answers only in its thinking, which the user never sees, and
+/// then works on for minutes; one direct reminder makes it reply.
+#[derive(Default)]
+pub struct UnansweredMessage {
+    text: Option<String>,
+    tool_results: u32,
+}
+
+impl UnansweredMessage {
+    pub fn asked(&mut self, text: &str) {
+        self.text = Some(text.to_owned());
+        self.tool_results = 0;
+    }
+
+    /// Visible text from the coordinator answers the message.
+    pub fn replied(&mut self) {
+        self.text = None;
+    }
+
+    /// The reminder to send once, after enough tool results without a reply.
+    pub fn tool_result(&mut self) -> Option<String> {
+        self.text.as_ref()?;
+        self.tool_results += 1;
+        if self.tool_results < NUDGE_AFTER_TOOL_RESULTS {
+            return None;
+        }
+        let text = self.text.take()?;
+        let quoted: String = text.chars().take(200).collect();
+        Some(format!("<system-reminder>The user is still waiting for your reply to their message \"{quoted}\". They cannot see your thinking. Reply to it now in plain visible text before any other tool call, then continue the task.</system-reminder>"))
+    }
 }
 
 /// An assistant event is not a receipt for queued user input. Only that input's
@@ -46,8 +82,40 @@ mod tests {
     fn midturn_messages_keep_the_user_text_and_ask_for_a_reply() {
         let text = midturn_text("eta");
         assert!(text.starts_with("eta\n\n<system-reminder>"));
-        assert!(text.contains("visible reply in your next message"));
-        assert!(text.contains("not only in your thinking"));
+        assert!(text.contains("Before your next tool call"));
+        assert!(text.contains("cannot see your thinking"));
+    }
+
+    #[test]
+    fn an_unanswered_message_gets_one_reminder() {
+        let mut waiting = UnansweredMessage::default();
+        assert_eq!(waiting.tool_result(), None, "nothing was asked");
+        waiting.asked("status");
+        assert_eq!(waiting.tool_result(), None);
+        let nudge = waiting.tool_result().expect("reminder after two tool results");
+        assert!(nudge.contains("\"status\""));
+        assert_eq!(waiting.tool_result(), None, "only one reminder");
+        assert_eq!(waiting.tool_result(), None);
+    }
+
+    #[test]
+    fn a_visible_reply_needs_no_reminder() {
+        let mut waiting = UnansweredMessage::default();
+        waiting.asked("eta");
+        waiting.tool_result();
+        waiting.replied();
+        assert_eq!(waiting.tool_result(), None);
+        assert_eq!(waiting.tool_result(), None);
+    }
+
+    #[test]
+    fn a_new_message_restarts_the_count() {
+        let mut waiting = UnansweredMessage::default();
+        waiting.asked("eta");
+        waiting.tool_result();
+        waiting.asked("and status?");
+        assert_eq!(waiting.tool_result(), None);
+        assert!(waiting.tool_result().unwrap().contains("and status?"));
     }
 
     #[test]

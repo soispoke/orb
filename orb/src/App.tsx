@@ -124,6 +124,7 @@ import {
   listProjectMissions,
   listProjects,
   listHarnessChoices,
+  HARNESS_NAMES,
   shortModelLabel,
   createProject,
   bumpProjects,
@@ -245,11 +246,15 @@ const pickLabel = (pick: HarnessPick | null): string => {
   const m = c?.models.find((x) => x.value === pick.model);
   return `${c?.backend.name ?? pick.backend} · ${m ? shortModelLabel(m.label) : pick.model}`;
 };
-async function refreshHarnessChoices() {
+let harnessRetry: ReturnType<typeof setTimeout> | undefined;
+/** A failed load keeps the last catalog and tries again, so one slow response
+ * on connect cannot leave every model picker empty until a reload. */
+async function refreshHarnessChoices(attempt = 0) {
+  clearTimeout(harnessRetry);
   try {
     setRemoteHarnessChoices(await listHarnessChoices());
   } catch {
-    /* keep last */
+    if (isConnected()) harnessRetry = setTimeout(() => void refreshHarnessChoices(attempt + 1), Math.min(30_000, 2_000 * 2 ** attempt));
   }
 }
 
@@ -2698,8 +2703,12 @@ function MissionDock(p: {
   const [saving, setSaving] = createSignal(false);
   const catalogMachine = () => p.mission && localBinding(p.mission.id) ? "local" : p.mission?.remote_node_id ?? "core";
   const choice = () => harnessChoices(catalogMachine()).find((c) => c.backend.id === p.mission?.backend);
-  const harnessName = () => choice()?.backend.name ?? p.mission?.backend ?? "";
-  const modelId = () => (p.mission?.backend === "antigravity" ? antigravityBaseModel(p.mission?.model_override) : p.mission?.model_override) || "";
+  const harnessName = () => choice()?.backend.name ?? HARNESS_NAMES[p.mission?.backend ?? ""] ?? p.mission?.backend ?? "";
+  // A pick shows at once and rolls back if the server refuses it.
+  const [pendingModel, setPendingModel] = createSignal<string | null>(null);
+  const [pendingEffort, setPendingEffort] = createSignal<string | null>(null);
+  createEffect(on(() => p.mission?.id, () => { setPendingModel(null); setPendingEffort(null); }, { defer: true }));
+  const modelId = () => pendingModel() ?? ((p.mission?.backend === "antigravity" ? antigravityBaseModel(p.mission?.model_override) : p.mission?.model_override) || "");
   const modelLabel = () => {
     const id = modelId();
     const m = choice()?.models.find((x) => x.value === id);
@@ -2708,22 +2717,27 @@ function MissionDock(p: {
   };
   const idle = () => missionSettingsIdle(p.mission?.status);
   const models = () => choice()?.models ?? [];
-  const canChangeModel = () => idle() && models().length > 1 && !saving();
+  // The button stays mounted while a change saves, so the footer never reflows.
+  const canChangeModel = () => idle() && models().length > 1;
   // The mission's own stored effort, normalized against its harness: a mission
   // created before an effort was offered simply has none.
-  const effort = () => normalizeEffort(p.mission?.model_effort, p.mission?.backend, models().find(m => m.value === modelId())?.efforts);
+  const effort = () => { const e = pendingEffort(); return e !== null ? (e || undefined) : normalizeEffort(p.mission?.model_effort, p.mission?.backend, models().find(m => m.value === modelId())?.efforts); };
   const efforts = () => supportedEfforts(p.mission?.backend, models().find(m => m.value === modelId())?.efforts);
   // Effort can change during a turn: a running Claude session applies it at
   // once, any other mission from its next turn.
-  const canChangeEffort = () => !!p.mission && efforts().length > 0 && !saving();
+  const canChangeEffort = () => !!p.mission && efforts().length > 0;
   const pickModel = async (value: string) => {
     const m = p.mission;
-    if (!m || value === modelId() || saving()) { setModelOpen(false); return; }
-    setSaving(true);
     setModelOpen(false);
+    if (!m || value === modelId() || saving()) return;
+    const nextEffort = normalizeEffort(effort(), m.backend, models().find(model => model.value === value)?.efforts) ?? "";
+    setSaving(true);
+    batch(() => { setPendingModel(value); setPendingEffort(nextEffort); });
     try {
-      p.onMission?.(await updateMissionSettings(m.id, { model_override: value, model_effort: normalizeEffort(m.model_effort, m.backend, models().find(model => model.value === value)?.efforts) ?? "" }));
+      const updated = await updateMissionSettings(m.id, { model_override: value, model_effort: nextEffort });
+      batch(() => { p.onMission?.(updated); setPendingModel(null); setPendingEffort(null); });
     } catch (e) {
+      batch(() => { setPendingModel(null); setPendingEffort(null); });
       p.onError?.(e instanceof Error && e.message.includes("409") ? "Stop the current turn before switching models." : launchError(e));
     } finally { setSaving(false); }
   };
@@ -2731,12 +2745,15 @@ function MissionDock(p: {
    * default (`normalize_string_patch` trims it to a null). */
   const pickEffort = async (value: string) => {
     const m = p.mission;
-    if (!m || value === (effort() ?? "") || saving()) { setEffortOpen(false); return; }
-    setSaving(true);
     setEffortOpen(false);
+    if (!m || value === (effort() ?? "") || saving()) return;
+    setSaving(true);
+    setPendingEffort(value);
     try {
-      p.onMission?.(await updateMissionSettings(m.id, { model_effort: value }));
+      const updated = await updateMissionSettings(m.id, { model_effort: value });
+      batch(() => { p.onMission?.(updated); setPendingEffort(null); });
     } catch (e) {
+      setPendingEffort(null);
       p.onError?.(e instanceof Error && e.message.includes("409") ? "Stop the current turn before switching effort." : launchError(e));
     } finally { setSaving(false); }
   };
@@ -2773,7 +2790,8 @@ function MissionDock(p: {
             <button
               class={`under-model ${modelOpen() ? "on" : ""}`}
               title="Model for the next turn"
-              onClick={() => setModelOpen(!modelOpen())}
+              aria-busy={saving()}
+              onClick={() => !saving() && setModelOpen(!modelOpen())}
             >
               {modelLabel()} <Ic.ChevronDown size={10} />
             </button>
@@ -2800,7 +2818,8 @@ function MissionDock(p: {
                 class={`under-model ${effortOpen() ? "on" : ""}`}
                 title={idle() ? "Reasoning effort for the next turn" : p.mission?.backend === "claudecode" ? "Reasoning effort · applies to the running session" : "Reasoning effort · applies from the next turn"}
                 aria-label={`Reasoning effort: ${effortLabel(effort(),p.mission?.backend,p.mission?.model_override)}`}
-                onClick={() => setEffortOpen(!effortOpen())}
+                aria-busy={saving()}
+                onClick={() => !saving() && setEffortOpen(!effortOpen())}
               >
                 {effortLabel(effort(),p.mission?.backend,p.mission?.model_override)} <Ic.ChevronDown size={10} />
               </button>
@@ -2815,7 +2834,7 @@ function MissionDock(p: {
         </Show>
         <Show when={p.mission?.backend === "codex"}>
           <span class="under-sep" aria-hidden="true">·</span>
-          <CodexSpeedPicker model={modelId()} value={missionSpeed(p.mission!)} missionId={p.mission!.id} local={catalogMachine()==="local"} disabled={saving()} onChange={tier=>{
+          <CodexSpeedPicker model={modelId()} value={missionSpeed(p.mission!)} missionId={p.mission!.id} local={catalogMachine()==="local"} onChange={tier=>{
             const mission=p.mission; if(!mission||saving())return;
             setSaving(true);
             void updateMissionSettings(mission.id,{service_tier:tier}).then(updated=>{if(missionSpeed(updated)!==tier)throw new Error('The backend did not save the selected speed. Update it before retrying.');p.onMission?.(updated);}).catch(e=>p.onError?.(launchError(e))).finally(()=>setSaving(false));

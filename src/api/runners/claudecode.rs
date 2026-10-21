@@ -1917,6 +1917,7 @@ pub fn run_claudecode_turn<'a>(
         // Keep each injected message until its native echo and a later result.
         // Unrelated assistant/tool activity must not retire a queued question.
         let mut pending_inputs = claude_followup::PendingInputs::default();
+        let mut unanswered = claude_followup::UnansweredMessage::default();
         // How a parked session ended: whether that was expected, and the note
         // that closes the turn (every reply was already delivered).
         let mut ended_parked: Option<(bool, &'static str)> = None;
@@ -2193,6 +2194,9 @@ pub fn run_claudecode_turn<'a>(
                     };
                     if delivered {
                         tracing::info!(mission_id = %mission_id, "Injected user message mid-turn into running Claude session");
+                        if pending_initial_prompt.is_none() {
+                            unanswered.asked(&content);
+                        }
                         if parked {
                             parked = false;
                             parked_slot = None;
@@ -2677,6 +2681,7 @@ pub fn run_claudecode_turn<'a>(
                                         let content_idx = content_idx as u32;
                                         match block {
                                             ContentBlock::Text { text } if !text.is_empty() => {
+                                                unanswered.replied();
                                                 // Text content is the final assistant response.
                                                 // Thinking must come from explicit provider
                                                 // reasoning/thinking blocks, not answer text.
@@ -2947,6 +2952,22 @@ pub fn run_claudecode_turn<'a>(
                                 ClaudeEvent::User(evt) => {
                                     for block in evt.message.content {
                                         if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                                            if let Some(nudge) = unanswered.tool_result() {
+                                                // Tracked like any injected input, so a reminder
+                                                // left queued at turn end is still answered here.
+                                                let input_id = Uuid::new_v4().to_string();
+                                                pending_inputs.insert(&input_id);
+                                                let frame = serde_json::json!({
+                                                    "type": "user",
+                                                    "uuid": input_id,
+                                                    "message": { "role": "user", "content": [{ "type": "text", "text": nudge }] }
+                                                });
+                                                if let Some(w) = stdin_writer.as_mut() {
+                                                    use std::io::Write as _;
+                                                    let ok = writeln!(w, "{}", frame).and_then(|_| w.flush()).is_ok();
+                                                    tracing::info!(mission_id = %mission_id, ok, "Reminded Claude to answer the user's mid-turn message");
+                                                }
+                                            }
                                             // Get tool name and remove from pending (tool is now complete)
                                             let name = pending_tools
                                                 .remove(&tool_use_id)
