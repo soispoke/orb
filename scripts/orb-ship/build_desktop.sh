@@ -10,9 +10,17 @@ step=""
 trap '[ -n "$step" ] && { echo "FAILED: $step (last lines of $logs/$step.log):" >&2; tail -20 "$logs/$step.log" >&2; }' ERR
 command -v memguard >/dev/null && memguard admit 12
 cd "$repo"
-# Tauri bundles the MCP companion; tauri.conf.json's beforeBuildCommand normally stages it.
+# Mirror tauri.macos.conf.json's beforeBuildCommand: stage the MCP companion and
+# compile the native app icon (both are generated, untracked build inputs).
 step=mcp-build; CARGO_TARGET_DIR="$target" python3 orb/scripts/build-mcp.py >"$logs/$step.log" 2>&1
 cd "$repo/orb"
+# Same actool call as orb/scripts/build-macos-icon.mjs (Node cannot spawn it in some shells).
+tauri="$repo/orb/src-tauri"
+step=icon-build; mkdir -p "$tauri/gen/app-icon"; xcrun actool "$tauri/icons/Orb.icon" --compile "$tauri/gen/app-icon" \
+  --output-format human-readable-text --notices --warnings --errors \
+  --output-partial-info-plist "$tauri/gen/app-icon/partial.plist" --app-icon Orb --include-all-app-icons \
+  --enable-on-demand-resources NO --development-region en --target-device mac \
+  --minimum-deployment-target 11.0 --platform macosx >"$logs/$step.log" 2>&1
 step=frontend-install; pnpm install --frozen-lockfile >"$logs/$step.log" 2>&1
 step=typecheck; pnpm exec tsc --noEmit >"$logs/$step.log" 2>&1
 step=frontend-build; pnpm exec vite build >"$logs/$step.log" 2>&1
