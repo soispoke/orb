@@ -1918,6 +1918,10 @@ pub fn run_claudecode_turn<'a>(
         // Unrelated assistant/tool activity must not retire a queued question.
         let mut pending_inputs = claude_followup::PendingInputs::default();
         let mut unanswered = claude_followup::UnansweredMessage::default();
+        // A turn the CLI started on its own (a background task reported back),
+        // and the reply such a turn last posted.
+        let mut woke_itself = false;
+        let mut last_wake_reply: Option<String> = None;
         // How a parked session ended: whether that was expected, and the note
         // that closes the turn (every reply was already delivered).
         let mut ended_parked: Option<(bool, &'static str)> = None;
@@ -2194,6 +2198,8 @@ pub fn run_claudecode_turn<'a>(
                     };
                     if delivered {
                         tracing::info!(mission_id = %mission_id, "Injected user message mid-turn into running Claude session");
+                        woke_itself = false;
+                        last_wake_reply = None;
                         if pending_initial_prompt.is_none() {
                             unanswered.asked(&content);
                         }
@@ -2222,6 +2228,8 @@ pub fn run_claudecode_turn<'a>(
                         });
                         if delivered {
                             tracing::info!(mission_id = %mission_id, "Delivered a message to the parked Claude session");
+                            woke_itself = false;
+                            last_wake_reply = None;
                             parked = false;
                             turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
                             idle_deadline = claudecode_idle_deadline(turn_wait_state, Instant::now(), idle_timeout, tool_idle_timeout, post_tool_result_idle_timeout, tool_timeout_override);
@@ -2507,10 +2515,13 @@ pub fn run_claudecode_turn<'a>(
                         if parked && main_thread {
                             // The CLI woke itself: a background task reported back.
                             parked = false;
+                            woke_itself = true;
                             super::live_session::unpark(mission_id);
                             if let Some(content) =
                                 parked_slot.take().and_then(|mut slot| slot.try_recv().ok())
                             {
+                                woke_itself = false;
+                                last_wake_reply = None;
                                 let input_id = Uuid::new_v4().to_string();
                                 pending_inputs.insert(&input_id);
                                 let frame = serde_json::json!({
@@ -3074,7 +3085,18 @@ pub fn run_claudecode_turn<'a>(
                                             .unwrap_or_else(|| {
                                                 text_buffer.values().cloned().collect::<String>()
                                             });
-                                        if !reply.trim().is_empty() {
+                                        // A background notice that changed nothing must not
+                                        // repeat the same line in the chat every minute.
+                                        let repeat = woke_itself
+                                            && last_wake_reply.as_deref().is_some_and(|last| last.trim() == reply.trim());
+                                        if woke_itself {
+                                            last_wake_reply = Some(reply.clone());
+                                        }
+                                        woke_itself = false;
+                                        if repeat {
+                                            tracing::info!(mission_id = %mission_id, "Dropped a background wake-up reply identical to the previous one");
+                                        }
+                                        if !reply.trim().is_empty() && !repeat {
                                             // The turn's cost is reported once, with the
                                             // message that ends the session.
                                             let _ = events_tx.send(AgentEvent::AssistantMessage {
