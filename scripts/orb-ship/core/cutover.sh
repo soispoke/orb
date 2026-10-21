@@ -21,7 +21,8 @@ if [ "$#" -gt 0 ]; then
   pattern="$(printf '/root/workspaces/mission-%s|' "$@")"; pattern="${pattern%|}"
   start=$(date +%s)
   while :; do
-    oldest=$(ssh_ "docker exec orb-sandboxed-sh-1 ps -eo etimes=,rss=,args=" | grep -E "$pattern" | awk -v h="$heavy" '$2 > h {print $1}' | sort -n | tail -1)
+    # No matching process makes grep fail; with pipefail that must not end the script.
+    oldest=$(ssh_ "docker exec orb-sandboxed-sh-1 ps -eo etimes=,rss=,args=" | { grep -E "$pattern" || true; } | awk -v h="$heavy" '$2 > h {print $1}' | sort -n | tail -1 || true)
     oldest=${oldest:-0}
     [ "$oldest" -le "$grace" ] && { say "protected missions have no job older than ${grace}s (oldest ${oldest}s)"; break; }
     [ $(( $(date +%s) - start )) -ge "$max_wait" ] && { say "waited ${max_wait}s; deploying with a ${oldest}s-old job running"; break; }
