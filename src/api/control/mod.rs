@@ -17,6 +17,7 @@ pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
+pub(crate) mod goal_continuation;
 pub mod fork;
 pub mod fork_observation;
 pub(crate) mod machine_transfer;
@@ -29400,6 +29401,19 @@ async fn control_actor_loop(
                                             None,
                                             Some("transport_auto_resume".to_string()),
                                         );
+                                    }
+                                    // Goal mode without a native goal loop: start the next turn here
+                                    // instead of leaving the mission idle until the user returns.
+                                    if !transport_requeued
+                                        && result.success
+                                        && result.terminal_reason == Some(TerminalReason::TurnComplete)
+                                        && !cancellation_requested
+                                        && was_queue_empty
+                                    {
+                                        if let Some(prompt) = goal_continuation::next(mission_store.as_ref(), *mission_id).await {
+                                            tracing::info!(mission_id = %mission_id, "Goal mode: queueing the next turn automatically");
+                                            runner.queue_message(Uuid::new_v4(), prompt, None, Some(goal_continuation::SOURCE.to_string()));
+                                        }
                                     }
                                     // Update automation executions based on agent outcome
                                     if !transport_requeued {
