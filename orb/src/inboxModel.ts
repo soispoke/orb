@@ -691,6 +691,7 @@ export function isSyntheticUserMessage(raw: string): boolean {
     /^antigravity background task handoff\b/i.test(pres) ||
     /^background task\s+`[^`]+`\s+.*finished\b/i.test(pres) ||
     /^continue from where you left off\.?$/i.test(pres) ||
+    /^goal mode is on, so this turn was started automatically\b/i.test(pres) ||
     /^\[system\b/i.test(pres)
   );
 }

@@ -3936,6 +3936,16 @@ pub(crate) async fn run_mission_turn(
     {
         return result;
     }
+    #[cfg(test)]
+    if let Some(result) = super::control::dispatch_admission_tests::scripted_turn_fixture(
+        mission_id,
+        &user_message,
+        events_tx.clone(),
+    )
+    .await
+    {
+        return result;
+    }
     // Preserve command intent before operator notes, attachments or transferred
     // history can be prepended to the text delivered to the harness.
     let vibe_user_message = (backend_id == "vibe").then(|| user_message.clone());

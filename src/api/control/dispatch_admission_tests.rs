@@ -226,6 +226,7 @@ impl Harness {
                 "/missions/:id/title",
                 axum::routing::post(set_mission_title),
             )
+            .route("/missions/:id/cancel", axum::routing::post(cancel_mission))
             .route(
                 "/missions/:id/project",
                 axum::routing::patch(update_mission_project).post(update_mission_project),
@@ -12694,4 +12695,164 @@ async fn fork_control_dispatch_rejects_missing_source_instead_of_creating_empty_
             "a missing fork source must not be recreated"
         );
     }
+}
+
+
+/// Missions under test whose turns are scripted: each entry says whether that
+/// turn runs a tool. Every delivered prompt is recorded.
+static SCRIPTED: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, (std::collections::VecDeque<bool>, Vec<String>)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) async fn scripted_turn_fixture(
+    id: Uuid,
+    message: &str,
+    events: broadcast::Sender<AgentEvent>,
+) -> Option<crate::agents::AgentResult> {
+    let uses_tool = {
+        let mut scripted = SCRIPTED.lock().unwrap();
+        let (turns, seen) = scripted.get_mut(&id)?;
+        seen.push(message.to_owned());
+        turns.pop_front().unwrap_or(false)
+    };
+    if uses_tool {
+        let _ = events.send(AgentEvent::ToolCall {
+            tool_call_id: Uuid::new_v4().to_string(),
+            name: "Bash".into(),
+            args: json!({"command": "true"}),
+            mission_id: Some(id),
+        });
+    }
+    // A real turn lasts long enough for its events to be stored before it ends.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    Some(crate::agents::AgentResult::success("done", 0).with_terminal_reason(TerminalReason::TurnComplete))
+}
+
+async fn scripted_goal_mission(h: &Harness, backend: &str, turns: &[bool]) -> Uuid {
+    let m = h
+        .control
+        .mission_store
+        .create_mission(Some("goal"), None, None, None, None, Some(backend), None)
+        .await
+        .unwrap();
+    SCRIPTED.lock().unwrap().insert(m.id, (turns.iter().copied().collect(), Vec::new()));
+    m.id
+}
+
+fn scripted_prompts(id: Uuid) -> Vec<String> {
+    SCRIPTED.lock().unwrap().get(&id).map(|(_, seen)| seen.clone()).unwrap_or_default()
+}
+
+/// Wait until the mission has been idle (no active run) for a while.
+async fn wait_settled(h: &Harness, id: Uuid) -> Mission {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut idle_since = None;
+        loop {
+            let active = h.control.mission_store.get_active_mission_run(id).await.unwrap().is_some();
+            let m = h.control.mission_store.get_mission(id).await.unwrap().unwrap();
+            if !active && m.status != MissionStatus::Active {
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > std::time::Duration::from_millis(1500) {
+                    return m;
+                }
+            } else {
+                idle_since = None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("mission settled")
+}
+
+#[tokio::test]
+async fn goal_mode_without_a_native_loop_keeps_going_until_a_turn_makes_no_progress() {
+    let h = Harness::new().await;
+    // Goal turn works, first nudge works, second nudge only answers.
+    let id = scripted_goal_mission(&h, "claudecode", &[true, true, false]).await;
+    assert!(h.request(false, id, json!({"content": "/goal ship the package"})).await.status().is_success());
+    let m = wait_settled(&h, id).await;
+    let prompts = scripted_prompts(id);
+    assert_eq!(prompts.len(), 3, "{prompts:#?}");
+    assert!(prompts[0].contains("ship the package"));
+    assert!(prompts[1..].iter().all(|p| p.contains("Goal mode is on") && p.contains("ship the package")));
+    assert!(m.goal_mode);
+    let sources: Vec<_> = h.control.mission_store.get_latest_events(id, 200).await.unwrap().into_iter()
+        .filter(|e| e.event_type == "user_message")
+        .map(|e| e.metadata.get("source").and_then(|s| s.as_str()).map(str::to_owned))
+        .collect();
+    assert_eq!(sources.iter().filter(|s| s.as_deref() == Some(goal_continuation::SOURCE)).count(), 2, "{sources:?}");
+}
+
+#[tokio::test]
+async fn ordinary_missions_and_harnesses_with_their_own_goal_loop_run_one_turn() {
+    let h = Harness::new().await;
+    let plain = scripted_goal_mission(&h, "claudecode", &[true, true]).await;
+    assert!(h.request(false, plain, json!({"content": "do the thing"})).await.status().is_success());
+    let grok = scripted_goal_mission(&h, "grok", &[true, true]).await;
+    assert!(h.request(false, grok, json!({"content": "/goal grok objective"})).await.status().is_success());
+    wait_settled(&h, plain).await;
+    wait_settled(&h, grok).await;
+    assert_eq!(scripted_prompts(plain).len(), 1);
+    for id in [plain, grok] {
+        let automatic = h.control.mission_store.get_latest_events(id, 200).await.unwrap().into_iter()
+            .filter(|e| e.event_type == "user_message" && e.metadata.get("source").and_then(|s| s.as_str()) == Some(goal_continuation::SOURCE))
+            .count();
+        assert_eq!(automatic, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_typed_stop_ends_the_automatic_turns() {
+    let h = Harness::new().await;
+    let id = scripted_goal_mission(&h, "claudecode", &[false, true, true]).await;
+    assert!(h.request(false, id, json!({"content": "/goal objective"})).await.status().is_success());
+    wait_settled(&h, id).await;
+    // Nudges run until one makes no progress; then a typed stop gets one plain turn.
+    let before = scripted_prompts(id).len();
+    assert!(h.request(false, id, json!({"content": "stop"})).await.status().is_success());
+    wait_settled(&h, id).await;
+    assert_eq!(scripted_prompts(id).len(), before + 1, "{:#?}", scripted_prompts(id));
+}
+
+#[tokio::test]
+async fn automatic_turns_stop_at_the_cap() {
+    let h = Harness::new().await;
+    let id = scripted_goal_mission(&h, "opencode", &vec![true; goal_continuation::MAX_CONSECUTIVE + 10]).await;
+    assert!(h.request(false, id, json!({"content": "/goal never ends"})).await.status().is_success());
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while scripted_prompts(id).len() < goal_continuation::MAX_CONSECUTIVE + 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("continuations ran");
+    wait_settled(&h, id).await;
+    assert_eq!(scripted_prompts(id).len(), goal_continuation::MAX_CONSECUTIVE + 1);
+}
+
+#[tokio::test]
+async fn stop_clears_goal_mode_so_the_next_message_is_not_continued() {
+    let h = Harness::new().await;
+    let id = scripted_goal_mission(&h, "claudecode", &[true, true, true, true, true]).await;
+    assert!(h.request(false, id, json!({"content": "/goal objective"})).await.status().is_success());
+    wait_native_file_count(id, 2).await;
+    let response = h.state.http_client.post(format!("{}/missions/{id}/cancel", h.url)).send().await.unwrap();
+    let status = response.status();
+    assert!(status.is_success(), "{status} {} {}", h.url, response.text().await.unwrap());
+    let m = wait_settled(&h, id).await;
+    assert!(!m.goal_mode);
+    let before = scripted_prompts(id).len();
+    assert!(h.request(false, id, json!({"content": "one more thing"})).await.status().is_success());
+    wait_settled(&h, id).await;
+    assert_eq!(scripted_prompts(id).len(), before + 1);
+}
+
+async fn wait_native_file_count(id: Uuid, count: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while scripted_prompts(id).len() < count {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("scripted turns started");
 }

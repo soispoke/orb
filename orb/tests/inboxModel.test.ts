@@ -6,6 +6,7 @@ import {
   clipToSentence,
   extractInboxInteraction,
   formatRelativeTime,
+  isSyntheticUserMessage,
   stripMarkdownToProse,
 } from "../src/inboxModel";
 import type { StreamItem } from "../src/transcriptModel";
@@ -43,6 +44,13 @@ describe("clipToSentence", () => {
     const clipped = clipToSentence(raw, 80);
     expect(clipped.endsWith("…")).toBe(true);
     expect(clipped.length).toBeLessThanOrEqual(80);
+  });
+});
+
+describe("isSyntheticUserMessage", () => {
+  it("treats Core's automatic goal turns as coordinator messages, not user requests", () => {
+    expect(isSyntheticUserMessage("Goal mode is on, so this turn was started automatically. Keep working toward the goal:\n\nShip it")).toBe(true);
+    expect(isSyntheticUserMessage("Goal mode is on? keep going")).toBe(false);
   });
 });
 

@@ -19056,8 +19056,9 @@ pub async fn cancel_mission(
 
     rx.await
         .map_err(recv_failed)?
-        .map(|_| Json(serde_json::json!({ "ok": true, "cancelled": mission_id })))
-        .map_err(|e| (StatusCode::NOT_FOUND, e))
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+    goal_continuation::clear_on_user_stop(control.mission_store.as_ref(), &control.events_tx, mission_id).await;
+    Ok(Json(serde_json::json!({ "ok": true, "cancelled": mission_id })))
 }
 
 /// Settle a durable run after the control actor has proved that no live main
@@ -24017,6 +24018,7 @@ async fn control_actor_loop(
     // quota/capacity, source failures, stalls, and loops are deliberately not
     // eligible. Writer leases are re-acquired by the normal start path.
     let mut transport_auto_resumed_missions: HashMap<Uuid, u8> = HashMap::new();
+    let mut goal_auto_turns: HashMap<Uuid, usize> = HashMap::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
     // Track number of in-flight tool calls on the main runner so the stall
@@ -24846,6 +24848,9 @@ async fn control_actor_loop(
                             ControlCommand::AdmitDispatch { .. } => unreachable!("nested admission"),
                             ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                                 if let Some(mid) = target_mission_id {
+                                    if !goal_continuation::is_automatic(source.as_deref()) {
+                                        goal_auto_turns.remove(&mid);
+                                    }
                                     if let Err(error) = remote_grok::reject_local_followup(&config.working_dir, &mission_store, mid).await {
                                         let _ = respond.send(UserMessageAck::Rejected(error));
                                         continue;
@@ -29404,15 +29409,20 @@ async fn control_actor_loop(
                                     }
                                     // Goal mode without a native goal loop: start the next turn here
                                     // instead of leaving the mission idle until the user returns.
+                                    let mut goal_requeued = false;
                                     if !transport_requeued
                                         && result.success
                                         && result.terminal_reason == Some(TerminalReason::TurnComplete)
                                         && !cancellation_requested
                                         && was_queue_empty
                                     {
-                                        if let Some(prompt) = goal_continuation::next(mission_store.as_ref(), *mission_id).await {
+                                        if let Some(prompt) = goal_continuation::next(mission_store.as_ref(), *mission_id)
+                                            .await
+                                            .filter(|_| goal_continuation::take_turn(&mut goal_auto_turns, *mission_id))
+                                        {
                                             tracing::info!(mission_id = %mission_id, "Goal mode: queueing the next turn automatically");
                                             runner.queue_message(Uuid::new_v4(), prompt, None, Some(goal_continuation::SOURCE.to_string()));
+                                            goal_requeued = true;
                                         }
                                     }
                                     // Update automation executions based on agent outcome
@@ -29459,7 +29469,9 @@ async fn control_actor_loop(
                                         )
                                         .await;
                                     }
+                                    // "Agent finished" automations wait until the goal loop stops.
                                     if was_queue_empty
+                                        && !goal_requeued
                                         && !suppress_finished_automation
                                         && !cancellation_requested
                                     {
