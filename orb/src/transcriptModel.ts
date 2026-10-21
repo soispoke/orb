@@ -308,8 +308,19 @@ export class TranscriptReducer {
       }
       case "thinking": {
         const text=str(d.content),done=d.done===true;
-        if(last?.kind==="think"&&!last.done)this.put(this.items.length-1,{...last,text,done});
-        else if(text)this.items.push({kind:"think",key:this.key("think"),text,done});
+        if(last?.kind==="think"&&!last.done){this.put(this.items.length-1,{...last,text,done});return;}
+        if(!text)return;
+        // A block's final copy can arrive after the tool call that followed it
+        // (Claude finalizes at the end of the assistant message). Complete the
+        // streamed copy in place, and never repeat a finished block in this turn.
+        for(let i=this.items.length-1;i>=0;i--){
+          const item=this.items[i];
+          if(item.kind==="user"&&!item.queued)break;
+          if(item.kind!=="think")continue;
+          if(item.done&&item.text===text)return;
+          if(done&&!item.done&&(text.startsWith(item.text)||item.text.startsWith(text))){this.put(i,{...item,text,done});return;}
+        }
+        this.items.push({kind:"think",key:this.key("think"),text,done});
         return;
       }
       case "tool_call":
