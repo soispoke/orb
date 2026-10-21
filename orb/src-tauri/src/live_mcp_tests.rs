@@ -45,7 +45,7 @@ fn live_native_mcp_roundtrip() {
     let prompt = if wakeup {
         format!("Call sandboxed get_capabilities once, then orb-wakeups schedule_wakeup once with request_id=\"native-smoke-{}\", delay_seconds=3600, prompt=\"Reply WAKE_NATIVE_OK\", reason=\"Orb native scheduling smoke\". Report ORB_MCP_LIVE_OK, the role and mission_id from get_capabilities, and the real scheduling receipt. Do not call other tools, change files, sleep or start missions.", uuid::Uuid::new_v4())
     } else {
-        "Call sandboxed get_capabilities exactly once. Report ORB_MCP_LIVE_OK, then the role and mission_id from the actual tool result. Do not call other tools, change files, or start missions.".to_string()
+        "Discover the sandboxed get_capabilities tool (using tool search if required), then invoke it exactly once. Report ORB_MCP_LIVE_OK, then the role and mission_id from the actual tool result. Do not invoke other capabilities, change files, or start missions.".to_string()
     };
     let workdir = config
         .parent()
@@ -57,7 +57,9 @@ fn live_native_mcp_roundtrip() {
         let started = local_origin::local_origin_launch(
             local_agents::StartRequest {
                 service_tier: None,
-                effort: None,
+                effort: std::env::var("ORB_MCP_LIVE_EFFORT")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
                 cyber_revision: None,
                 cyber_access: None,
                 id: String::new(),
@@ -73,6 +75,8 @@ fn live_native_mcp_roundtrip() {
                 shared_cwd_with: None,
             },
             local_origin::Draft {
+                fork_source_mission_id: None,
+                share_folder: false,
                 key: uuid::Uuid::new_v4().to_string(),
                 title: format!("Orb MCP live validation: {harness}"),
                 project: "unified-mcp-validation".into(),
@@ -113,9 +117,14 @@ fn live_native_mcp_roundtrip() {
                     "Missing live MCP identity in response"
                 );
                 assert!(
-                    poll.activities
-                        .iter()
-                        .any(|a| a.label.contains("get_capabilities") && a.done && !a.failed),
+                    poll.activities.iter().any(|a| a.done
+                        && !a.failed
+                        && (a.label.contains("get_capabilities")
+                            || a.detail
+                                .as_deref()
+                                .is_some_and(|d| d.contains("get_capabilities")
+                                    && d.contains("executor")
+                                    && d.contains(&id)))),
                     "No completed native MCP tool activity"
                 );
                 // Let the native-origin outbox publish its terminal snapshot.
@@ -246,10 +255,14 @@ fn live_native_mcp_resume() {
                         && poll.text.contains(&id),
                     "Native history or MCP identity missing"
                 );
-                assert!(poll
-                    .activities
-                    .iter()
-                    .any(|a| a.label.contains("get_capabilities") && a.done && !a.failed));
+                assert!(poll.activities.iter().any(|a| a.done
+                    && !a.failed
+                    && (a.label.contains("get_capabilities")
+                        || a.detail
+                            .as_deref()
+                            .is_some_and(|d| d.contains("get_capabilities")
+                                && d.contains("executor")
+                                && d.contains(&id)))));
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 println!("Orb native MCP resume validated: {harness} {id}");
                 break;

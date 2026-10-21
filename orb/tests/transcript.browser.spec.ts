@@ -41,11 +41,11 @@ test("cumulative live text across tools renders once and preserves open tool det
 test("native Grok canary final assistant_message then text_delta renders once",async({page})=>{
   const events=(await import("./fixtures/native-canary-events.json",{with:{type:"json"}})).default;
   await page.addInitScript(()=>{localStorage.setItem("orb.apiUrl",location.origin);localStorage.setItem("orb.jwt","test");localStorage.setItem("orb-theme","dark");});
-  const mission={id:"44584615-b118-45c4-a4e7-299c2ab1a153",title:"Orb native Grok launch verification",status:"completed",history:[],workspace_name:"host",remote_node_id:"dgx-spark",created_at:"",updated_at:""};
+  const mission={id:"44584615-b118-45c4-a4e7-299c2ab1a153",title:"Orb native Grok launch verification",project:"test",status:"completed",history:[],workspace_name:"host",remote_node_id:"dgx-spark",created_at:"",updated_at:""};
   await page.route("**/api/**",async route=>{
     const path=new URL(route.request().url()).pathname;
     const json=path==="/api/projects"?{projects:[{slug:"test",title:"test"}]}
-      :path==="/api/control/missions"&&new URL(route.request().url()).searchParams.get("project")==="test"?[mission]
+      :path==="/api/control/missions"?[mission]
       :path==="/api/control/missions/44584615-b118-45c4-a4e7-299c2ab1a153"?mission
       :path.endsWith("/events")?events
       :path==="/api/control/stream"?undefined
@@ -104,7 +104,7 @@ test('paused Antigravity receipt keeps raw JSON collapsed',async({page})=>{
  await expect(page.locator('.legacy-log pre')).toBeHidden();
 });
 
-test('action details expand above their trigger without moving it off screen',async({page})=>{
+test('action details expand below their trigger without moving it off screen',async({page})=>{
  await page.goto('/tests/transcript.html');
  await page.waitForFunction(()=>!!(window as any).transcriptHarness);
  await page.evaluate(()=> (window as any).transcriptHarness.reset([
@@ -119,12 +119,12 @@ test('action details expand above their trigger without moving it off screen',as
  await expect(fold).toHaveAttribute('aria-expanded','true');
  await page.waitForTimeout(50);
  const after=await fold.boundingBox();const body=await page.locator('.st-work-body').boundingBox();
- expect(body!.y+body!.height).toBeLessThanOrEqual(after!.y+1);
+ expect(body!.y).toBeGreaterThanOrEqual(after!.y+after!.height-1);
  expect(Math.abs(after!.y-before!.y)).toBeLessThan(3);
  const tool=page.locator('.st-tool-head');await tool.click();
  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
  const detail=await page.locator('.st-tool-detail').boundingBox();const trigger=await tool.boundingBox();
- expect(detail!.y+detail!.height).toBeLessThanOrEqual(trigger!.y+1);
+ expect(detail!.y).toBeGreaterThanOrEqual(trigger!.y+trigger!.height-1);
 });
 
 
@@ -187,4 +187,122 @@ test("OpenCode / Cursor-styled tool components, diff badges, collapsible & dismi
   await page.screenshot({path:"test-results/orb-components-cursor-style.png", fullPage: true});
   await page.locator(".tasks-dismiss").click();
   await expect(page.locator(".mission-tasks")).toHaveCount(0);
+});
+
+test('a delivered follow-up does not repeat the streaming reply or close a running tool',async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>(window as any).transcriptHarness.reset([
+  {type:'text_delta',data:{content:'I will update the runner.'}},
+  {type:'tool_call',data:{tool_call_id:'runner',name:'Bash',args:{command:'check-runner'}}},
+ ]));
+ await page.locator('.st-work-head').click();
+ await page.locator('.st-tool-head').click();
+ await page.evaluate(()=>{
+  const harness=(window as any).transcriptHarness;
+  const followup={type:'user_message',data:{id:'followup',content:'Explain simply'}};
+  harness.apply(followup);harness.apply(followup);
+  harness.apply({type:'text_delta',data:{content:'I will update the runner.'}});
+ });
+ await expect(page.locator('.st-text')).toHaveCount(1);
+ await expect(page.locator('.user')).toHaveCount(1);
+ await expect(page.locator('.st-tool-detail')).toBeVisible();
+ await page.evaluate(()=>(window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'runner',result:'RUNNER_OK'}}));
+ await expect(page.locator('.st-tool-detail')).toContainText('RUNNER_OK');
+});
+
+for(const theme of ['dark','light'])test(`reply follows its question and thoughts expand downward (${theme})`,async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(theme=>{
+  document.documentElement.dataset.theme=theme;
+  const h=(window as any).transcriptHarness;
+  h.reset([
+   {type:'text_delta',data:{content:'The build is running.'}},
+   {type:'user_message',data:{id:'status',content:'How long?'}},
+   {type:'text_delta',data:{content:'The build is running. About ten minutes.'}},
+   {type:'thinking',data:{content:'First check',done:true}},
+   {type:'thinking',data:{content:'Second check',done:true}},
+   {type:'thinking',data:{content:'Current check',done:false}},
+  ]);
+ },theme);
+ const question=page.locator('.user');const answer=page.locator('.st-text').last();
+ await expect(answer).toContainText('About ten minutes.');
+ expect((await answer.boundingBox())!.y).toBeGreaterThan((await question.boundingBox())!.y);
+ await expect(page.locator('.st-text').first()).toHaveText('The build is running.');
+ const fold=page.locator('.st-think-fold > .st-work-head');
+ await fold.click();await expect(fold).toHaveAttribute('aria-expanded','true');
+ const header=await fold.boundingBox();const body=await page.locator('.st-think-fold > .st-work-body').boundingBox();
+ expect(body!.y).toBeGreaterThanOrEqual(header!.y+header!.height-1);
+});
+
+for (const theme of ['dark','light']) test(`ongoing commands stay below the latest reply and settle into history (${theme})`,async({page})=>{
+ await page.goto(`/tests/transcript.html?theme=${theme}`);
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>{
+  document.documentElement.dataset.theme=new URLSearchParams(location.search).get('theme')!;
+  (window as any).transcriptHarness.reset([
+   {type:'user_message',data:{id:'start',content:'Start building'}},
+   {type:'tool_call',data:{tool_call_id:'building',name:'Bash',args:{command:'build --wait'}}},
+   {type:'text_delta',data:{content:'The build continues while I answer.'}},
+  ]);
+ });
+ const tool=page.locator('.st-work-head'),reply=page.locator('.st-text');
+ await expect(tool).toContainText('Bash');await expect(reply).toContainText('build continues');
+ expect((await tool.boundingBox())!.y).toBeGreaterThan((await reply.boundingBox())!.y);
+ await tool.click();await page.locator('.st-tool-head').click();
+ await expect(page.locator('.st-tool-detail')).toContainText('build --wait');
+ await page.evaluate(()=>(window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'building',result:'Build complete'}}));
+ await expect(tool).toContainText('1 command');
+ expect((await tool.boundingBox())!.y).toBeLessThan((await reply.boundingBox())!.y);
+});
+
+for (const native of [false, true]) test(`${native ? 'native Codex' : 'shared'} text keeps its Markdown nodes when commands finish`, async ({page}) => {
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ const user={type:'user_message',data:{id:'stable-user',content:'Check the result'}};
+ const bubble=native?'codex:fixture:item-1':'text_delta_latest';
+ const content='## Stable heading\n\nThe **existing paragraph** stays visible while commands run.';
+ const live={type:'text_op',eventId:'live-1',data:{bubble_id:bubble,ops:[{type:'snapshot',revision:1,text:content}]}};
+ const tool={type:'tool_call',data:{tool_call_id:'stable-tool',name:'bash',args:{command:'printf checked'}}};
+ const final={type:'assistant_message',eventId:'canonical-1',sequence:5,data:{bubble_id:bubble,canonical:true,revision:2,content}};
+ await page.evaluate(events=>(window as any).transcriptHarness.reset(events),[user,live,tool]);
+ await expect(page.getByRole('heading',{name:'Stable heading'})).toBeVisible();
+ await page.evaluate(()=>{(window as any).retainedHeading=document.querySelector('.st-text h2');(window as any).retainedParagraph=document.querySelector('.st-text p');});
+ await page.evaluate(ev=>(window as any).transcriptHarness.apply(ev),final);
+ await page.evaluate(()=>(window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'stable-tool',result:'checked'}}));
+ expect(await page.evaluate(()=>document.querySelector('.st-text h2')===(window as any).retainedHeading)).toBe(true);
+ expect(await page.evaluate(()=>document.querySelector('.st-text p')===(window as any).retainedParagraph)).toBe(true);
+ await page.evaluate(events=>(window as any).transcriptHarness.reset(events),[user,tool,final]);
+ expect(await page.evaluate(()=>document.querySelector('.st-text h2')===(window as any).retainedHeading)).toBe(true);
+});
+
+test('stored local final and native snapshot render once across completion, steering and reload',async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ const row=(sequence:number,id:string,type:string,content:string)=>({id:sequence,sequence,event_id:id,event_type:type,content,timestamp:''});
+ const reply='**Status:** The result is saved.\n\n| Route | Result |\n| --- | --- |\n| Audit | Complete |';
+ const question=row(1,'question','user_message','Status?');
+ const final=row(2,'run','assistant_message',reply);
+ const show=async(rows:unknown[],runId:string,text:string,boundaries:unknown[]=[])=>page.evaluate(({rows,runId,text,boundaries})=>(window as any).transcriptHarness.storedLocal(rows,boundaries,{runId,text,active:false,activities:[]}),{rows,runId,text,boundaries});
+ await show([question],'run',reply);
+ await expect(page.locator('.st-text')).toHaveCount(1);
+ await show([question,final],'run',reply);
+ await expect(page.locator('.st-text')).toHaveCount(1);
+ await expect(page.locator('.st-text table')).toHaveCount(1);
+ const cut={id:'steer',runId:'run',text:'Next?',before:reply,accepted:true,activityKeys:[]};
+ const withSteer=[question,{...final,content:reply+'\n\nContinue with the next check.'},row(3,'steer','user_message','Next?')];
+ await show(withSteer,'run',reply+'\n\nContinue with the next check.',[cut]);
+ await expect(page.locator('.st-text')).toHaveCount(2);
+ await expect(page.locator('.st-text table')).toHaveCount(1);
+ await expect(page.locator('.st-text').last()).toHaveText('Continue with the next check.');
+ // Identical prose in a distinct run is legitimate and must remain visible.
+ const next=[...withSteer,row(4,'again','user_message','Again'),row(5,'next-run','assistant_message',reply)];
+ await show(next,'next-run',reply,[cut]);
+ await expect(page.locator('.st-text')).toHaveCount(3);
+ await expect(page.locator('.st-text table')).toHaveCount(2);
+ await page.reload();await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await show(next,'next-run',reply,[cut]);
+ await expect(page.locator('.st-text')).toHaveCount(3);
+ await expect(page.locator('.st-text table')).toHaveCount(2);
 });

@@ -13,6 +13,10 @@ use std::{
 use tokio::sync::Mutex;
 #[derive(Deserialize)]
 pub struct Draft {
+    #[serde(default)]
+    pub share_folder: bool,
+    #[serde(default)]
+    pub fork_source_mission_id: Option<uuid::Uuid>,
     pub key: String,
     pub title: String,
     pub project: String,
@@ -73,6 +77,19 @@ fn account(c: &Connection) -> Result<PathBuf, String> {
 fn read(p: &Path) -> Result<Record, String> {
     serde_json::from_slice(&std::fs::read(p).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
+// The journal exists before registration and spawn finish. Observers must not
+// interpret that interval as a lost process, or overwrite the launcher's state.
+fn record_guard(path: &Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("launch.lock"))?;
+    file.try_lock_exclusive()?;
+    Ok(file)
+}
 fn write(p: &Path, r: &Record) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -104,8 +121,12 @@ fn view(r: &Record) -> Value {
     let (status, title) = confirmed::shown(r.confirmed.as_ref(), pending(r), &s.status, &o.title);
     json!({"id":o.id,"title":title,"status":status,"project":o.project,"tags":o.tags.iter().cloned().chain(std::iter::once("placement:client".into())).collect::<Vec<_>>(),"backend":o.backend,"agent":o.initial_agent(),"model_override":o.model,"model_effort":o.effort,"service_tier":o.service_tier,"working_directory":o.cwd,"created_at":o.created_at,"updated_at":o.created_at,"history":[{"role":"user","content":o.prompt},{"role":"assistant","content":s.text}],"goal_mode":objective.is_some(),"goal_objective":objective,"status_message":s.error,"local_sync_pending":r.acked<s.sequence,"local_run_active":s.status=="active","local_sync_error":r.error})
 }
-fn initial_binding(request: &local_agents::StartRequest, origin: &Origin) -> Value {
-    json!({"harness":request.harness,"bin":request.bin,"cwd":request.cwd,"model":request.model,"effort":request.effort,"planMode":origin.initial_agent() == Some("plan")})
+fn initial_binding(
+    request: &local_agents::StartRequest,
+    origin: &Origin,
+    share_folder: bool,
+) -> Value {
+    json!({"shareFolder":share_folder,"harness":request.harness,"bin":request.bin,"cwd":request.cwd,"model":request.model,"effort":request.effort,"planMode":origin.initial_agent() == Some("plan")})
 }
 
 fn workers() -> &'static Mutex<HashSet<PathBuf>> {
@@ -116,7 +137,7 @@ fn connections() -> &'static Mutex<std::collections::HashMap<PathBuf, Connection
     static C: OnceLock<Mutex<std::collections::HashMap<PathBuf, Connection>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_origin_disconnect(connection: Connection) -> Result<(), String> {
     let key = account(&connection)?;
     let mut active = connections().lock().await;
@@ -159,6 +180,14 @@ async fn start_worker(path: PathBuf, c: Connection) {
             .unwrap();
         let mut last_session = None;
         loop {
+            let guard = match record_guard(&path) {
+                Ok(guard) => guard,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(_) => break,
+            };
             let Ok(mut record) = read(&path) else { break };
             if record.rejected() {
                 break;
@@ -221,6 +250,7 @@ async fn start_worker(path: PathBuf, c: Connection) {
                     .get(path.parent().unwrap())
                     .cloned();
                 let Some(c) = connection else {
+                    drop(guard);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 };
@@ -275,12 +305,13 @@ async fn start_worker(path: PathBuf, c: Connection) {
             if record.acked == record.snapshot.sequence && record.snapshot.status != "active" {
                 break;
             }
+            drop(guard);
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         workers().lock().await.remove(&path);
     });
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_origin_list(connection: Connection) -> Result<Vec<Value>, String> {
     let root = account(&connection)?;
     if !root.exists() {
@@ -309,7 +340,7 @@ pub async fn local_origin_list(connection: Connection) -> Result<Vec<Value>, Str
     Ok(rows)
 }
 /// Remember what Core confirmed, so a restart without Core shows the same list.
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_origin_confirm(
     connection: Connection,
     confirmations: Vec<Confirmation>,
@@ -346,6 +377,11 @@ pub async fn local_origin_confirm(
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+        // Confirmations are retried by the next list refresh. Never replace a
+        // newer snapshot with a record read before a concurrent launch/sync.
+        let Ok(_guard) = record_guard(&path) else {
+            continue;
+        };
         let mut record = read(&path)?;
         let id = record.snapshot.origin.id.to_string();
         let local_pending = pending(&record);
@@ -359,7 +395,7 @@ pub async fn local_origin_confirm(
     }
     Ok(())
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_origin_launch(
     mut request: local_agents::StartRequest,
     draft: Draft,
@@ -375,17 +411,7 @@ pub async fn local_origin_launch(
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let key = uuid::Uuid::parse_str(&draft.key).map_err(|_| "Invalid draft identity")?;
     let path = root.join(format!("{key}.json"));
-    use fs2::FileExt;
-    let guard = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .read(true)
-        .open(root.join(format!("{key}.launch.lock")))
-        .map_err(|e| e.to_string())?;
-    guard
-        .try_lock_exclusive()
-        .map_err(|_| "This draft is already starting")?;
+    let _guard = record_guard(&path).map_err(|_| "This draft is already starting")?;
     if path.exists() {
         let record = read(&path)?;
         if record.snapshot.origin.prompt != draft.prompt
@@ -393,6 +419,7 @@ pub async fn local_origin_launch(
             || record.snapshot.origin.backend != request.harness
             || record.snapshot.origin.model != request.model
             || record.snapshot.origin.effort != request.effort
+            || record.snapshot.origin.fork_source_mission_id != draft.fork_source_mission_id
             || record.snapshot.origin.cwd != request.cwd
         {
             return Err("Draft identity already used".into());
@@ -403,29 +430,34 @@ pub async fn local_origin_launch(
     }
 
     // Serialize check-through-spawn for new origins. Same-draft replay above
-    // remains idempotent; different drafts cannot reserve the same directory.
+    // remains idempotent; overlapping folders require an explicit sharing choice.
     static LAUNCH: OnceLock<Mutex<()>> = OnceLock::new();
     let _launch = LAUNCH.get_or_init(|| Mutex::new(())).lock().await;
-    if local_agents::workspace_busy(Path::new(&request.cwd))? {
+    let busy = local_agents::workspace_busy(Path::new(&request.cwd))?;
+    if busy && !draft.share_folder {
         return Err("This directory already has a running local mission. Choose a separate directory or worktree.".into());
     }
 
-    crate::context_service::project_skills_prepare(
-        crate::context_service::Request {
-            endpoint: connection.api_url.clone(),
-            token: connection.token.clone(),
-            project: draft.project.clone(),
-            paths: vec![],
-        },
-        request.cwd.clone(),
-        request.harness.clone(),
-        Some(request.bin.clone()),
-    )
-    .await?;
+    // Do not rewrite shared harness configuration under a running chat.
+    if !busy {
+        crate::context_service::project_skills_prepare(
+            crate::context_service::Request {
+                endpoint: connection.api_url.clone(),
+                token: connection.token.clone(),
+                project: draft.project.clone(),
+                paths: vec![],
+            },
+            request.cwd.clone(),
+            request.harness.clone(),
+            Some(request.bin.clone()),
+        )
+        .await?;
+    }
 
     // Execution stays in the chosen directory; the journal above remains private.
     let snapshot = Snapshot {
         origin: Origin {
+            fork_source_mission_id: draft.fork_source_mission_id,
             cyber_access: request.cyber_access,
             id,
             run_id,
@@ -460,7 +492,11 @@ pub async fn local_origin_launch(
     write(&path, &record)?;
     crate::local_bindings(
         Some(id.to_string()),
-        Some(initial_binding(&request, &record.snapshot.origin)),
+        Some(initial_binding(
+            &request,
+            &record.snapshot.origin,
+            draft.share_folder,
+        )),
     )?;
     // Core must know the durable identity before it can issue this mission's
     // MCP grant. Registering the snapshot never dispatches a second harness.
@@ -492,10 +528,18 @@ pub async fn local_origin_launch(
         if receipt["ok"] != true {
             return Err("Core did not acknowledge the local mission".into());
         }
+        if let Some(source) = record.snapshot.origin.fork_source_mission_id {
+            if receipt["fork_source_mission_id"].as_str() != Some(source.to_string().as_str()) {
+                return Err("Update Core to enable read-only source-agent visibility before launching this fork".into());
+            }
+        }
         record.acked = record.snapshot.sequence;
         write(&path, &record)?;
         let started =
             crate::routed_opencode::start(request, &connection.api_url, &connection.token).await;
+        if started.is_ok() {
+            crate::agent_observation::start(id.to_string(), run_id, 1, connection.clone());
+        }
         if let Err(ref error) = started {
             record.snapshot.status = "failed".into();
             record.snapshot.sequence += 1;
@@ -544,6 +588,53 @@ pub async fn local_origin_launch(
 #[cfg(test)]
 mod rejection_tests {
     use super::*;
+    #[tokio::test]
+    async fn local_origin_refresh_cannot_interrupt_registration_before_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("draft.json");
+        let launch = record_guard(&path).unwrap();
+        let mut record: Record = serde_json::from_value(json!({
+            "snapshot": {"origin": {
+                "id": uuid::Uuid::new_v4(), "run_id": uuid::Uuid::new_v4(),
+                "client_id": uuid::Uuid::new_v4(), "title": "test", "project": "test",
+                "backend": "claudecode", "model": null, "cwd": "/tmp", "prompt": "test",
+                "created_at": "2026-09-30T00:00:00Z", "tags": []
+            }, "sequence": 1, "text": "", "status": "active", "error": null},
+            "acked": 1, "error": null
+        }))
+        .unwrap();
+        write(&path, &record).unwrap();
+        start_worker(
+            path.clone(),
+            Connection {
+                api_url: "invalid://no-network".into(),
+                token: "fixture".into(),
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let during = read(&path).unwrap();
+        assert_eq!(during.snapshot.status, "active");
+        assert_eq!(during.snapshot.sequence, 1);
+        assert!(during.error.is_none());
+        // Complete the launch transaction before releasing its lock. A queued
+        // observer must read this new state instead of writing its old snapshot.
+        record.snapshot.status = "awaiting_user".into();
+        record.snapshot.sequence = 2;
+        record.acked = 2;
+        write(&path, &record).unwrap();
+        drop(launch);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while workers().lock().await.contains(&path) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(read(&path).unwrap().snapshot.status, "awaiting_user");
+        connections().lock().await.remove(temp.path());
+    }
+
     #[test]
     fn local_origin_binding_and_view_preserve_initial_vibe_plan() {
         for (backend, prompt, plan) in [
@@ -570,10 +661,15 @@ mod rejection_tests {
                 prompt: prompt.into(),
                 ..Default::default()
             };
-            let binding = initial_binding(&request, &record.snapshot.origin);
+            let binding = initial_binding(&request, &record.snapshot.origin, false);
             // The launch persists this exact value before starting the native process.
             let restored: Value = serde_json::from_str(&binding.to_string()).unwrap();
             assert_eq!(restored["planMode"], plan);
+            assert_eq!(restored["shareFolder"], false);
+            assert_eq!(
+                initial_binding(&request, &record.snapshot.origin, true)["shareFolder"],
+                true
+            );
             assert_eq!(view(&record)["agent"].as_str(), plan.then_some("plan"));
             if backend == "vibe" {
                 let next_turn = crate::vibe::args(

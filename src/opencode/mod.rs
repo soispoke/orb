@@ -18,6 +18,8 @@
 //! The only timeout we apply is `DEFAULT_REQUEST_TIMEOUT` for initial HTTP connections,
 //! not for ongoing SSE streaming.
 
+pub(crate) mod effort;
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

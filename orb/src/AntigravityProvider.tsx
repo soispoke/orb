@@ -8,18 +8,22 @@ export function AntigravityProvider() {
   const [nodes, setNodes] = createSignal<string[]>([]);
   const [models, setModels] = createSignal<[string, string][]>([]);
   const [phase, setPhase] = createSignal<"loading" | "ready" | "error">("loading");
+  const [discoveryError, setDiscoveryError] = createSignal("");
   const [showModels, setShowModels] = createSignal(false);
   const modelsId = createUniqueId();
   let generation = 0, inventoryGeneration = 0, disposed = false;
   const refresh = async () => {
     const request = ++generation, version = connectionVersion(), target = machine();
-    setModels([]); setPhase("loading");
+    setModels([]); setDiscoveryError(""); setPhase("loading");
     try {
       const result = await listNodeAntigravityModels(target);
       if (disposed || request !== generation || version !== connectionVersion()) return;
       setModels(result); setPhase("ready");
-    } catch {
-      if (!disposed && request === generation && version === connectionVersion()) setPhase("error");
+    } catch (error) {
+      if (!disposed && request === generation && version === connectionVersion()) {
+        setDiscoveryError(error instanceof Error ? error.message : "Model discovery failed. Try refreshing.");
+        setPhase("error");
+      }
     }
   };
   createEffect(() => { machine(); connectionVersion(); void refresh(); });
@@ -51,7 +55,7 @@ export function AntigravityProvider() {
         <label class="p-native-machine">Machine <Select class="s-input" aria-label="Antigravity machine" value={machine()} onChange={event => setMachine(event.currentTarget.value)}>
           <option value="core">Core</option><For each={nodes()}>{node => <option value={node}>{node}</option>}</For>
         </Select></label>
-        <span class="s-row-desc" role="status">{phase() === "loading" ? "Checking machine…" : phase() === "error" ? "Machine unavailable" : models().length ? "Ready" : "No models available"}</span>
+        <span class="s-row-desc" role="status">{phase() === "loading" ? "Checking machine…" : phase() === "error" ? "Native runner not ready" : models().length ? "Ready" : "No models available"}</span>
         <button class="s-btn" disabled={phase() === "loading"} onClick={reload}>Refresh machines</button>
       </div>
       <Show when={phase() === "ready" && models().length}>
@@ -60,6 +64,6 @@ export function AntigravityProvider() {
         </button>
         <Show when={showModels()}><ul id={modelsId} class="p-native-models" aria-label="Antigravity models"><For each={models()}>{model => <li>{model[1]}</li>}</For></ul></Show>
       </Show>
-      <Show when={phase() === "error"}><p class="s-row-desc">Check this machine’s connection and Antigravity sign-in, then refresh.</p></Show>
+      <Show when={phase() === "error"}><p class="s-row-desc">{discoveryError()} This check is for native execution; connecting a subscription does not install or sign in the native runner.</p></Show>
   </section>;
 }

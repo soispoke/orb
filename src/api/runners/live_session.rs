@@ -115,7 +115,7 @@ pub(crate) fn effort_request(effort: Option<&str>) -> Value {
     serde_json::json!({
         "type": "control_request",
         "request_id": format!("orb-effort-{}", Uuid::new_v4()),
-        "request": { "subtype": "apply_flag_settings", "settings": { "effortLevel": effort } }
+        "request": { "subtype": "apply_flag_settings", "settings": { "effortLevel": if effort == Some("ultracode") { Some("xhigh") } else { effort }, "ultracode": effort == Some("ultracode") } }
     })
 }
 
@@ -154,7 +154,7 @@ impl Drop for SessionGuard {
 #[derive(Default)]
 pub(crate) struct ClaudeBackground {
     tasks: HashSet<String>,
-    has_snapshot: bool,
+    terminal_tasks: HashSet<String>,
 }
 
 impl ClaudeBackground {
@@ -165,22 +165,46 @@ impl ClaudeBackground {
         match event["subtype"].as_str() {
             Some("background_tasks_changed") => {
                 if let Some(tasks) = event["tasks"].as_array() {
-                    self.has_snapshot = true;
+                    for task in tasks {
+                        if matches!(
+                            task["status"].as_str(),
+                            Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
+                        ) {
+                            if let Some(id) = task["task_id"].as_str() {
+                                self.terminal_tasks.insert(id.into());
+                            }
+                        }
+                    }
                     self.tasks = tasks
                         .iter()
                         .filter(|task| task["ambient"] != true)
-                        .filter_map(|task| task["task_id"].as_str().map(str::to_owned))
+                        .filter(|task| {
+                            !matches!(
+                                task["status"].as_str(),
+                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
+                            )
+                        })
+                        .filter_map(|task| task["task_id"].as_str())
+                        .filter(|id| !self.terminal_tasks.contains(*id))
+                        .map(str::to_owned)
                         .collect();
                 }
             }
-            Some("task_started") if !self.has_snapshot && event["ambient"] != true => {
+            Some("task_started") if event["ambient"] != true => {
                 if let Some(id) = event["task_id"].as_str() {
-                    self.tasks.insert(id.into());
+                    if !self.terminal_tasks.contains(id) {
+                        self.tasks.insert(id.into());
+                    }
                 }
             }
-            Some("task_notification") if !self.has_snapshot => {
+            Some("task_notification")
+                if !event["summary"].as_str().is_some_and(|s| {
+                    super::subagents::claude_task_status::session_end_notice(s).is_some()
+                }) =>
+            {
                 if let Some(id) = event["task_id"].as_str() {
                     self.tasks.remove(id);
+                    self.terminal_tasks.insert(id.into());
                 }
             }
             _ => {}
@@ -207,12 +231,28 @@ mod tests {
             "tasks":[{"task_id":"b"},{"task_id":"c","ambient":true}]}),
         );
         assert_eq!(background.running(), 1);
-        // Edges are ignored once the CLI sends snapshots.
+        // A terminal edge remains authoritative even after snapshots begin.
         background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"b"}));
+        assert_eq!(background.running(), 0);
+        background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b"}]}));
+        assert_eq!(background.running(), 0);
+        background.consume(&json!({"type":"system","subtype":"task_started","task_id":"d"}));
         assert_eq!(background.running(), 1);
         background
             .consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}));
         assert_eq!(background.running(), 0);
+    }
+
+    #[test]
+    fn terminal_snapshot_entries_do_not_keep_the_runner_parked() {
+        let mut background = ClaudeBackground::default();
+        background.consume(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_id":"a","status":"completed"},{"task_id":"b","status":"failed"},
+                {"task_id":"c","status":"stopped"},{"task_id":"d","status":"running"}
+            ]}),
+        );
+        assert_eq!(background.running(), 1);
     }
 
     #[test]
@@ -251,6 +291,14 @@ mod tests {
         assert_eq!(request["request"]["subtype"], "apply_flag_settings");
         assert_eq!(request["request"]["settings"]["effortLevel"], "xhigh");
         assert!(effort_request(None)["request"]["settings"]["effortLevel"].is_null());
+        let ultra = effort_request(Some("ultracode"));
+        assert_eq!(ultra["request"]["settings"]["effortLevel"], "xhigh");
+        assert_eq!(ultra["request"]["settings"]["ultracode"], true);
+        assert_eq!(request["request"]["settings"]["ultracode"], false);
+        assert_eq!(
+            effort_request(None)["request"]["settings"]["ultracode"],
+            false
+        );
     }
 
     #[test]
@@ -280,5 +328,23 @@ mod tests {
         drop(guard);
         assert!(!is_attached(mission));
         assert_eq!(deliver(mission, "later".into()), Err("later".into()));
+    }
+}
+
+#[cfg(test)]
+mod recovery_notice_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn ambiguous_notice_does_not_close_or_poison_a_parked_session() {
+        let mut state = ClaudeBackground::default();
+        let lost = json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Background agent \"Proof check\" didn't finish before the previous session ended"});
+        state.consume(&lost);
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a"}));
+        assert_eq!(state.running(), 1);
+        state.consume(&lost);
+        assert_eq!(state.running(), 1);
+        state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"completed"}));
+        assert_eq!(state.running(), 0);
     }
 }

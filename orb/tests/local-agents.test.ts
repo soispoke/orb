@@ -1,11 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
-import { isSecretPath, quotePath, rewritePrompt, materializeMentions } from "../src/localAgents";
+import { isSecretPath, quotePath, rewritePrompt, materializeMentions, localInputToken } from "../src/localAgents";
+import { LiveInputUnavailable } from "../src/liveInputAvailability";
 import type { AttachChip } from "../src/attach";
 
 vi.mock('../src/cyberAccess', async importOriginal => ({
   ...await importOriginal<typeof import('../src/cyberAccess')>(),
   getCyber: vi.fn(async () => ({mode:'automatic',status:'requested',revision:'legacy'})),
 }));
+
+it.each(['unsupported worker', 'missing adapter', 'unreachable worker'])('reports %s before writing any session input', async reason => {
+ const host=window as any, previous=host.__TAURI_INTERNALS__, previousApi=host.__TAURI__;
+ const invoke=vi.fn(async()=>{
+   if(reason==='missing adapter')return {};
+   throw new Error(reason);
+ });
+ host.__TAURI__=undefined;host.__TAURI_INTERNALS__={invoke};
+ try {
+   await expect(localInputToken('mission')).rejects.toBeInstanceOf(LiveInputUnavailable);
+   expect(invoke).toHaveBeenCalledExactlyOnceWith('local_agents_input_status',{id:'mission'});
+ } finally {host.__TAURI_INTERNALS__=previous;host.__TAURI__=previousApi;}
+});
 
 describe("local mention rewrite", () => {
   it("leaves unknown @words and rewrites a copied file", () => {
@@ -368,3 +382,16 @@ it('does not mark a local run settled when native recovery is blocked by a runni
   }
 });
 
+
+it('fails closed on a strict transfer scan instead of trusting a cached CLI',async()=>{
+ const {refreshLocalAgents}=await import('../src/localAgents');
+ const host=window as any,previous=host.__TAURI__;
+ const invoke=vi.fn().mockResolvedValue([{id:'claudecode',bin:'claude',path:'/claude',installed:true}]);
+ host.__TAURI__={core:{invoke}};
+ try {
+  await refreshLocalAgents(true);
+  invoke.mockRejectedValue(new Error('Native scan failed'));
+  await expect(refreshLocalAgents(true,true)).rejects.toThrow('Native scan failed');
+  expect((await refreshLocalAgents(true))[0].id).toBe('claudecode');
+ }finally{host.__TAURI__=previous;}
+});

@@ -137,6 +137,17 @@ CREATE TABLE IF NOT EXISTS unrouted_deliveries (
 -- deliveries), so a slug typo forks a phantom project and nothing owns the
 -- project's own state. This table makes the project an object: it exists
 -- because a row says so, and its mode/blocker are columns, not a parsed trailer.
+CREATE TABLE IF NOT EXISTS native_agent_observations_v1 (
+    owner TEXT NOT NULL, mission_id TEXT NOT NULL, run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL, sequence INTEGER NOT NULL, observed_at TEXT NOT NULL, snapshot TEXT NOT NULL,
+    PRIMARY KEY(owner,mission_id)
+);
+
+CREATE TABLE IF NOT EXISTS fork_observations_v1 (
+    owner TEXT NOT NULL, fork_id TEXT NOT NULL, source_id TEXT NOT NULL,
+    PRIMARY KEY(owner,fork_id), CHECK(fork_id<>source_id)
+);
+
 CREATE TABLE IF NOT EXISTS projects (
     slug               TEXT PRIMARY KEY NOT NULL,
     title              TEXT,

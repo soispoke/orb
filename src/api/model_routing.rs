@@ -328,7 +328,7 @@ async fn resolve_chain(
     ))
 }
 
-/// POST /api/model-routing/chains/:id/test - Send a 1-token test request
+/// POST /api/model-routing/chains/:id/test - Send a bounded test request
 /// through a chain.
 ///
 /// Runs behind the dashboard JWT (unlike `/v1/chat/completions`, which
@@ -341,7 +341,7 @@ pub struct TestChainQuery {
     pub all: bool,
 }
 
-/// One entry's liveness, from a real 1-token request to that exact upstream.
+/// One entry's liveness, from a bounded completion request to that exact upstream.
 #[derive(Debug, Serialize)]
 struct EntryProbe {
     provider_id: String,
@@ -366,8 +366,8 @@ async fn probe_entry(
     let qualified = format!("{provider_id}/{model_id}");
     let body = serde_json::json!({
         "model": qualified,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "Reply only OK"}],
+        "max_tokens": 32,
     });
     let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).expect("probe body serializes"));
 
@@ -449,8 +449,8 @@ async fn test_chain(
 
     let body = serde_json::json!({
         "model": id,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "Reply only OK"}],
+        "max_tokens": 32,
     });
     let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).expect("test body serializes"));
     let response = super::proxy::chat_completions_inner(

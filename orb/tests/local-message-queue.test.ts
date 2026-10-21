@@ -1,14 +1,15 @@
 import {createRoot,createComputed} from 'solid-js';
 import {afterEach,beforeEach,expect,it,vi} from 'vitest';
-const mocks=vi.hoisted(()=>({store:new Map<string,unknown>(),active:true,effort:undefined as string|null|undefined,acknowledged:false,reopen:vi.fn(),launch:vi.fn(),follow:vi.fn(),save:vi.fn(),status:vi.fn(),append:vi.fn(),version:1,recover:vi.fn(),failure:vi.fn(),poll:vi.fn(),stopNative:vi.fn()}));
-vi.mock('../src/api',()=>({connectionVersion:()=>mocks.version,reopenMission:mocks.reopen,getMission:async()=>({status:mocks.acknowledged?'acknowledged':mocks.active?'active':'awaiting_user',tags:['placement:client'],model_effort:mocks.effort}),appendClientTranscript:mocks.append,setClientMissionStatus:mocks.status}));
+const mocks=vi.hoisted(()=>({store:new Map<string,unknown>(),active:true,missing:false,missionRead:vi.fn(),unavailable:"",paused:false,api:vi.fn(),effort:undefined as string|null|undefined,acknowledged:false,reopen:vi.fn(),launch:vi.fn(),follow:vi.fn(),save:vi.fn(),status:vi.fn(),append:vi.fn(),version:1,recover:vi.fn(),failure:vi.fn(),poll:vi.fn(),stopNative:vi.fn(),token:vi.fn(),steer:vi.fn()}));
+vi.mock('../src/api',()=>({api:mocks.api,connectionVersion:()=>mocks.version,reopenMission:mocks.reopen,getMission:async(id:string)=>{mocks.missionRead(id);if(mocks.missing&&id==='mission')throw Object.assign(new Error('Mission not found'),{status:404});if(id===mocks.unavailable)throw Error('Unavailable mission');return {status:mocks.paused?'paused':mocks.acknowledged?'acknowledged':mocks.active?'active':'awaiting_user',tags:['placement:client'],model_effort:mocks.effort};},appendClientTranscript:mocks.append,setClientMissionStatus:mocks.status}));
 vi.mock('../src/sideQuestionStorage',()=>({sideQuestionKey:()=>`account:${mocks.version}`}));
 vi.mock('../src/composerDrafts',()=>({readSideThread:async(k:string)=>structuredClone(mocks.store.get(k)),saveSideThread:async(k:string,v:unknown)=>{mocks.save();mocks.store.set(k,structuredClone(v));}}));
-vi.mock('../src/localAgents',()=>({recoverLocalLaunch:mocks.recover,recordLocalFailure:mocks.failure,restoreLocalBindings:async()=>{},localBinding:()=>({cwd:'/work',sessionId:'latest',planMode:false}),pollLocal:mocks.poll,reconcileLocalRun:async()=>{},startLocal:mocks.launch,followLocal:mocks.follow,stopLocal:mocks.stopNative}));
-import {enqueueLocalMessage,queuedLocalMessages,startLocalQueueWorker,removeQueuedMessage,takeQueuedMessage,sendQueuedNow,retryQueuedMessage,resumedPrompt,holdQueuedMessage,releaseQueuedMessage,prioritizeQueuedMessage,cancelQueuedWakeups,captureWakeupFences,confirmWakeupStops,cutByConnection} from '../src/localMessageQueue';
+vi.mock('../src/clientRuns',()=>({clientRunReceipt:async()=>({run_id:'r',generation:1})}));
+vi.mock('../src/localAgents',()=>({localLiveText:()=>"Before steering",localActivities:()=>[],localInputToken:mocks.token,steerLocal:mocks.steer,recoverLocalLaunch:mocks.recover,recordLocalFailure:mocks.failure,restoreLocalBindings:async()=>{},localBinding:()=>({cwd:'/work',sessionId:'latest',planMode:false}),pollLocal:mocks.poll,reconcileLocalRun:async()=>{},startLocal:mocks.launch,followLocal:mocks.follow,stopLocal:mocks.stopNative}));
+import {enqueueLocalMessage,localSteeringPending,queuedLocalMessages,startLocalQueueWorker,removeQueuedMessage,takeQueuedMessage,sendQueuedNow,wakeLocalQueue,retryQueuedMessage,resumedPrompt,holdQueuedMessage,releaseQueuedMessage,prioritizeQueuedMessage,cancelQueuedWakeups,captureWakeupFences,confirmWakeupStops,cutByConnection} from '../src/localMessageQueue';
 const request={id:'mission',harness:'claudecode',bin:'claude',cwd:'/work',prompt:'first'};
 let stop:(()=>void)|undefined;
-beforeEach(()=>{mocks.effort=undefined;vi.useFakeTimers();mocks.poll.mockReset().mockImplementation(async()=>({done:!mocks.active}));mocks.stopNative.mockReset().mockImplementation(async()=>{mocks.active=false;});mocks.acknowledged=false;mocks.reopen.mockReset().mockResolvedValue(undefined);mocks.store.clear();mocks.recover.mockReset().mockResolvedValue(undefined);mocks.failure.mockReset();mocks.version=1;mocks.active=true;mocks.launch.mockReset().mockResolvedValue({run_id:'r',generation:1});mocks.follow.mockReset().mockResolvedValue({done:true,text:'Done',exit_code:0});mocks.save.mockReset();mocks.status.mockReset();mocks.append.mockReset().mockResolvedValue(undefined);Object.defineProperty(navigator,'locks',{configurable:true,value:{request:async(_key:string,options:unknown,fn?: (lock:unknown)=>unknown)=>fn?fn({name:_key}):(options as ()=>unknown)()}});});
+beforeEach(()=>{mocks.missing=false;mocks.missionRead.mockReset();mocks.unavailable="";mocks.paused=false;mocks.api.mockReset().mockImplementation(async()=>{mocks.paused=false;});mocks.token.mockReset().mockResolvedValue('session-token');mocks.steer.mockReset().mockResolvedValue(undefined);mocks.effort=undefined;vi.useFakeTimers();mocks.poll.mockReset().mockImplementation(async()=>({done:!mocks.active}));mocks.stopNative.mockReset().mockImplementation(async()=>{mocks.active=false;});mocks.acknowledged=false;mocks.reopen.mockReset().mockResolvedValue(undefined);mocks.store.clear();mocks.recover.mockReset().mockResolvedValue(undefined);mocks.failure.mockReset();mocks.version=1;mocks.active=true;mocks.launch.mockReset().mockResolvedValue({run_id:'r',generation:1});mocks.follow.mockReset().mockResolvedValue({done:true,text:'Done',exit_code:0});mocks.save.mockReset();mocks.status.mockReset();mocks.append.mockReset().mockResolvedValue(undefined);Object.defineProperty(navigator,'locks',{configurable:true,value:{request:async(_key:string,options:unknown,fn?: (lock:unknown)=>unknown)=>fn?fn({name:_key}):(options as ()=>unknown)()}});});
 afterEach(()=>{stop?.();vi.useRealTimers();});
 it('retains a Vibe plan command when a build-mode mission automatically resumes its interrupted followup',async()=>{
  mocks.active=false;
@@ -30,8 +31,8 @@ it('retains a Vibe plan command when a build-mode mission automatically resumes 
  expect(queuedLocalMessages('mission')).toHaveLength(0);
 });
 it('preserves goal commands during recovery without treating /planet as a mode',()=>{
- expect(resumedPrompt('  /goal Finish the audit')).toMatch(/^\/goal Finish the audit\n\nOrb restarted/);
- expect(resumedPrompt('/planet Inspect the repository')).toMatch(/^Orb restarted/);
+ expect(resumedPrompt('  /goal Finish the audit')).toMatch(/^\/goal Finish the audit\n\nThe previous local run/);
+ expect(resumedPrompt('/planet Inspect the repository')).toMatch(/^The previous local run/);
  expect(resumedPrompt('/planet Inspect the repository')).toMatch(/\n\n\/planet Inspect the repository$/);
 });
 it('persists active-run followups and drains them in order using the latest session',async()=>{
@@ -40,12 +41,12 @@ it('persists active-run followups and drains them in order using the latest sess
  mocks.active=false;window.dispatchEvent(new Event('orb:queue-wake'));await vi.advanceTimersByTimeAsync(2500);
  expect(mocks.launch.mock.calls.map(c=>c[0].prompt)).toEqual(['first','second']);expect(mocks.launch.mock.calls[0][0].sessionId).toBe('latest');expect(queuedLocalMessages('mission')).toEqual([]);
 });
-it('restores the queue after remount, permits removal, and Send now stops before sending',async()=>{
+it('restores the queue after remount and steers without stopping or launching',async()=>{
  await enqueueLocalMessage(request,'first');await enqueueLocalMessage({...request,prompt:'second'},'second');
  stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(100);stop();
  stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(100);expect(queuedLocalMessages('mission')).toHaveLength(2);
  await removeQueuedMessage(queuedLocalMessages('mission')[1].id);await sendQueuedNow('mission');await vi.advanceTimersByTimeAsync(1100);
- expect(mocks.recover).toHaveBeenCalledWith('mission');expect(mocks.launch).toHaveBeenCalledTimes(1);
+ expect(mocks.steer).toHaveBeenCalledTimes(1);expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.recover).not.toHaveBeenCalled();expect(mocks.launch).not.toHaveBeenCalled();
 });
 it('does not silently replay an uncertain launch or let later messages overtake it',async()=>{
  mocks.active=false;mocks.launch.mockRejectedValue(new Error('connection lost'));
@@ -82,17 +83,18 @@ it('keeps accepted messages durable across sync failure and never launches them 
  mocks.append.mockResolvedValue(undefined);window.dispatchEvent(new Event('online'));await vi.advanceTimersByTimeAsync(1000);
  expect(mocks.launch).toHaveBeenCalledTimes(1);expect(queuedLocalMessages('mission')).toHaveLength(0);
 });
-it('saves a stopped partial answer before closing the run receipt and releasing the next message',async()=>{
+it('saves a naturally completed answer before closing the receipt and releasing the next message',async()=>{
  mocks.active=false;let finish!:(value:unknown)=>void;
  mocks.follow.mockImplementationOnce(()=>new Promise(resolve=>finish=resolve));
  stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first');await vi.advanceTimersByTimeAsync(1);
  await enqueueLocalMessage({...request,prompt:'second'},'second');
  const stopping=sendQueuedNow('mission');await vi.advanceTimersByTimeAsync(1);
- finish({done:true,text:'Partial answer worth keeping',exit_code:143});await stopping;await vi.advanceTimersByTimeAsync(1);
+ finish({done:true,text:'Partial answer worth keeping',exit_code:0});await stopping;await vi.advanceTimersByTimeAsync(1);
  const partial=mocks.append.mock.calls.findIndex(c=>c[1]==='assistant'&&c[2]==='Partial answer worth keeping');
  expect(partial).toBeGreaterThanOrEqual(0);
  expect(mocks.append.mock.invocationCallOrder[partial]).toBeLessThan(mocks.status.mock.invocationCallOrder[0]);
- expect(mocks.status.mock.calls[0][1]).toBe('interrupted');
+ expect(mocks.status.mock.calls[0][1]).toBe('awaiting_user');
+ expect(mocks.stopNative).not.toHaveBeenCalled();
  expect(mocks.launch).toHaveBeenCalledTimes(2);
 });
 
@@ -110,7 +112,7 @@ it('retains the real native failure even when the agent produced partial output'
  mocks.active=false;mocks.follow.mockResolvedValue({done:true,text:'Partial',exit_code:0,error:'goal objective must be at most 4000 characters'});
  stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first');await vi.advanceTimersByTimeAsync(10);
  expect(mocks.failure).toHaveBeenCalledWith('mission','goal objective must be at most 4000 characters');
- expect(mocks.status).toHaveBeenCalledWith('mission','failed',expect.anything());
+ expect(mocks.status).toHaveBeenCalledWith('mission','failed',expect.anything(),undefined,'goal objective must be at most 4000 characters');
 });
 
 it('editing removes only a still-unsent message and rejects stale edits',async()=>{
@@ -181,7 +183,7 @@ it('makes a closed receipt recoverable without replaying it in the background',a
 it('Send now recovers an already-ended run without trying to close a missing receipt',async()=>{
  mocks.active=false;mocks.status.mockRejectedValue(new Error('409 No active run on this computer'));
  await enqueueLocalMessage(request,'next');
- await expect(sendQueuedNow('mission')).resolves.toBeUndefined();
+ await expect(sendQueuedNow('mission')).resolves.toBe('queued');
  expect(mocks.recover).toHaveBeenCalledWith('mission');
  expect(mocks.status).not.toHaveBeenCalled();
 });
@@ -340,23 +342,26 @@ it('Send now retries the message that needs attention before the ones behind it'
  expect(mocks.launch.mock.calls.map(call=>call[0].prompt)).toEqual(['first','first','second']);
  expect(queuedLocalMessages('mission')).toHaveLength(0);
 });
-it('a turn that only waits for a background task yields to a waiting message after ten minutes',async()=>{
- mocks.poll.mockImplementation(async()=>({done:!mocks.active,waiting_since:mocks.active?Date.now()-5*60_000:null}));
- stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first');await vi.advanceTimersByTimeAsync(31000);
- expect(mocks.stopNative).not.toHaveBeenCalled();
- mocks.poll.mockImplementation(async()=>({done:!mocks.active,waiting_since:mocks.active?Date.now()-11*60_000:null}));
- await vi.advanceTimersByTimeAsync(31000);
- expect(mocks.stopNative).toHaveBeenCalledWith('mission',{cancelWakeups:false});
+it.each([false,true])('never interrupts old background work for a queued message (scheduled=%s)',async(scheduled)=>{
+ mocks.poll.mockImplementation(async()=>({done:!mocks.active,waiting_since:mocks.active?Date.now()-24*60*60_000:null}));
+ stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first',{scheduled});await vi.advanceTimersByTimeAsync(31000);
+ expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.launch).not.toHaveBeenCalled();
+ expect(queuedLocalMessages('mission')[0].state).toBe('queued');
+ wakeLocalQueue();await vi.advanceTimersByTimeAsync(100);
+ expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.launch).not.toHaveBeenCalled();
+ mocks.active=false;window.dispatchEvent(new Event('orb:queue-wake'));await vi.advanceTimersByTimeAsync(100);
  expect(mocks.launch).toHaveBeenCalledTimes(1);
 });
-it('a followed turn that only waits for a background task yields to the message behind it',async()=>{
+it('keeps a followed background run alive until it actually finishes',async()=>{
  mocks.active=false;let finish!:(value:unknown)=>void;
  mocks.follow.mockImplementationOnce(()=>new Promise(resolve=>finish=resolve));
  stop=startLocalQueueWorker();await enqueueLocalMessage(request,'first');await vi.advanceTimersByTimeAsync(50);
- mocks.active=true;mocks.stopNative.mockImplementation(async()=>{mocks.active=false;finish({text:'Partial',done:true,exit_code:0,resumed:true});});
- mocks.poll.mockImplementation(async()=>({done:!mocks.active,waiting_since:mocks.active?Date.now()-11*60_000:null}));
+ mocks.active=true;
+ mocks.poll.mockImplementation(async()=>({done:!mocks.active,waiting_since:mocks.active?Date.now()-24*60*60_000:null}));
  await enqueueLocalMessage({...request,prompt:'second'},'second');await vi.advanceTimersByTimeAsync(31000);
- expect(mocks.stopNative).toHaveBeenCalledWith('mission',{cancelWakeups:false});
+ expect(mocks.stopNative).not.toHaveBeenCalled();
+ expect(mocks.launch.mock.calls.map(call=>call[0].prompt)).toEqual(['first']);
+ mocks.active=false;finish({text:'Finished',done:true,exit_code:0,resumed:true});await vi.advanceTimersByTimeAsync(100);
  expect(mocks.launch.mock.calls.map(call=>call[0].prompt)).toEqual(['first','second']);
 });
 it('sends again a message that failed only because nothing could be reached',async()=>{
@@ -405,17 +410,33 @@ it('keeps a busy-directory child queued and retries after the directory is relea
  expect(queuedLocalMessages('mission')).toHaveLength(0);
 });
 
-it('Send now preserves a scheduled continuation while stopping the preceding process',async()=>{
+it('steering preserves scheduled continuations and the original process',async()=>{
+ const id=await enqueueLocalMessage({...request,prompt:'status'},'status');
  await enqueueLocalMessage({...request,prompt:'scheduled continuation'},'scheduled continuation',{scheduled:true,delegated:true});
- mocks.stopNative.mockImplementation(async(mission,options)=>{
-  mocks.active=false;
-  if(options?.cancelWakeups!==false)await import('../src/localMessageQueue').then(m=>m.cancelQueuedWakeups(mission));
- });
  stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(100);
- await sendQueuedNow('mission');await vi.advanceTimersByTimeAsync(1500);
- expect(mocks.stopNative).toHaveBeenCalledWith('mission',{cancelWakeups:false});
- expect(mocks.launch).toHaveBeenCalledTimes(1);
- expect(mocks.launch.mock.calls[0][0].prompt).toBe('scheduled continuation');
+ await sendQueuedNow('mission',id);await vi.advanceTimersByTimeAsync(1500);
+ expect(mocks.steer).toHaveBeenCalledWith('mission','session-token',id,'status');
+ expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.launch).not.toHaveBeenCalled();
+ expect(queuedLocalMessages('mission')).toMatchObject([{text:'scheduled continuation',scheduled:true}]);
+});
+
+it.each(['claudecode','codex','grok','opencode','antigravity','vibe'])('unsupported %s never falls back to stop/restart',async harness=>{
+ mocks.token.mockRejectedValue(new Error('No adapter; remains queued'));
+ const id=await enqueueLocalMessage({...request,harness},'eta');
+ await expect(sendQueuedNow('mission',id)).rejects.toThrow('remains queued');
+ expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.recover).not.toHaveBeenCalled();expect(mocks.launch).not.toHaveBeenCalled();
+ expect(queuedLocalMessages('mission')[0]).toMatchObject({id,state:'queued'});
+});
+
+it('persists uncertain steering and never replays it after reopening',async()=>{
+ const id=await enqueueLocalMessage(request,'status');
+ mocks.steer.mockRejectedValue(new Error('IPC disconnected'));
+ await expect(sendQueuedNow('mission',id)).rejects.toThrow('IPC disconnected');
+ expect(localSteeringPending('mission',id)).toBe(false);
+ mocks.active=false;stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(3000);
+ await expect(retryQueuedMessage(id)).rejects.toThrow('cannot be replayed');
+ expect(mocks.launch).not.toHaveBeenCalled();expect(mocks.recover).not.toHaveBeenCalled();
+ expect(queuedLocalMessages('mission')[0]).toMatchObject({steerToken:'session-token',state:'error'});
 });
 
 it('fences a fetched wake-up across Stop, Core acknowledgement and replay',async()=>{
@@ -466,7 +487,7 @@ it('settles a scheduled occurrence when connection retries are exhausted',async(
  stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(65000);
  expect(mocks.launch).toHaveBeenCalledTimes(4);
  expect(mocks.status.mock.calls.slice(0,3).every(call=>call.length===3)).toBe(true);
- expect(mocks.status.mock.calls.at(-1)).toEqual(['mission','failed',expect.anything(),id]);
+ expect(mocks.status.mock.calls.at(-1)).toEqual(['mission','failed',expect.anything(),id,'Local process exited with code 1']);
  expect(queuedLocalMessages('mission')).toHaveLength(0);
 });
 
@@ -589,4 +610,106 @@ it.each(['high', null])('uses the current Antigravity effort at dispatch, includ
  window.dispatchEvent(new Event('orb:queue-wake'));await vi.advanceTimersByTimeAsync(10);
  expect(mocks.launch).toHaveBeenCalledTimes(1);
  expect(mocks.launch.mock.calls[0][0]).toMatchObject({harness:'antigravity',model:'agy-demo',effort:effort??undefined,sessionId:'latest'});
+});
+
+it('persists the actual harness failure with the terminal status', async () => {
+ mocks.active=false;
+ const error='Unrecognized flag: --dir in command opencode run';
+ mocks.follow.mockResolvedValueOnce({done:true,text:'',exit_code:1,error});
+ stop=startLocalQueueWorker();
+ await enqueueLocalMessage(request,'hello');
+ await vi.advanceTimersByTimeAsync(1500);
+ expect(mocks.status).toHaveBeenCalledWith('mission','failed',expect.anything(),undefined,error);
+});
+
+
+it('reports acceptance only after an acknowledged steer and transcript receipt',async()=>{
+ const id=await enqueueLocalMessage(request,'status');
+ await expect(sendQueuedNow('mission',id)).resolves.toBe('accepted');
+ expect(mocks.steer).toHaveBeenCalledExactlyOnceWith('mission','session-token',id,'first');
+ expect(mocks.append).toHaveBeenCalledWith('mission','user','status',id,{run_id:'r',generation:1});
+});
+it('does not turn an empty idle queue into a successful delivery receipt',async()=>{
+ mocks.active=false;
+ await expect(sendQueuedNow('mission')).resolves.toBe('unconfirmed');
+ expect(mocks.recover).not.toHaveBeenCalled();expect(mocks.steer).not.toHaveBeenCalled();
+});
+it('does not report concurrent steering as accepted before the real acknowledgement',async()=>{
+ const id=await enqueueLocalMessage(request,'status');
+ let acknowledge!:()=>void;
+ mocks.steer.mockImplementation(()=>new Promise<void>(resolve=>{acknowledge=resolve;}));
+ const first=sendQueuedNow('mission',id);
+ await vi.advanceTimersByTimeAsync(1);
+ expect(localSteeringPending('mission',id)).toBe(true);
+ expect(localSteeringPending('other-mission',id)).toBe(false);
+ expect(queuedLocalMessages('mission')[0]).toMatchObject({state:'error',steerToken:'session-token'});
+ await expect(sendQueuedNow('mission',id)).resolves.toBe('unconfirmed');
+ acknowledge();await expect(first).resolves.toBe('accepted');
+ expect(localSteeringPending('mission',id)).toBe(false);
+ expect(mocks.steer).toHaveBeenCalledTimes(1);
+});
+it('discards an old connection receipt without claiming delivery in the new view',async()=>{
+ const id=await enqueueLocalMessage(request,'status');
+ mocks.token.mockImplementation(async()=>{mocks.version=2;return 'old-token';});
+ await expect(sendQueuedNow('mission',id)).resolves.toBe('unconfirmed');
+ expect(mocks.steer).not.toHaveBeenCalled();expect(mocks.append).not.toHaveBeenCalled();
+});
+
+it('keeps a paused queue and interrupted recovery stopped across worker remounts',async()=>{
+ mocks.active=false;
+ const id=await enqueueLocalMessage(request,'saved question');
+ mocks.paused=true;
+ stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(4000);stop();
+ stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(4000);
+ expect(mocks.launch).not.toHaveBeenCalled();expect(queuedLocalMessages('mission')[0]).toMatchObject({id,state:'queued'});
+ await sendQueuedNow('mission',id);await vi.advanceTimersByTimeAsync(100);
+ expect(mocks.api).toHaveBeenCalledWith('/api/control/missions/mission/status',expect.objectContaining({body:JSON.stringify({status:'awaiting_user'})}));
+ expect(mocks.launch).toHaveBeenCalledTimes(1);
+});
+it('a scheduled wake cannot release a pause but a new user message can',async()=>{
+ mocks.active=false;mocks.paused=true;
+ await enqueueLocalMessage(request,'wake',{scheduled:true,delegated:true});
+ expect(mocks.api).not.toHaveBeenCalled();
+ await enqueueLocalMessage({...request,prompt:'continue'},'continue');
+ expect(mocks.api).toHaveBeenCalledTimes(1);
+});
+
+it('an unavailable historical mission cannot block another conversation queue',async()=>{
+ mocks.active=false;
+ await enqueueLocalMessage({...request,id:'old-mission'},'old question');
+ await enqueueLocalMessage(request,'new question');
+ mocks.unavailable='old-mission';
+ stop=startLocalQueueWorker();await vi.advanceTimersByTimeAsync(1000);
+ expect(mocks.launch).toHaveBeenCalledTimes(1);
+ expect(mocks.launch.mock.calls[0][0].id).toBe('mission');
+ expect(queuedLocalMessages('old-mission')).toHaveLength(1);
+});
+
+it('persists the transcript boundary before stdin and retains acceptance when sync fails',async()=>{
+ await enqueueLocalMessage(request,'question');
+ mocks.steer.mockImplementation(async()=>{
+  const records=[...mocks.store.entries()].find(([key])=>key.startsWith('local-transcript:'))?.[1] as any[];
+  expect(records).toEqual([expect.objectContaining({before:'Before steering',accepted:false,runId:'r'})]);
+ });
+ mocks.append.mockRejectedValueOnce(Error('offline'));
+ await expect(sendQueuedNow('mission')).rejects.toThrow('offline');
+ const records=[...mocks.store.entries()].find(([key])=>key.startsWith('local-transcript:'))?.[1] as any[];
+ expect(records[0]).toMatchObject({accepted:true,text:'question'});
+ expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.launch).not.toHaveBeenCalled();
+});
+
+it('backs off missing missions without discarding input or blocking other chats',async()=>{
+ await enqueueLocalMessage(request,'saved missing mission input');
+ await enqueueLocalMessage({...request,id:'other'},'other chat');
+ mocks.missing=true;mocks.missionRead.mockClear();
+ stop=startLocalQueueWorker();
+ await vi.advanceTimersByTimeAsync(59_000);
+ const reads=(id:string)=>mocks.missionRead.mock.calls.filter(call=>call[0]===id).length;
+ expect(reads('mission')).toBeLessThanOrEqual(4);
+ expect(reads('other')).toBeGreaterThan(10);
+ expect(queuedLocalMessages('mission')[0]).toMatchObject({text:'saved missing mission input',state:'queued'});
+ expect(mocks.launch).not.toHaveBeenCalled();expect(mocks.stopNative).not.toHaveBeenCalled();expect(mocks.recover).not.toHaveBeenCalled();
+ const before=reads('mission');mocks.missing=false;
+ window.dispatchEvent(new Event('online'));await vi.advanceTimersByTimeAsync(1);
+ expect(reads('mission')).toBeGreaterThan(before);
 });

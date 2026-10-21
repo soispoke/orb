@@ -6,6 +6,8 @@
   <string>Orb</string>
   <key>CFBundleIconFile</key>
   <string>Orb.icns</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Orb connects to your selected backend and execution machines on your local or private network.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Orb uses the microphone to dictate prompts. Audio is transcribed on this Mac and never leaves it.</string>
 </dict>

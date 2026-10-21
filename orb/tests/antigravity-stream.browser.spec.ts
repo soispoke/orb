@@ -4,7 +4,7 @@ import {eventPage} from './eventPageFixture';
 test('native response remains visible through a tool-only history resync and reload',async({page})=>{
  const id='85cce150-8b72-4a5f-be57-61aea8043104';
  const bubble='antigravity:session:turn:1';
- const mission={id,title:'Gemini streaming canary',status:'active',backend:'antigravity',history:[],created_at:'',updated_at:''};
+ const mission={id,project:'test',title:'Gemini streaming canary',status:'active',backend:'antigravity',history:[],created_at:'',updated_at:''};
  const tool={type:'tool_call',data:{tool_call_id:'session:2',name:'bash',args:{command:'true'}}};
  const snapshot={type:'text_op',data:{bubble_id:bubble,ops:[{type:'snapshot',revision:1,text:'First visible update'}]}};
  let history:any[]=[{id:1,sequence:1,event_type:'tool_call',tool_call_id:'session:2',tool_name:'bash',content:'{}',timestamp:''}];
@@ -19,7 +19,7 @@ test('native response remains visible through a tool-only history resync and rel
  });
  await page.goto('/');
  await page.getByRole('button',{name:'test',exact:true}).click();
- await page.getByRole('button',{name:/Gemini streaming canary/}).click();
+ await page.getByRole('button',{name:'Gemini streaming canary',exact:true}).click();
  await expect(page.locator('.st-text')).toContainText('First visible update');
  await expect.poll(()=>historyReads).toBeGreaterThan(1);
  await expect(page.locator('.st-text')).toContainText('First visible update');
@@ -28,7 +28,7 @@ test('native response remains visible through a tool-only history resync and rel
  await expect(page.locator('.st-text')).toHaveCount(1);
  await expect(page.locator('.st-text')).toContainText('First visible update');
  await page.reload();
- await page.getByRole('button',{name:/Gemini streaming canary/}).click();
+ await page.getByRole('button',{name:'Gemini streaming canary',exact:true}).click();
  await expect(page.locator('.st-text')).toHaveCount(1);
  await expect(page.locator('.st-text')).toContainText('First visible update');
 });

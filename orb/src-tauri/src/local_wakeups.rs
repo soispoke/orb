@@ -77,7 +77,7 @@ pub fn command(mission: &str) -> Option<Vec<String>> {
     ])
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_wakeups_sync(connection: Connection) -> Result<Value, String> {
     let _guard = SYNC_LOCK.lock().await;
     sync_at(&connection, account(&connection)?).await
@@ -230,7 +230,7 @@ pub fn capture(command: Option<&[String]>, args: Value) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_wakeups_cancel(
     connection: Connection,
     mission: String,
@@ -306,7 +306,7 @@ fn cancel_at(root: PathBuf, mission: String, cancel_token: Option<String>) -> Re
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_wakeups_discard(
     connection: Connection,
     mission: String,

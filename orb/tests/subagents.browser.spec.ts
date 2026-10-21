@@ -1,0 +1,144 @@
+import {test,expect} from '@playwright/test';
+test('subagents stay stable, readable, and keyboard accessible as they finish',async({page},testInfo)=>{
+ await page.goto('/tests/subagents.html');
+ const row=page.getByRole('button',{name:/Inspect the parser/});
+ await row.focus();await page.keyboard.press('Enter');
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ const before=await row.boundingBox();
+ await page.getByRole('button',{name:'Complete first agent'}).click();
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(row).toContainText('Done');
+ const after=await row.boundingBox();
+ expect(after!.y).toBe(before!.y);
+ await expect(page.getByText('Checked unicode boundaries. All tests pass.')).toBeVisible();
+ await page.screenshot({path:testInfo.outputPath('subagents-desktop.png')});
+ await page.setViewportSize({width:390,height:844});
+ await page.emulateMedia({reducedMotion:'reduce'});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ const dot=page.locator('.subagent[data-state=running] .subagent-dot').first();
+ expect(await dot.evaluate(el=>getComputedStyle(el).animationName)).toBe('none');
+ await page.screenshot({path:testInfo.outputPath('subagents-mobile.png')});
+});
+
+test('expanded agents remain rendered inside the real conversation scroller',async({page})=>{
+ await page.goto('/tests/subagents.html?scroll');
+ const panel=page.locator('.subagents');
+ const heading=page.getByRole('button',{name:/Subagents/});
+ await heading.click(); await heading.click();
+ const row=page.getByRole('button',{name:/Inspect the parser/});
+ await row.click();
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ expect(await panel.evaluate(el=>getComputedStyle(el).contentVisibility)).toBe('visible');
+ const samples=await page.evaluate(async()=>{
+  const el=document.querySelector('.subagents')!; const points:number[]=[];
+  for(let i=0;i<30;i++){await new Promise(requestAnimationFrame);points.push(el.getBoundingClientRect().top);}
+  return points;
+ });
+ expect(Math.max(...samples)-Math.min(...samples)).toBeLessThan(2);
+});
+
+
+test('side panel preserves disclosures and leaves conversation scroll alone',async({page},testInfo)=>{
+ await page.goto('/tests/subagents.html?panel');
+ const scroll=page.locator('.background-conversation .scroll');
+ await scroll.evaluate(el=>el.scrollTop=400);
+ const row=page.getByRole('button',{name:/Inspect the parser/});
+ await row.click();
+ expect(await scroll.evaluate(el=>el.scrollTop)).toBe(400);
+ await page.getByRole('button',{name:'Close background tasks'}).click();
+ await expect(page.getByRole('complementary',{name:'Background tasks'})).toBeHidden();
+ await page.getByRole('button',{name:/Background tasks/}).click();
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(page.getByText('Reading token boundaries in parser.ts')).toBeVisible();
+ await page.screenshot({path:testInfo.outputPath('side-panel.png')});
+ await page.setViewportSize({width:390,height:844});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ await expect(row).toBeVisible();
+ await page.screenshot({path:testInfo.outputPath('side-panel-mobile.png')});
+});
+
+test('panel closure survives navigation and narrow panes keep room for the conversation',async({page})=>{
+ await page.goto('/tests/subagents.html?panel');
+ await page.getByRole('button',{name:'Close background tasks'}).click();
+ await expect(page.getByRole('button',{name:'Background tasks'})).toBeFocused();
+ await page.reload();
+ await expect(page.getByRole('complementary',{name:'Background tasks'})).toBeHidden();
+ await page.getByRole('button',{name:'Background tasks'}).click();
+ // A desktop sidebar/file pane can leave a narrow chat even on a wide screen.
+ await page.locator('.background-shell').evaluate(el=>(el.parentElement!.style.width='650px'));
+ const conversation=await page.locator('.background-conversation').boundingBox();
+ const tasks=await page.getByRole('complementary',{name:'Background tasks'}).boundingBox();
+ expect(conversation!.width).toBeGreaterThan(600);
+ expect(tasks!.y).toBeGreaterThanOrEqual(conversation!.y+conversation!.height-1);
+ expect(tasks!.height).toBeLessThanOrEqual(360);
+});
+
+
+test('historical workflows stay unconfirmed across polls and settle on a failure receipt without closing', async ({page}) => {
+ let polls = 0;
+ let failed = false;
+ await page.addInitScript(() => localStorage.setItem('orb.apiUrl', location.origin));
+ await page.route('**/api/fs/download?**', async route => {
+  const path = new URL(route.request().url()).searchParams.get('path')!;
+  if (!path.endsWith('journal.jsonl')) {
+   await route.fulfill({body:JSON.stringify({type:'assistant',timestamp:'2026-10-14T18:00:00Z',message:{content:[{type:'text',text:'Last known work'}]}})});
+   return;
+  }
+  polls++;
+  const events = [{type:'started',agentId:'a',label:'Historical child'}, ...(failed ? [{type:'failed',agentId:'a'}] : [])];
+  await route.fulfill({body:events.map(e=>JSON.stringify(e)).join('\n')});
+ });
+ await page.goto('/tests/subagents.html?workflow');
+ const row = page.getByRole('button', {name:/Historical child/});
+ await expect(row).toContainText('Status unconfirmed');
+ await row.click();
+ await expect(page.getByText('Last known work')).toBeVisible();
+ expect(await page.locator('.subagent-dot').evaluate(el=>getComputedStyle(el).boxShadow)).toBe('none');
+ await expect.poll(()=>polls, {timeout:6000}).toBeGreaterThan(1);
+ await expect(row).toContainText('Status unconfirmed');
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ failed = true;
+ await expect(row).toContainText('Failed', {timeout:6000});
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(page.getByText('The workflow recorded an agent failure.')).toBeVisible();
+});
+
+test('native workflow recovery shows every reviewer and stays open across refreshes',async({page},testInfo)=>{
+ let polls=0;
+ await page.addInitScript(()=>localStorage.setItem('orb.apiUrl',location.origin));
+ await page.route('**/api/fs/download?**',async route=>{
+  const path=new URL(route.request().url()).searchParams.get('path')!;
+  if(path.endsWith('journal.jsonl')) {polls++;await route.fulfill({body:[0,1].map(i=>JSON.stringify({type:'started',agentId:`a${i}`})).join('\n')});}
+  else if(path.endsWith('/workflows/test.json')) await route.fulfill({body:JSON.stringify({runId:'test',taskId:'task',status:'killed',timestamp:'2026-10-15T05:20:20Z',workflowProgress:Array.from({length:10},(_,i)=>({type:'workflow_agent',index:i+1,label:`Reviewer ${i+1}`,state:i<2?'progress':'start',phaseTitle:'Review',model:'Claude Opus',...(i<2?{agentId:`a${i}`,startedAt:Date.parse('2026-10-15T05:09:35Z'),tokens:200000}:{})}))})});
+  else await route.fulfill({status:404,body:''});
+ });
+ await page.goto('/tests/subagents.html?workflow');
+ await expect(page.getByText('10 stopped',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Show all 10 agents'}).click();
+ const row=page.getByRole('button',{name:/Reviewer 10/});await row.click();
+ await expect(page.locator('.subagent-details:not([hidden])').getByText('The workflow stopped before this agent started.')).toBeVisible();
+ await expect.poll(()=>polls,{timeout:6000}).toBeGreaterThan(1);
+ await expect(row).toHaveAttribute('aria-expanded','true');
+ await expect(page.locator('.subagent')).toHaveCount(10);
+ await page.screenshot({path:testInfo.outputPath('workflow-recovery.png')});
+ await page.setViewportSize({width:390,height:844});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
+
+test('saved local agents and provider failures survive reload without pretending they run',async({page},info)=>{
+ await page.addInitScript(()=>{(window as any).__TAURI_INTERNALS__={invoke:async(command:string)=>{
+  if(command!=='local_agent_history')throw Error('Unexpected command');
+  return {agents:[{id:'saved-call',description:'Saved proof porter',status:'stopped',detail:'Saved agent ID: abc123',workflowLabel:'Saved agent'}],providerError:'429 All providers are cooling down',providerErrorAt:'2026-10-18T18:43:33Z'};
+ }};});
+ await page.goto('/tests/subagents.html?saved');
+ await expect(page.getByRole('status')).toContainText('429 All providers are cooling down');
+ await page.getByRole('button',{name:/Saved proof porter/}).click();
+ await expect(page.getByText('Saved agent ID: abc123')).toBeVisible();
+ await expect(page.locator('.subagent')).toHaveAttribute('data-state','stopped');
+ await page.reload();
+ await expect(page.getByRole('button',{name:/Saved proof porter/})).toBeVisible();
+ await page.getByRole('button',{name:'Receive live activity'}).click();
+ await expect(page.locator('.subagent')).toHaveCount(1);
+ await expect(page.locator('.subagent')).toHaveAttribute('data-state','running');
+ await page.screenshot({path:info.outputPath('saved-agent-recovery.png')});
+});

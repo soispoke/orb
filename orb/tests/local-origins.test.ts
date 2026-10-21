@@ -1,6 +1,22 @@
 import {afterEach,expect,it,vi} from 'vitest';
 import {getMission,listMissions,listProjectMissions,archiveMission,reopenMission,renameMission,setConnection,clearConnection} from '../src/api';
 afterEach(()=>{delete (window as any).__TAURI_INTERNALS__;clearConnection();vi.unstubAllGlobals();});
+it.each(['core','node'] as const)('uses the activated %s destination despite a pending source journal after reopening',async kind=>{
+ setConnection('http://moved.test','token');
+ const local={id:'moved',status:'active',history:[],tags:['placement:client'],backend:'claudecode',model_override:'old-model',local_sync_pending:true,local_run_active:true};
+ const remote={id:'moved',status:'awaiting_user',history:[],tags:null,backend:'codex',model_override:'gpt-6-astra',machine_transfer:{id:'transfer',mission_id:'moved',phase:'activated',destination:kind==='core'?{kind}:{kind,id:'worker'},source:{kind:'client',id:'old'},backend:'codex',created_at:'now'}};
+ const invoke=vi.fn(async()=>[local]);(window as any).__TAURI_INTERNALS__={invoke};
+ vi.stubGlobal('fetch',vi.fn(async input=>Response.json(String(input).includes('/missions/moved')?remote:[remote])));
+ expect(await getMission('moved')).toEqual(remote);
+ expect(await listMissions()).toEqual([remote]);
+ expect(await getMission('moved')).toEqual(remote);
+ vi.stubGlobal('fetch',vi.fn(async()=>{throw new TypeError('offline');}));
+ expect(await getMission('moved')).toEqual(remote);
+ expect(await listMissions()).toEqual([remote]);
+ await expect(getMission('moved',true)).rejects.toThrow();
+ expect(local.local_sync_pending).toBe(true);
+ expect(invoke.mock.calls.every(([command])=>command==='local_origin_list')).toBe(true);
+});
 it('shows a locally journaled mission and its text while Core is offline',async()=>{
  setConnection('http://offline.test','token');
  const mission={id:'local-id',title:'Offline task',status:'active',created_at:'now',updated_at:'now',history:[{role:'user',content:'Do work'},{role:'assistant',content:'Working'}],local_sync_pending:true};
@@ -129,7 +145,7 @@ it('learns about an archive the default list leaves out, and keeps an emptied ti
  vi.stubGlobal('fetch',offline());
  expect((await listMissions()).find(m=>m.id==='done')).toMatchObject({status:'acknowledged',title:''});
 });
-it('retires a synchronized local mission once Core confirms 404 or explicit deletion',async()=>{
+it('keeps synchronized local history visible after Core returns 404',async()=>{
  setConnection('http://core.test','token');const {confirmed}=journal([done,unsynced]);
  const {forgetUnlistedReads}=await import('../src/localOrigins');
  forgetUnlistedReads();
@@ -138,11 +154,13 @@ it('retires a synchronized local mission once Core confirms 404 or explicit dele
   if(new URL(url).pathname === '/api/control/missions')return new Response('[]');
   return new Response('Not found',{status:404});
  }));
- await listMissions();
- expect(confirmed.get('done')?.deleted).toBe(true);
+ expect((await listMissions()).map(m=>m.id)).toEqual(['unsynced','done']);
+ expect((await listProjectMissions('test')).map(m=>m.id)).toEqual(['unsynced','done']);
+ expect(await getMission('done')).toMatchObject({id:'done',title:done.title});
+ expect(confirmed.get('done')?.deleted).not.toBe(true);
  expect(confirmed.get('unsynced')).toBeUndefined();
  vi.stubGlobal('fetch',offline());
- expect((await listMissions()).map(m=>m.id)).toEqual(['unsynced']);
+ expect((await listMissions()).map(m=>m.id)).toEqual(['done','unsynced']);
 });
 
 it('shares concurrent native scans and reads fresh rows after completion',async()=>{
@@ -169,4 +187,34 @@ it('keeps local output but reads current Antigravity effort from Core while runn
  expect(await listProjectMissions('test')).toMatchObject([{...local,model_effort:'high'}]);
  effort=null;
  expect(await getMission('done')).toMatchObject({...local,model_effort:null});
+});
+
+it('still retires the local copy after an explicit successful deletion',async()=>{
+ setConnection('http://core.test','token');const {confirmed}=journal([done]);
+ const {confirmDeletedLocalOrigins}=await import('../src/localOrigins');
+ await confirmDeletedLocalOrigins(['done']);
+ expect(confirmed.get('done')?.deleted).toBe(true);
+ vi.stubGlobal('fetch',core([]));
+ expect(await listMissions()).toEqual([]);
+});
+it.each([404,503])('keeps the local copy after a failed lookup (%s), then accepts Core recovery',async(status)=>{
+ setConnection('http://core.test','token');journal([done]);
+ vi.stubGlobal('fetch',vi.fn(async(input:any)=>new Response(String(input).includes('?')?'[]':'unavailable',{status:String(input).includes('?')?200:status})));
+ expect(await listMissions()).toMatchObject([{id:'done',title:done.title}]);
+ vi.stubGlobal('fetch',core([{...done,title:'Recovered on Core'}]));
+ expect(await listMissions()).toMatchObject([{id:'done',title:'Recovered on Core'}]);
+});
+
+it('restoring invalidates a cached archive when Core omits the chat from its list',async()=>{
+ setConnection('http://restore-cache.test','token');journal([done]);
+ const {unlistedCoreState}=await import('../src/localOrigins');
+ await unlistedCoreState([done as any],[],async()=>({...done,status:'acknowledged'}) as any);
+ const state={...done,status:'acknowledged'};
+ vi.stubGlobal('fetch',vi.fn(async(input:any,init?:any)=>{
+  const url=String(input);
+  if(url.endsWith('/status'))state.status=JSON.parse(init.body).status;
+  return Response.json(init?.method==='POST'?{}:url.endsWith('/done')?state:[]);
+ }));
+ await reopenMission('done');
+ expect(await listMissions()).toMatchObject([{id:'done',status:'paused',title:done.title}]);
 });

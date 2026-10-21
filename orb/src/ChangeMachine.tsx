@@ -13,7 +13,7 @@ import { appendClientTranscript, setClientMissionStatus } from "./api";
 import { MachineLoadBadge, byLeastLoaded, machineLoadTitle } from "./machineLoad";
 import { TransferInventory, formatBytes } from "./TransferInventory";
 import { TransferSelection, selectionRequest, selectionTotals, type Choice } from "./TransferSelection";
-import { activeTransfer, activateTransfer, copyTransfer, inspectTransfer, inventoryTransfer, machineLabel, sameMachine, selectTransfer, snapshotTransfer, transferRequest, verifyTransfer, type Destination, type Machine, type TransferAction, type TransferView, type WorkspaceInventory } from "./machineTransfer";
+import { activeTransfer, activateTransfer, requireLocalTransferHarness, copyTransfer, inspectTransfer, inventoryTransfer, machineLabel, sameMachine, selectTransfer, snapshotTransfer, transferRequest, verifyTransfer, type Destination, type Machine, type TransferAction, type TransferView, type WorkspaceInventory } from "./machineTransfer";
 
 type Loaded = { view: TransferView; rows: Destination[]; client?: string };
 const loads = new Map<string, Promise<Loaded>>();
@@ -28,8 +28,14 @@ export function loadMachineDestinations(missionId: string, force = false): Promi
     const local = async (): Promise<Destination> => {
       if (!nativeInvoke()) return { machine: { kind: "client", id: "unavailable" }, label: "This computer", available: false, reason: "Open Orb desktop to use this computer" };
       // A recent scan is enough to list harnesses; launching re-validates.
-      const [id, installed] = await Promise.all([machineIdentity(), refreshLocalAgents(false)]);
-      return { machine: { kind: "client", id }, label: "This computer", available: true, harnesses: installed.filter(c => c.installed).map(c => c.id) };
+      const id = await machineIdentity();
+      try {
+        const installed = await refreshLocalAgents(force, true);
+        return { machine: { kind: "client", id }, label: "This computer", available: true, harnesses: installed.filter(c => c.installed).map(c => c.id) };
+      } catch {
+        // A local scan failure must not prevent moving to a healthy remote machine.
+        return { machine: { kind: "client", id }, label: "This computer", available: false, harnesses: [], reason: "Local agent check failed. Refresh machines to retry." };
+      }
     };
     const [view, computer] = await Promise.all([inspectTransfer(missionId), local()]);
     if (view.version !== 1) throw new Error("Update the connected backend to enable machine transfer.");
@@ -74,7 +80,7 @@ export function ChangeMachine(p: { mission: Mission; choices: HarnessChoice[]; c
   const models = () => destinationChoices().find(c => c.backend.id === backend())?.models ?? [];
   const availableHarnesses = () => destinationChoices().filter(c => c.backend.id === "antigravity" ? c.models.length > 0 : !selected()?.harnesses || selected()!.harnesses!.includes(c.backend.id));
   const harnessCompatible = () => backend() === "antigravity" ? models().length > 0 : !selected()?.harnesses || selected()!.harnesses!.includes(backend());
-  const compatible = () => harnessCompatible() && (backend() !== "antigravity" || models().some(option => option.value === model()));
+  const compatible = () => harnessCompatible() && models().some(option => option.value === model());
   const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
   const loadKey = (d: Destination) => d.machine.kind === "node" ? d.machine.id : d.machine.kind;
   // This computer and Core keep their place; usable nodes go least busy first.
@@ -136,6 +142,8 @@ export function ChangeMachine(p: { mission: Mission; choices: HarnessChoice[]; c
     cancelled = false; setBusy(true); setError(""); setStage("Preparing workspace…");
     try {
       if (current().kind === "client" && !localBinding(p.mission.id)) throw new Error("Open this conversation on its source computer before moving it.");
+      if (target.machine.kind === "client") await requireLocalTransferHarness(backend());
+      if (cancelled) return;
       if (running()) await stopSource();
       let a: TransferAction = action() ?? await transferRequest<TransferAction>(p.mission.id, { op: "prepare", destination: target.machine, client_id: client, client_root: localBinding(p.mission.id)?.cwd, idempotency_key: requestKey, backend: backend(), model: model(), effort: backend() === p.mission.backend ? p.mission.model_effort : "" });
       setAction(a);
@@ -187,6 +195,7 @@ export function ChangeMachine(p: { mission: Mission; choices: HarnessChoice[]; c
       <For each={ordered()}>{d => <button class="menu-item" role="menuitem" disabled={!d.available || sameMachine(d.machine, current())} title={d.reason ?? `${d.label} · ${machineLoadTitle(loadKey(d))}`} onClick={() => { setSelected(d); setError(""); queueMicrotask(() => root.querySelector<HTMLSelectElement>("select")?.focus()); }}>
         <span>{d.label}<Show when={d.reason}><small>{d.reason}</small></Show></span><span class="machine-transfer-end"><MachineLoadBadge machine={loadKey(d)} /><span>{sameMachine(d.machine, current()) ? "✓" : "›"}</span></span>
       </button>}</For>
+      <button class="menu-item" role="menuitem" disabled={loading()} onClick={() => void load(true)}>Refresh machines</button>
     </Show>
     <Show when={selected()}>
       <header class="transfer-head">
@@ -199,7 +208,9 @@ export function ChangeMachine(p: { mission: Mission; choices: HarnessChoice[]; c
       <div class="transfer-body">
         <Show when={loading()}><p role="status">{destinations().length?"Updating machines…":"Checking machines…"}</p></Show>
         <Show when={selected()?.reason}><p role="status">{selected()!.reason}</p></Show>
-        <Show when={!action()?.manifest && !inventory()}><p>The conversation and its workspace files move together. The agent waits for your next message.</p></Show>
+        <Show when={!action()?.manifest && !inventory()}><p>The conversation and its saved workspace files move together. The agent waits for your next message.</p>
+          <Show when={running()}><p>Preparing stops the current run. Running commands and work held only in memory cannot move; wait for a checkpoint or build to finish before switching.</p></Show>
+        </Show>
         <Show when={!action()}>
           <div class="transfer-options">
             <label>Harness<Select aria-label="Transfer harness" value={backend()} disabled={busy()} onChange={e => { setBackend(e.currentTarget.value); setModel(destinationChoices().find(c => c.backend.id === e.currentTarget.value)?.models[0]?.value ?? ""); }}>
@@ -209,6 +220,7 @@ export function ChangeMachine(p: { mission: Mission; choices: HarnessChoice[]; c
             <label>Model<Select aria-label="Transfer model" value={model()} disabled={busy()} onChange={e => setModel(e.currentTarget.value)}><For each={models()}>{m => <option value={m.value} selected={m.value === model()}>{m.label}</option>}</For></Select></label>
           </div>
           <Show when={!compatible()}><p>Choose a harness and model available on this machine.</p></Show>
+          <Show when={selected()?.machine.kind === "client"}><button type="button" class="pill" disabled={busy() || loading()} onClick={() => void load(true)}>Refresh local agents</button></Show>
         </Show>
         <Show when={!action()?.manifest && inventory()}>{found => <TransferSelection inventory={found()} choice={choice()} disabled={busy()} onChoice={setChoice} />}</Show>
         <Show when={action()?.manifest}>{m => <TransferInventory manifest={m()} />}</Show>

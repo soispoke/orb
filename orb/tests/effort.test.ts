@@ -33,9 +33,9 @@ function effortsFromCore(): Record<string, string[]> {
 describe("effort options come from the core's own gate", () => {
   it("matches normalize_model_effort_for_backend exactly", () => {
     const core = effortsFromCore();
-    expect(Object.keys(core).sort()).toEqual(["antigravity", "claudecode", "codex"]);
+    expect(Object.keys(core).sort()).toEqual(["antigravity", "claudecode", "codex", "opencode"]);
     for (const [backend, ladder] of Object.entries(core)) {
-      expect(supportedEfforts(backend)).toEqual(ladder);
+      expect(EFFORT_BY_HARNESS[backend]).toEqual(ladder);
     }
     expect(Object.keys(EFFORT_BY_HARNESS).sort()).toEqual(Object.keys(core).sort());
   });
@@ -84,4 +84,35 @@ it("Antigravity offers only native efforts and makes the required default explic
  expect(normalizeEffort("xhigh","antigravity")).toBeNull();
  expect(effortLabel(null,"antigravity","agy-demo")).toBe("Default (High)");
  expect(effortLabel("low","antigravity","agy-demo")).toBe("Low");
+});
+
+ it("offers Ultracode only for Claude and preserves saved selections", () => {
+   expect(normalizeEffort(" Ultracode ", "claudecode")).toBe("ultracode");
+   expect(effortLabel("ultracode", "claudecode")).toBe("Ultracode");
+   expect(normalizeEffort("ultracode", "codex")).toBeNull();
+   expect(normalizeEffort("ultracode", "antigravity")).toBeNull();
+ });
+
+ it("requires model capability before offering OpenCode effort and rejects Max", () => {
+   const levels = ["low", "medium", "high"];
+   expect(supportedEfforts("opencode", levels)).toEqual(levels);
+   expect(normalizeEffort("HIGH", "opencode", levels)).toBe("high");
+   expect(normalizeEffort("max", "opencode", [...levels, "max"])).toBeNull();
+   expect(normalizeEffort("high", "opencode", [])).toBeNull();
+   expect(normalizeEffort("", "opencode", levels)).toBeNull();
+ });
+
+// Local launch and Core registration both validate this shared wire record.
+// Check every offered option, not only Core's ordinary mission-create gate.
+it("keeps the local-origin validation gate aligned with every effort menu", () => {
+  const source = readFileSync(resolve(__dirname, "../../shared/local_origin.rs"), "utf8");
+  const match = source.slice(source.indexOf("let accepted = match"));
+  const body = match.slice(0, match.indexOf("_ => false"));
+  const local: Record<string, string[]> = {};
+  for (const [, harnesses, levels] of body.matchAll(/((?:"\w+"\s*\|?\s*)+) =>\s*\{?\s*matches!\(\s*effort,\s*([^)]*)\)/g)) {
+    for (const [, harness] of harnesses.matchAll(/"(\w+)"/g)) {
+      local[harness] = [...levels.matchAll(/"(\w+)"/g)].map(m => m[1]);
+    }
+  }
+  expect(local).toEqual(EFFORT_BY_HARNESS);
 });

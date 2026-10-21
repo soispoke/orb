@@ -3,6 +3,7 @@
     "beforeBuildCommand": "python3 scripts/build-mcp.py && node scripts/build-macos-icon.mjs && pnpm build"
   },
   "bundle": {
+    "active": true,
     "resources": {
       "gen/app-icon/Assets.car": "Assets.car",
       "gen/app-icon/Orb.icns": "Orb.icns"

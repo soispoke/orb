@@ -1,5 +1,4 @@
 import { useTooltip } from "./Tooltip";
-import { ErrorToast } from "./toast";
 import {nativeComposerDrop} from "./composerDrop";
 import {importProjectFiles} from "./projectFileImport";
 import {backgroundUploads,cancelBackgroundUpload,formatFileSize,pauseBackgroundUpload,resumeBackgroundUpload,type UploadSource} from "./uploads";
@@ -75,7 +74,7 @@ import { cacheCanPrefetch, cacheLoad, cachePeek, cachePrefetch, cachePut, cacheR
 import { SidebarTree } from "./Tree";
 import { visibleTree, type TreeNode, type TreeRow } from "./treeModel";
 import { FileSkeleton } from "./Skeleton";
-import { countNested, holds, nestMissions, missionParent, missionSubtree, missionTreeRows, archiveOnlyRows, isSupersededInTree, ARCHIVE_DAY_MS, ARCHIVE_WEEK_MS, filterArchivedMissionsByAge, expandMissionDescendants, type NestedMission } from "./missionTree";
+import { countNested, holds, nestMissions, missionParent, missionSubtree, missionTreeRows, archiveOnlyRows, ARCHIVE_DAY_MS, ARCHIVE_WEEK_MS, filterArchivedMissionsByAge, expandMissionDescendants, type NestedMission } from "./missionTree";
 
 const [deletingIds, setDeletingIds] = createSignal<ReadonlySet<string>>(new Set());
 export const isMissionDeleting = (id: string): boolean => deletingIds().has(id);
@@ -201,9 +200,9 @@ export function LiveProjectsSection(p: {
       : rows;
     const extraArchived = archivedMissions().filter(m => (m.project ?? "") === slug && !withCurrent.some(r => r.id === m.id));
     const allRows = [...withCurrent, ...extraArchived];
-    const byId = new Map(allRows.map(m => [m.id, m]));
-    const selectedId = p.selected()?.startsWith("m:") ? p.selected()!.slice(2) : undefined;
-    return missionTreeRows(allRows, m => !isArchived(m) && (m.id === selectedId || !isSupersededInTree(m, byId)));
+    // Workflow tags are not an archive action. In particular, restoring a
+    // superseded attempt must keep it visible after selection or polling changes.
+    return missionTreeRows(allRows, m => !isArchived(m));
   };
   const allKnownMissions = (): Mission[] => {
     const byId = new Map<string, Mission>();
@@ -521,6 +520,7 @@ export function LiveProjectsSection(p: {
     return current.includes(treeId) ? current : (treeId.startsWith("m:") && deleting.has(treeId.slice(2)) ? [] : [treeId]);
   };
   const startMoveSelection = (id: string) => {
+    cancelMissionCut();
     setFileClipboard("");
     setCutCron(null);
     const ids = [...selectedFor(id)];
@@ -608,6 +608,7 @@ export function LiveProjectsSection(p: {
     finally { setFileBusy(false); }
   };
   const copyFile = async (slug: string, path: string, copy: boolean, directory = false) => {
+    cancelMissionCut();
     const version = connectionVersion(); setFileMenu(null); setActionMenu(null); setMultiSelectMenu(null);
     try {
       const text = await copyFileReference(slug, path, copy, directory);
@@ -683,6 +684,7 @@ export function LiveProjectsSection(p: {
     return request;
   };
   createEffect(on(connectionVersion, () => {
+    cancelMissionCut();
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
     deletedInSession.clear(); deleteQueue.length = 0; queuedDeletes.clear(); deletingDescendants.clear(); deleteFailures.length = 0; pendingRemoved = new Set(); pendingUnmark = new Set();
     setDeletingIds(new Set<string>());
@@ -1072,6 +1074,7 @@ export function LiveProjectsSection(p: {
     bumpProjects();
   };
   const startCutCron = async (slug: string, id: string, name: string, folder = "") => {
+    cancelMissionCut();
     const version = connectionVersion();
     setControllerMenu(null); setActionMenu(null); setMultiSelectMenu(null);
     try {
@@ -1138,6 +1141,7 @@ export function LiveProjectsSection(p: {
     if (copy && items.some(i => i.kind !== "file")) return;
     // If all items are missions and !copy, preserve the existing pendingMoves path so Move N agents works identically.
     if (!copy && items.every(i => i.kind === "mission")) {
+      cancelMissionCut();
       const ids = items.map(i => (i as { kind: "mission"; id: string }).id);
       setMultiSelectMenu(null); setActionMenu(null); setFileMenu(null); setControllerMenu(null);
       setFileClipboard(""); setCutCron(null);
@@ -1152,6 +1156,7 @@ export function LiveProjectsSection(p: {
     }
     const version = connectionVersion();
     setMultiSelectMenu(null); setActionMenu(null); setFileMenu(null); setControllerMenu(null); setMissionMenu(null);
+    cancelMissionCut();
     try {
       const text = await copyItemsReference(items, copy);
       if (version !== connectionVersion()) return;
@@ -1480,6 +1485,7 @@ export function LiveProjectsSection(p: {
             ...targets.map(t => ({ ...t, status })),
             ...(rows ?? []).filter(m => !targetIds.has(m.id)),
           ]);
+          p.onProjectMissions?.(slug, missions[slug] ?? []);
           setExpanded(slug, true);
           void loadDir(slug, "");
           const segments = missionFolder(mission).split("/").filter(Boolean);
@@ -1658,15 +1664,54 @@ export function LiveProjectsSection(p: {
   type Node = TreeNode<RowData>;
   const [cutId, setCutId] = createSignal<string | null>(null);
   let moving = false;
-  let consumedCut = "";
+  const consumedCuts = new Set<string>();
   let cutClipboard = "";
+  let cutRevision = 0, cutPending = false;
+  function cancelMissionCut() {
+    cutRevision++;
+    cutPending = false;
+    if (cutClipboard) consumedCuts.add(cutClipboard);
+    cutClipboard = "";
+    setCutId(null);
+    setPendingMoves([]);
+  }
+  function cancelPendingMove() {
+    if (moving || fileBusy() || movingCron()) return false;
+    const pending = cutPending || !!cutId() || pendingMoves().length > 0 || !!cutFile() || cutItems().length > 0 || !!cutCron();
+    if (!pending) return false;
+    if (cutFile() || cutItems().length || readCronReference(fileClipboard())) consumedFileClipboard = fileClipboard();
+    cancelMissionCut();
+    setFileClipboard(""); setCutCron(null);
+    setSelectedTreeIds([]); setSelectionActive(false); selectionAnchor = null;
+    return true;
+  }
+  // Escape is dispatched by the app's existing shortcut handler only after
+  // menus, dialogs, IME and composer controls have had the chance to consume it.
+  onMount(() => {
+    const cancel = (event: Event) => { if (cancelPendingMove()) event.preventDefault(); };
+    window.addEventListener("orb:cancel-sidebar-move", cancel);
+    onCleanup(() => window.removeEventListener("orb:cancel-sidebar-move", cancel));
+  });
+  onCleanup(() => { cutRevision++; cutPending = false; });
   const beginMove = (id: string) => {
     if (moving) return;
     const version = connectionVersion();
-    void cutMission(id).then(text => {
-      if (version !== connectionVersion()) return;
+    const revision = ++cutRevision;
+    cutPending = true;
+    // Remember the token before the OS write completes: Escape must revoke it
+    // even if a paste can read the clipboard before writeText resolves.
+    void cutMission(id, text => { cutClipboard = text; }).then(text => {
+      if (version !== connectionVersion() || revision !== cutRevision) {
+        consumedCuts.add(text);
+        return;
+      }
+      cutPending = false;
       cutClipboard = text; setCutId(id); setActionError(null);
-    }).catch(e => setActionError(String(e)));
+    }).catch(e => {
+      if (version === connectionVersion() && revision === cutRevision) {
+        cutPending = false; setActionError(String(e));
+      }
+    });
   };
   const pasteMission = (slug: string, path: string, fromMenu = false) => {
     if (moving) return;
@@ -1694,12 +1739,12 @@ export function LiveProjectsSection(p: {
     const version = connectionVersion();
     void (async () => {
       const clipboard = fromMenu ? cutClipboard : await navigator.clipboard.readText();
-      if (clipboard === consumedCut) return;
+      if (consumedCuts.has(clipboard)) return;
       const missionId = readCutMission(clipboard, getApiUrl());
       if (!missionId || version !== connectionVersion()) return;
       await moveMission(missionId, slug, path);
       if (version !== connectionVersion()) return;
-      consumedCut = clipboard; cutClipboard = "";
+      consumedCuts.add(clipboard); cutClipboard = "";
       setCutId(null); setActionError(null);
       for (const source of Object.keys(missions)) setMissions(source, list => list.filter(m => m.id !== missionId));
       setExpanded(slug, true);
@@ -1709,7 +1754,12 @@ export function LiveProjectsSection(p: {
     })().catch(e => setActionError(`Couldn’t move conversation: ${String(e)}`)).finally(() => { moving = false; });
   };
   const moveKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") { if (cutFile() || cutItems().length || readCronReference(fileClipboard())) consumedFileClipboard = fileClipboard(); setFileClipboard(""); setSelectedTreeIds([]); setSelectionActive(false); setPendingMoves([]); setCutId(null); setCutCron(null); selectionAnchor = null; return; }
+    if (event.defaultPrevented || event.isComposing) return;
+    if (event.key === "Escape") {
+      if (cancelPendingMove()) event.preventDefault();
+      setSelectedTreeIds([]); setSelectionActive(false); selectionAnchor = null;
+      return;
+    }
     if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
     const target = event.target as HTMLElement;
     if (target.closest('input, textarea, [contenteditable="true"]')) return;
@@ -2012,7 +2062,7 @@ export function LiveProjectsSection(p: {
         <span class="row-label">{d.label}</span>
         <Show when={!row.expanded && currentMission()?.project === d.slug}><span class="current-location-label">Open</span></Show>
       </button>
-      <Show when={row.expanded}><ContextBadge slug={d.slug} compact/></Show>
+      <Show when={row.expanded}><ContextBadge slug={d.slug}/></Show>
       <button class="row-action" aria-label={`Project actions for ${d.label}`} title="Project actions"
         onPointerDown={e => setActionFocus(e.pointerType !== "mouse")}
         onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setActionFocus(true); }}
@@ -2090,7 +2140,7 @@ export function LiveProjectsSection(p: {
       <Show when={error()}>
         <div class="row note">{error()} <button class="text-btn" onClick={() => refresh(true)}>Retry</button></div>
       </Show>
-      <ErrorToast error={cronWarning()} onDismiss={() => setCronWarning(null)} />
+      <Show when={cronWarning()}><ErrorNotice error={cronWarning()!} /></Show>
       <Show when={!deleteTargets().length && actionError()}>{error => <ErrorDialog error={error()} onClose={() => setActionError(null)} />}</Show>
       <Show when={importStatus()}><div class="row note" role="status">{importStatus()}</div></Show>
       <For each={backgroundUploads().filter(t => t.scope?.startsWith("project:"))}>

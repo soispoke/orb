@@ -37,8 +37,25 @@ it("keeps the login modal open during callback submission and exposes a rejected
   finish(new Response(JSON.stringify({ status: "failed", message: "Callback rejected" })));
   await waitFor(() => expect(within(screen.getByRole("dialog")).getByRole("alert").textContent).toContain("Callback rejected"));
   expect((input as HTMLInputElement).value).toBe("http://localhost:54545/callback?code=test");
+  expect(screen.queryByRole("button", { name: "Submit callback" })).toBeNull();
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(submissions).toBe(1);
   fireEvent.click(screen.getAllByRole("button", { name: "Close", exact: true })[0]);
   expect(screen.getByRole("button", {name:"Keep editing"})).toBeTruthy();
   fireEvent.click(screen.getByRole("button", {name:"Discard changes"}));
   await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+it.each(["completed", "failed"] as const)("reads the recorded %s result after an older Core rejects a duplicate callback", async (status) => {
+  setConnection("http://core.test", "test-token");
+  const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
+    init?.method === "POST"
+      ? new Response("This login session has already finished.", { status: 409 })
+      : new Response(JSON.stringify({ status, message: "Recorded result" })));
+  vi.stubGlobal("fetch", fetchMock);
+  const { submitCliProxyLoginCallback } = await import("../src/api");
+  await expect(submitCliProxyLoginCallback("test-login", "http://localhost:54545/callback?code=test"))
+    .resolves.toMatchObject({ status, message: "Recorded result" });
+  expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
 });

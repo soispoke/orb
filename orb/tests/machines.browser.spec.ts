@@ -57,8 +57,8 @@ test("collapsed providers show right-aligned used percentages and local monochro
   await page.goto("/");
   await page.getByRole("button", { name: "Providers", exact: true }).click();
   const row = page.getByRole("button", { name: /^Anthropic example@example.com/ });
-  await expect(row.getByText("0%", { exact: true })).toBeVisible();
-  await expect(row.getByText("63%", { exact: true })).toBeVisible();
+  await expect(row.getByText("0% used", { exact: true })).toBeVisible();
+  await expect(row.getByText("63% used", { exact: true })).toBeVisible();
   await expect(row.locator(".p-bar")).toHaveCount(0);
   const text = await row.locator(".s-row-text").boundingBox();
   const usage = await row.locator(".p-usage").boundingBox();

@@ -12,9 +12,13 @@ pub mod file_notifications;
 #[path = "../../../shared/vibe.rs"]
 mod vibe;
 
+#[allow(dead_code)]
+#[path = "../../../src/account_limits.rs"]
+mod account_limits;
 mod connection_store;
 #[cfg(test)]
 mod live_mcp_tests;
+mod agent_observation;
 mod local_origin;
 mod local_origin_confirmed;
 #[path = "../../../shared/local_origin.rs"]
@@ -34,11 +38,17 @@ mod context_service;
 #[path = "../../../shared/file_browser.rs"]
 mod file_browser;
 mod interactions;
+mod live_input;
 mod local_agents;
+#[cfg(unix)]
+mod local_runtime;
 mod local_stream;
 mod local_wakeups;
+mod local_workspaces;
 mod machine_metrics;
 mod routed_opencode;
+#[cfg(unix)]
+mod runtime_commands;
 mod session_preview;
 mod skills;
 mod transfers;
@@ -64,37 +74,6 @@ fn set_window_theme(window: WebviewWindow, theme: String) -> Result<(), String> 
 fn paloma_ssh_pubkey() -> Result<String, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is unset".to_string())?;
     std::fs::read_to_string(format!("{home}/.ssh/paloma.pub")).map_err(|e| e.to_string())
-}
-
-/// Show a file the webview saved to ~/Downloads, or the folder when the browser
-/// renamed it (e.g. "name (1).jar"). Only bare file names are accepted.
-#[tauri::command]
-fn reveal_download(name: String) -> Result<(), String> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        return Err("invalid file name".into());
-    }
-    let downloads = std::env::var_os("HOME")
-        .map(|home| std::path::PathBuf::from(home).join("Downloads"))
-        .ok_or("no home directory")?;
-    let file = downloads.join(&name);
-    #[cfg(target_os = "macos")]
-    let status = if file.exists() {
-        std::process::Command::new("open").arg("-R").arg(&file).status()
-    } else {
-        std::process::Command::new("open").arg(&downloads).status()
-    };
-    #[cfg(target_os = "windows")]
-    let status = if file.exists() {
-        std::process::Command::new("explorer").arg(format!("/select,{}", file.display())).status()
-    } else {
-        std::process::Command::new("explorer").arg(&downloads).status()
-    };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let status = std::process::Command::new("xdg-open").arg(&downloads).status();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        _ => Err("Could not open the Downloads folder".into()),
-    }
 }
 
 #[tauri::command]
@@ -125,11 +104,44 @@ fn open_url(url: String) -> Result<(), String> {
 }
 
 mod bindings;
-mod biometrics;
 mod diagnostics;
+mod transcript_recovery;
 use bindings::local_bindings;
 
+#[cfg(not(unix))]
+use bindings as execution_bindings;
+#[cfg(not(unix))]
+use interactions as execution_interactions;
+#[cfg(not(unix))]
+use local_agents as execution_local_agents;
+#[cfg(not(unix))]
+use local_origin as execution_local_origin;
+#[cfg(not(unix))]
+use local_wakeups as execution_local_wakeups;
+#[cfg(not(unix))]
+use run_recovery as execution_run_recovery;
+#[cfg(unix)]
+use runtime_commands as execution_bindings;
+#[cfg(unix)]
+use runtime_commands as execution_interactions;
+#[cfg(unix)]
+use runtime_commands as execution_local_agents;
+#[cfg(unix)]
+use runtime_commands as execution_local_origin;
+#[cfg(unix)]
+use runtime_commands as execution_local_wakeups;
+#[cfg(unix)]
+use runtime_commands as execution_run_recovery;
+#[cfg(unix)]
+use runtime_commands as execution_transfers;
+#[cfg(not(unix))]
+use transfers as execution_transfers;
+
 fn main() {
+    #[cfg(unix)]
+    if local_runtime::worker_entry() {
+        return;
+    }
     agent_software::start_worker();
     if context_service::worker_entry() {
         return;
@@ -142,6 +154,8 @@ fn main() {
                 context_service::clear_subscriptions();
                 interactions::clear_subscriptions();
                 local_agents::clear_subscriptions();
+                #[cfg(unix)]
+                local_runtime::clear_subscriptions();
             }
         })
         .on_window_event(|window, event| {
@@ -185,22 +199,22 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             diagnostics::diagnostics_append,
-            biometrics::biometric_status,
-            biometrics::biometric_authenticate,
-            bindings::local_binding_set,
-            bindings::local_bindings_refresh,
-            bindings::local_bindings_subscribe,
-            bindings::local_bindings_unsubscribe,
-            local_origin::local_origin_launch,
-            local_origin::local_origin_list,
-            local_origin::local_origin_confirm,
-            local_origin::local_origin_disconnect,
-            run_recovery::local_run_launch,
-            run_recovery::local_run_reconcile,
-            interactions::local_interaction,
-            interactions::local_interaction_subscribe,
-            interactions::local_interaction_unsubscribe,
-            interactions::local_interaction_answer,
+            transcript_recovery::local_transcript_recover,
+            transcript_recovery::local_agent_history,
+            execution_bindings::local_binding_set,
+            execution_bindings::local_bindings_refresh,
+            execution_bindings::local_bindings_subscribe,
+            execution_bindings::local_bindings_unsubscribe,
+            execution_local_origin::local_origin_launch,
+            execution_local_origin::local_origin_list,
+            execution_local_origin::local_origin_confirm,
+            execution_local_origin::local_origin_disconnect,
+            execution_run_recovery::local_run_launch,
+            execution_run_recovery::local_run_reconcile,
+            execution_interactions::local_interaction,
+            execution_interactions::local_interaction_subscribe,
+            execution_interactions::local_interaction_unsubscribe,
+            execution_interactions::local_interaction_answer,
             paloma_ssh_pubkey,
             session_preview::local_session_git,
             connection_store::desktop_connection_load,
@@ -215,7 +229,6 @@ fn main() {
             browse_local_files,
             machine_metrics::local_machine_metrics,
             open_url,
-            reveal_download,
             set_window_theme,
             voice::voice_capability,
             voice::voice_prewarm,
@@ -241,16 +254,19 @@ fn main() {
             local_agents::local_antigravity_models,
             local_agents::local_agents_workspace,
             local_agents::local_agents_directory,
+            local_workspaces::local_worktree,
             local_agents::local_agents_write,
-            transfers::local_machine_transfer,
+            execution_transfers::local_machine_transfer,
             transfers::local_machine_identity,
-            local_agents::local_agents_poll,
-            local_wakeups::local_wakeups_sync,
-            local_wakeups::local_wakeups_cancel,
-            local_wakeups::local_wakeups_discard,
-            local_agents::local_agents_subscribe,
-            local_agents::local_agents_unsubscribe,
-            local_agents::local_agents_stop
+            execution_local_agents::local_agents_poll,
+            execution_local_agents::local_agents_input_status,
+            execution_local_agents::local_agents_steer,
+            execution_local_wakeups::local_wakeups_sync,
+            execution_local_wakeups::local_wakeups_cancel,
+            execution_local_wakeups::local_wakeups_discard,
+            execution_local_agents::local_agents_subscribe,
+            execution_local_agents::local_agents_unsubscribe,
+            execution_local_agents::local_agents_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running orb");

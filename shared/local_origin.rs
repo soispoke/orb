@@ -1,6 +1,51 @@
 //! Wire record for a new, native-owned local mission. Never used to adopt an
 //! existing Core mission. Sequence numbers make reconnect/replay idempotent.
 use serde::{Deserialize, Serialize};
+/// Bounded diagnostic observations, never execution authority or commands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub id: String,
+    #[serde(default)]
+    pub identity_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_status: Option<String>,
+    pub label: String,
+    pub status: String,
+    pub done: bool,
+    pub failed: bool,
+    pub updated_at: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentReport {
+    pub run_id: uuid::Uuid,
+    pub generation: u64,
+    pub sequence: u64,
+    pub source_running: bool,
+    pub agents: Vec<AgentStatus>,
+    pub omitted: usize,
+}
+impl AgentReport {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.run_id.is_nil()
+            || self.generation == 0
+            || self.generation > i64::MAX as u64
+            || self.sequence == 0
+            || self.sequence > i64::MAX as u64
+            || self.agents.len() > 500
+            || self.agents.iter().any(|a| {
+                a.id.is_empty()
+                    || a.id.len() > 1024
+                    || a.label.len() > 1024
+                    || a.status.len() > 128
+                    || a.identity_kind.len() > 32
+                    || a.activity_status.as_ref().is_some_and(|s| s.len() > 128)
+            })
+        {
+            return Err("Invalid agent observation".into());
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Origin {
     pub id: uuid::Uuid,
@@ -16,6 +61,9 @@ pub struct Origin {
     pub service_tier: Option<crate::codex_speed::Tier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cyber_access: Option<crate::cyber_access::Mode>,
+    /// Operator-selected source; grants observation only, never parent ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_source_mission_id: Option<uuid::Uuid>,
     pub cwd: String,
     pub prompt: String,
     pub created_at: String,
@@ -48,8 +96,14 @@ impl Snapshot {
         }
         if let Some(effort) = self.origin.effort.as_deref() {
             let accepted = match self.origin.backend.as_str() {
-                "antigravity" => matches!(effort, "low" | "medium" | "high"),
-                "codex" | "claudecode" => {
+                "antigravity" | "opencode" => matches!(effort, "low" | "medium" | "high"),
+                "claudecode" => {
+                    matches!(
+                        effort,
+                        "low" | "medium" | "high" | "xhigh" | "max" | "ultracode"
+                    )
+                }
+                "codex" => {
                     matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
                 }
                 _ => false,
@@ -57,6 +111,13 @@ impl Snapshot {
             if !accepted {
                 return Err("Invalid local reasoning effort for harness".into());
             }
+        }
+        if self
+            .origin
+            .fork_source_mission_id
+            .is_some_and(|id| id.is_nil() || id == self.origin.id)
+        {
+            return Err("Invalid fork source identity".into());
         }
         if self.sequence == 0 || self.sequence > i64::MAX as u64 {
             return Err("Invalid sequence".into());
@@ -94,5 +155,84 @@ impl Snapshot {
             return Err("Invalid local folder tags".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(backend: &str, effort: Option<&str>) -> Snapshot {
+        Snapshot {
+            origin: Origin {
+                fork_source_mission_id: None,
+                id: uuid::Uuid::new_v4(),
+                run_id: uuid::Uuid::new_v4(),
+                client_id: uuid::Uuid::new_v4(),
+                title: "Effort regression".into(),
+                project: "test".into(),
+                backend: backend.into(),
+                model: None,
+                effort: effort.map(str::to_owned),
+                service_tier: None,
+                cyber_access: None,
+                cwd: "/tmp/local-effort".into(),
+                prompt: "hello".into(),
+                created_at: "2026-10-15T12:00:00Z".into(),
+                tags: vec![],
+            },
+            sequence: 1,
+            text: String::new(),
+            status: "active".into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn local_effort_accepts_claude_ultracode_through_json_roundtrip() {
+        let original = snapshot("claudecode", Some("ultracode"));
+        let wire = serde_json::to_string(&original).unwrap();
+        let decoded: Snapshot = serde_json::from_str(&wire).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded.origin.effort.as_deref(), Some("ultracode"));
+    }
+
+    #[test]
+    fn local_effort_enforces_each_harness_boundary() {
+        for backend in [
+            "claudecode",
+            "codex",
+            "antigravity",
+            "opencode",
+            "vibe",
+            "grok",
+        ] {
+            snapshot(backend, None).validate().unwrap();
+            for effort in [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode",
+                "ultra",
+                "",
+                "typo",
+            ] {
+                let expected = match backend {
+                    "claudecode" => {
+                        ["low", "medium", "high", "xhigh", "max", "ultracode"].contains(&effort)
+                    }
+                    "codex" => ["low", "medium", "high", "xhigh", "max"].contains(&effort),
+                    "antigravity" | "opencode" => ["low", "medium", "high"].contains(&effort),
+                    _ => false,
+                };
+                assert_eq!(
+                    snapshot(backend, Some(effort)).validate().is_ok(),
+                    expected,
+                    "{backend}: {effort}"
+                );
+            }
+        }
     }
 }

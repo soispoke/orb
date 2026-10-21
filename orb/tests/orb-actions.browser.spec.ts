@@ -6,6 +6,7 @@ const DONE_ID = "8c11ee52-0000-4aaa-9bbb-cccccccccccc";
 const missions = [
   {
     id: MISSION_ID,
+    project: "test",
     title: "Lido SRv3 report",
     status: "active",
     history: [],
@@ -18,10 +19,10 @@ const missions = [
     created_at: "",
     updated_at: "",
   },
-  { id: DONE_ID, title: "Earlier report", status: "completed", history: [], created_at: "", updated_at: "" },
+  { id: DONE_ID, project: "test", title: "Earlier report", status: "completed", history: [], created_at: "", updated_at: "" },
 ];
 
-type Options = { clipboard?: "ok" | "broken"; entries?: Array<{ name: string; kind: string }>; capAt?: { active: number; cap: number } };
+type Options = { argon?: boolean; clipboard?: "ok" | "broken"; entries?: Array<{ name: string; kind: string }>; capAt?: { active: number; cap: number } };
 
 async function setup(page: Page, options: Options = {}) {
   const posts: any[] = [];
@@ -49,7 +50,7 @@ async function setup(page: Page, options: Options = {}) {
     const url = new URL(request.url());
     const path = url.pathname;
     if(path === "/api/control/cyber-capabilities") return route.fulfill({json:{version:2}});
-    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"}]});
+    if(path === "/api/model-routing/chains") return route.fulfill({json:[{id:"builtin/smart",name:"Smart (Default)"},...(options.argon?[{id:"personal-argon",name:"Argon — Gemini Gateway"}]:[])]});
     if (path === "/api/control/missions" && request.method() === "POST") {
       posts.push(request.postDataJSON());
       if (options.capAt) {
@@ -77,7 +78,7 @@ async function setup(page: Page, options: Options = {}) {
       : path === "/api/providers/backend-models" ? { backends: {
           claudecode: [{ value: "claude-opus-5", label: "Anthropic — Claude Opus 5" }],
           codex: [{ value: "gpt-6-astra", label: "OpenAI — GPT-6 Astra" }],
-          opencode: [{ value: "xai/grok-4.6", label: "xAI — Grok 4.6" }],
+          opencode: [{ value: "xai/grok-4.6", label: "xAI — Grok 4.6" }, ...(options.argon?[{value:"personal-argon",label:"Argon",efforts:["low","medium","high"]}]:[])],
         } }
       : path === "/api/remote-nodes" ? { enabled: true, nodes: [], remote_launch: { typed: true, harnesses: ["codex"], proxy_url_configured: true } }
       : path === "/api/control/missions" ? (url.searchParams.get("project") === "test" ? missions : [])
@@ -268,7 +269,7 @@ test("composer effort: shown after harness and model for Codex, and sent on crea
   expect(posts[0].backend).toBe("codex");
   expect(posts[0].model_override).toBe("gpt-6-astra");
   expect(posts[0].model_effort).toBe("high");
-  expect(posts[0].cyber_access).toBe("standard");
+  expect(posts[0].cyber_access).toBe("automatic");
 });
 
 test("composer effort: absent for a harness the core ignores effort for, and reset on switch", async ({ page }) => {
@@ -344,6 +345,7 @@ test("a project cap refusal explains itself and links to that project's settings
   await expect(alert).toContainText("increase the limit in Project settings");
   // The refusal proves nothing about the provider, so it must not vouch for it.
   await expect(alert).not.toContainText(/nothing is wrong/i);
+  await expect(page.locator(".launch-refusal-meta")).toHaveText("2 of 2 unfinished");
 
   // The draft survives, and nothing was retried on its own.
   await expect(composer).toHaveValue("start the SRv3 report");
@@ -383,7 +385,7 @@ test("Concurrency limits expand inside client settings and preserve the draft", 
   await expect(global).not.toBeVisible();
   await summary.click();
   await expect(global).toHaveValue("7");
-  await expect(page.locator(".settings-body h2")).toHaveText("General");
+  await expect(page.locator(".settings-body h2")).toHaveText("Client");
   await page.screenshot({ path: "artifacts/orb-execution-settings.png" });
 });
 
@@ -553,4 +555,81 @@ test('a refused sidebar action explains itself in a dialog, not inside the proje
   await expect(page.locator('.sidebar .error-notice, nav .error-notice')).toHaveCount(0);
   await dialog.locator('.dlg-foot').getByRole('button',{name:'Close',exact:true}).click();
   await expect(dialog).toHaveCount(0);
+});
+
+ test("Argon effort is selectable, clears on Default/model switch, and reaches create", async ({ page }) => {
+  const {posts}=await setup(page,{argon:true});
+  const picks=page.locator(".picks .model:not(.cyber-pill)");
+  await picks.nth(0).click();
+  await page.getByRole("option",{name:/^OpenCode/}).click();
+  await picks.nth(1).click();
+  await page.getByRole("option",{name:/Gemini Gateway/}).click();
+  const effort=page.getByRole("button",{name:/^Reasoning effort:/});
+  await effort.click();
+  await expect(page.locator(".picker .picker-row-copy > span")).toHaveText(["Default","Low","Medium","High"]);
+  await page.getByRole("option",{name:"High",exact:true}).click();
+  await expect(effort).toHaveAccessibleName("Reasoning effort: High");
+  await effort.click();await page.getByRole("option",{name:"Default",exact:true}).click();
+  await expect(effort).toHaveAccessibleName("Reasoning effort: Default");
+  await effort.click();await page.getByRole("option",{name:"Medium",exact:true}).click();
+  await picks.nth(1).click();await page.getByRole("option",{name:"Smart (Default)",exact:true}).click();
+  await expect(effort).toHaveCount(0);
+  await picks.nth(1).click();await page.getByRole("option",{name:/Gemini Gateway/}).click();
+  await expect(effort).toHaveAccessibleName("Reasoning effort: Default");
+  await effort.click();await page.getByRole("option",{name:"High",exact:true}).click();
+  expect(await page.evaluate(()=>JSON.parse(localStorage.getItem("orb.harnessPick")!))).toMatchObject({backend:"opencode",model:"personal-argon",effort:"high"});
+  await page.getByPlaceholder("Describe a task, / for commands, @ for context").fill("Reply OK");
+  await page.keyboard.press("Enter");
+  await expect.poll(()=>posts.length).toBe(1);
+  expect(posts[0]).toMatchObject({backend:"opencode",model_override:"personal-argon",model_effort:"high"});
+ });
+
+test("Argon effort changes on an existing chat and preserves selection on a failed save",async({page})=>{
+ const mission={id:'argon-effort',title:'Argon effort check',project:'test',status:'active',backend:'opencode',model_override:'personal-argon',model_effort:'low' as string|null,history:[],created_at:'',updated_at:''};
+ const patches:unknown[]=[];let fail=false;
+ await page.addInitScript(()=>{localStorage.setItem('orb.apiUrl',location.origin);localStorage.setItem('orb.jwt','fixture');localStorage.setItem('orb-theme','dark');});
+ await page.route('**/api/**',async route=>{
+  const request=route.request(), path=new URL(request.url()).pathname;
+  if(path.endsWith('/settings') && request.method()==='PATCH'){
+   patches.push(request.postDataJSON());
+   if(fail)return route.fulfill({status:503,body:'Temporarily unavailable'});
+   mission.model_effort=request.postDataJSON().model_effort || null;
+   return route.fulfill({json:mission});
+  }
+  if(path.endsWith('/events'))return route.fulfill({headers:{'X-Orb-Events-Protocol':'1','X-Has-More':'false'},json:[]});
+  if(path==='/api/control/stream')return route.fulfill({contentType:'text/event-stream',body:''});
+  const json=path==='/api/projects'?{projects:[{slug:'test',title:'Test'}]}
+   :path==='/api/backends'?[{id:'opencode',name:'OpenCode'}]
+   :path==='/api/model-routing/chains'?[{id:'personal-argon',name:'Argon'}]
+   :path==='/api/providers/backend-models'?{backends:{opencode:[{value:'personal-argon',label:'Argon',efforts:['low','medium','high']}]}}
+   :path==='/api/control/missions'?[mission]
+   :path===`/api/control/missions/${mission.id}`?mission
+   :path.endsWith('/queue')?[]
+   :path.endsWith('/history')?[]
+   :path.endsWith('/files')?{entries:[]}
+   :path.endsWith('/crons')?{jobs:[]}
+   :{};
+  return route.fulfill({json});
+ });
+ await page.goto('/');
+ await page.getByRole('button',{name:'Test',exact:true}).click();
+ await page.getByRole('button',{name:/Argon effort check/}).click();
+ const trigger=()=>page.getByRole('button',{name:/^Reasoning effort:/});
+ await expect(trigger()).toHaveAccessibleName('Reasoning effort: Low');
+ await trigger().click();
+ await expect(page.getByRole('option',{name:'Low',exact:true})).toBeFocused();
+ await page.keyboard.press('End');await page.keyboard.press('Enter');
+ await expect(trigger()).toHaveAccessibleName('Reasoning effort: High');
+ expect(patches).toEqual([{model_effort:'high'}]);
+ await trigger().click();
+ await expect(page.getByRole('option',{name:'High',exact:true})).toHaveAttribute('aria-selected','true');
+ await page.keyboard.press('Escape');
+ fail=true;
+ await trigger().click();await page.getByRole('option',{name:'Low',exact:true}).click();
+ await expect(page.getByRole('alert').first()).toBeVisible();
+ await expect(trigger()).toHaveAccessibleName('Reasoning effort: High');
+ fail=false;
+ await trigger().click();await page.getByRole('option',{name:'Default',exact:true}).click();
+ await expect(trigger()).toHaveAccessibleName('Reasoning effort: Default');
+ expect(patches.at(-1)).toEqual({model_effort:''});
 });

@@ -1395,6 +1395,7 @@ pub async fn local_origin(
     snapshot
         .validate()
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let observation_source = snapshot.origin.fork_source_mission_id;
     let cyber = snapshot.origin.cyber_access;
     let id = snapshot.origin.id;
     if let Some(mode) = cyber {
@@ -1409,6 +1410,22 @@ pub async fn local_origin(
     }
     let _guard = DISPATCH_ADMISSION.lock().await;
     let control = control_for_user(&state, &user).await;
+    let registered_source =
+        super::fork_observation::source(&state, &user.id, id).map_err(internal_error)?;
+    if let Some(source) = observation_source.filter(|source| registered_source != Some(*source)) {
+        let original = control
+            .mission_store
+            .get_mission(source)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Fork source not found".into()))?;
+        if original.project.project.as_deref() != Some(snapshot.origin.project.as_str()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Fork source is outside this project".into(),
+            ));
+        }
+    }
     control
         .mission_store
         .sync_local_origin(snapshot)
@@ -1423,7 +1440,16 @@ pub async fn local_origin(
             super::cyber::write(&state.config.working_dir, id, mode).map_err(internal_error)?;
         }
     }
-    Ok(Json(json!({"ok":true})))
+    // Observation revocation (for example a source project move) must never
+    // turn an otherwise valid execution heartbeat into a stop instruction.
+    if let Some(source) = observation_source.filter(|source| registered_source != Some(*source)) {
+        super::fork_observation::record(&state, &user, id, source)
+            .await
+            .map_err(internal_error)?;
+    }
+    Ok(Json(
+        json!({"ok":true,"fork_source_mission_id":observation_source}),
+    ))
 }
 
 #[cfg(test)]

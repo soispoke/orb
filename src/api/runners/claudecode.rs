@@ -5,6 +5,11 @@
 //! the fix for the debug-build async stack overflow (see CLAUDE.md notes) —
 //! do not convert to `async fn`.
 
+#[path = "../../../shared/claude_stream_scope.rs"]
+mod claude_stream_scope;
+#[path = "../../../shared/claude_followup.rs"]
+mod claude_followup;
+
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -1140,6 +1145,13 @@ pub fn run_claudecode_turn<'a>(
             args.push("--dangerously-skip-permissions".to_string());
         }
 
+        // Ultracode is a workflow mode, not a valid effort environment value.
+        // Pass the native CLI flag; stream sessions also receive its explicit
+        // on/off state through apply_flag_settings on launch and live changes.
+        if model_effort == Some("ultracode") {
+            args.extend(["--effort".to_string(), "ultracode".to_string()]);
+        }
+
         // Claude Code settings and MCP config are loaded via CLAUDE_CONFIG_DIR
         // which points to the per-mission .claude directory. Claude Code auto-discovers
         // settings.local.json and mcp.json from that directory.
@@ -1151,8 +1163,16 @@ pub fn run_claudecode_turn<'a>(
         if settings_path.exists() {
             match std::fs::read_to_string(&settings_path) {
                 Ok(json_content) => {
+                    let mut settings: serde_json::Value = match serde_json::from_str(&json_content)
+                    {
+                        Ok(serde_json::Value::Object(settings)) => {
+                            serde_json::Value::Object(settings)
+                        }
+                        _ => return AgentResult::failure("Invalid Claude settings object", 0),
+                    };
+                    settings["ultracode"] = serde_json::json!(model_effort == Some("ultracode"));
                     args.push("--settings".to_string());
-                    args.push(json_content);
+                    args.push(settings.to_string());
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1163,6 +1183,12 @@ pub fn run_claudecode_turn<'a>(
                     );
                 }
             }
+        }
+        if !settings_path.exists() {
+            args.push("--settings".to_string());
+            args.push(
+                serde_json::json!({"ultracode": model_effort == Some("ultracode")}).to_string(),
+            );
         }
         let mcp_config_path = work_dir.join(".claude").join("mcp.json");
         if mcp_config_path.exists() {
@@ -1190,8 +1216,8 @@ pub fn run_claudecode_turn<'a>(
             args.push(bare.to_string());
         }
 
-        // Note: model_effort is set via CLAUDE_CODE_EFFORT_LEVEL env var below,
-        // not as a CLI flag (Claude Code CLI does not have an --effort flag).
+        // Ordinary effort uses the environment or live control channel below;
+        // Ultracode additionally uses its native workflow flag above.
 
         // For continuation turns, use --resume to resume existing session.
         // For first turn, use --session-id to create new session with that ID.
@@ -1306,9 +1332,12 @@ pub fn run_claudecode_turn<'a>(
         // typing in the interactive CLI). The positional prompt is ignored
         // by the CLI in this mode, so it is not added.
         let stream_input = native_plan || (super::live_session::enabled() && !force_argv_prompt);
+        args.push("--append-system-prompt".to_string());
+        args.push(claude_followup::INSTRUCTIONS.to_string());
         if stream_input {
             args.push("--input-format".to_string());
             args.push("stream-json".to_string());
+            args.push("--replay-user-messages".to_string());
         } else {
             // Provide the prompt as a positional argument (instead of stdin).
             //
@@ -1385,7 +1414,15 @@ pub fn run_claudecode_turn<'a>(
             // The variable outranks a later change of effort, so a session
             // that takes input receives its effort over stdin instead.
             if !stream_input || native_plan {
-                env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
+                env.insert(
+                    "CLAUDE_CODE_EFFORT_LEVEL".to_string(),
+                    if effort == "ultracode" {
+                        "xhigh"
+                    } else {
+                        effort
+                    }
+                    .to_string(),
+                );
             }
 
             // CLAUDE_CODE_EFFORT_LEVEL only nudges adaptive reasoning, which
@@ -1873,11 +1910,13 @@ pub fn run_claudecode_turn<'a>(
         let mut midturn_messages = (stream_input && !native_plan)
             .then(|| super::live_session::midturn_messages(mission_id));
         let mut background = super::live_session::ClaudeBackground::default();
+        let mut subagents =
+            super::subagents::ClaudeSubagentSession::new(events_tx.clone(), mission_id);
         let mut parked = false;
         let mut parked_slot: Option<tokio::sync::oneshot::Receiver<String>> = None;
-        // A message that reached the slot just as the CLI woke itself: it is
-        // answered after the current turn, so one more result is expected.
-        let mut extra_input_pending = false;
+        // Keep each injected message until its native echo and a later result.
+        // Unrelated assistant/tool activity must not retire a queued question.
+        let mut pending_inputs = claude_followup::PendingInputs::default();
         // How a parked session ended: whether that was expected, and the note
         // that closes the turn (every reply was already delivered).
         let mut ended_parked: Option<(bool, &'static str)> = None;
@@ -2134,8 +2173,11 @@ pub fn run_claudecode_turn<'a>(
                     tracing::info!(mission_id = %mission_id, ?effort, applied, "Effort change for the running Claude session");
                 }
                 Some(content) = async { midturn_messages.as_mut().expect("guarded by is_some").recv().await }, if midturn_messages.is_some() => {
+                    let input_id = Uuid::new_v4().to_string();
+                    pending_inputs.insert(&input_id);
                     let frame = serde_json::json!({
                         "type": "user",
+                        "uuid": input_id,
                         "message": { "role": "user", "content": [{ "type": "text", "text": content }] }
                     });
                     let delivered = if let Some(prompt) = pending_initial_prompt.as_mut() {
@@ -2155,16 +2197,17 @@ pub fn run_claudecode_turn<'a>(
                             super::live_session::unpark(mission_id);
                             turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
                             idle_deadline = claudecode_idle_deadline(turn_wait_state, Instant::now(), idle_timeout, tool_idle_timeout, post_tool_result_idle_timeout, tool_timeout_override);
-                        } else {
-                            extra_input_pending = true;
                         }
                     }
                 }
                 message = async { parked_slot.as_mut().expect("guarded by is_some").await }, if parked_slot.is_some() => {
                     parked_slot = None;
                     if let Ok(content) = message {
+                        let input_id = Uuid::new_v4().to_string();
+                        pending_inputs.insert(&input_id);
                         let frame = serde_json::json!({
                             "type": "user",
+                            "uuid": input_id,
                             "message": { "role": "user", "content": [{ "type": "text", "text": content }] }
                         });
                         let delivered = stdin_writer.as_mut().is_some_and(|w| {
@@ -2208,8 +2251,11 @@ pub fn run_claudecode_turn<'a>(
                                 // blocking write to the live stream-json stdin
                                 // means the frame is handed to the CLI, so the
                                 // returned `bool` is the true outcome.
+                                let input_id = Uuid::new_v4().to_string();
+                                pending_inputs.insert(&input_id);
                                 let msg = serde_json::json!({
                                     "type": "user",
+                                    "uuid": input_id,
                                     "message": { "role": "user", "content": [{ "type": "text", "text": block }] }
                                 });
                                 let delivered = if let Some(w) = stdin_writer.as_mut() {
@@ -2378,6 +2424,20 @@ pub fn run_claudecode_turn<'a>(
                         }
                     }
 
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        subagents.consume(&event);
+                        // Nested model output belongs to its task, not to the
+                        // coordinator's buffers or turn completion state.
+                        if claude_stream_scope::is_child_message(&event) {
+                            continue;
+                        }
+                        if event["type"] == "user" {
+                            if let Some(id) = event["uuid"].as_str() {
+                                pending_inputs.acknowledge(id);
+                            }
+                        }
+                    }
+
                     if keep_alive && line.contains("\"system\"") {
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
                             background.consume(&event);
@@ -2445,22 +2505,19 @@ pub fn run_claudecode_turn<'a>(
                             if let Some(content) =
                                 parked_slot.take().and_then(|mut slot| slot.try_recv().ok())
                             {
+                                let input_id = Uuid::new_v4().to_string();
+                                pending_inputs.insert(&input_id);
                                 let frame = serde_json::json!({
                                     "type": "user",
+                                    "uuid": input_id,
                                     "message": { "role": "user", "content": [{ "type": "text", "text": content }] }
                                 });
                                 if let Some(w) = stdin_writer.as_mut() {
                                     use std::io::Write as _;
-                                    extra_input_pending =
-                                        writeln!(w, "{}", frame).and_then(|_| w.flush()).is_ok();
+                                    let _ = writeln!(w, "{}", frame).and_then(|_| w.flush());
                                 }
                             }
                             turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
-                        } else if main_thread && matches!(&claude_event, ClaudeEvent::Assistant(_))
-                        {
-                            // A new assistant message arrived after mid-turn input was injected,
-                            // meaning the CLI consumed the mid-turn input within this turn.
-                            extra_input_pending = false;
                         }
                     }
                     if !matches!(claude_event, ClaudeEvent::System(_)) {
@@ -2970,10 +3027,11 @@ pub fn run_claudecode_turn<'a>(
                                     if let Some(cost) = res.total_cost_usd {
                                         total_cost_usd = Some(cost);
                                     }
+                                    pending_inputs.complete_result();
                                     if keep_alive
                                         && stdin_writer.is_some()
                                         && !process_exited
-                                        && (background.running() > 0 || extra_input_pending)
+                                        && (background.running() > 0 || !pending_inputs.is_empty())
                                         && !res.is_error
                                         && res.subtype != "error"
                                         && !res.error_message().starts_with("API Error:")
@@ -2983,7 +3041,6 @@ pub fn run_claudecode_turn<'a>(
                                             &res.error_message(),
                                         )
                                     {
-                                        extra_input_pending = false;
                                         let reply = res
                                             .result
                                             .filter(|text| !text.trim().is_empty())
@@ -3028,13 +3085,15 @@ pub fn run_claudecode_turn<'a>(
                                         tracing::info!(
                                             mission_id = %mission_id,
                                             background_tasks = background.running(),
-                                            "Claude turn ended with background tasks running; keeping the session"
+                                            pending_input = !pending_inputs.is_empty(),
+                                            "Claude turn ended with outstanding work; keeping the session"
                                         );
                                         let _ = events_tx.send(AgentEvent::MissionActivity {
-                                            label: format!(
-                                                "Waiting for {} background task(s)",
-                                                background.running()
-                                            ),
+                                            label: if !pending_inputs.is_empty() {
+                                                "Waiting for Claude to acknowledge your follow-up".to_string()
+                                            } else {
+                                                format!("Waiting for {} background task(s)", background.running())
+                                            },
                                             tool_name: super::live_session::PARKED_MARKER.to_string(),
                                             mission_id: Some(mission_id),
                                         });

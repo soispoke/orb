@@ -44,7 +44,7 @@ impl Store {
         }
     }
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_interaction_subscribe(
     id: String,
     on_event: Channel<Option<Request>>,
@@ -62,7 +62,7 @@ pub fn local_interaction_subscribe(
         .insert(token, on_event);
     Ok(token)
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_interaction_unsubscribe(id: String, token: u64) -> Result<(), String> {
     let mut store = pending().lock().map_err(|e| e.to_string())?;
     if let Some(subscribers) = store.subscribers.get_mut(&id) {
@@ -73,7 +73,7 @@ pub fn local_interaction_unsubscribe(id: String, token: u64) -> Result<(), Strin
     }
     Ok(())
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_interaction(id: String) -> Result<Option<Request>, String> {
     Ok(pending()
         .lock()
@@ -82,7 +82,7 @@ pub fn local_interaction(id: String) -> Result<Option<Request>, String> {
         .get(&id)
         .map(|p| p.request.clone()))
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_interaction_answer(
     id: String,
     request_id: String,

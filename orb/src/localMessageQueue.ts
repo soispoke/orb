@@ -1,14 +1,18 @@
+import {saveLocalTranscriptBoundary} from './localTranscriptStorage';
+import {localActivitiesToStreamItems} from './workModel';
+import {localLiveText,localActivities} from './localAgents';
+import {followLocalReply} from './localReply';
 import {createSignal,batch} from 'solid-js';
 import {mergeById} from './poll';
-import {connectionVersion,getMission,reopenMission,appendClientTranscript,setClientMissionStatus} from './api';
-import type {ClientRunReceipt} from './clientRuns';
+import {api,connectionVersion,getMission,reopenMission,appendClientTranscript,setClientMissionStatus} from './api';
+import {clientRunReceipt, type ClientRunReceipt} from './clientRuns';
 import {readSideThread,saveSideThread} from './composerDrafts';
 import {sideQuestionKey} from './sideQuestionStorage';
 import {normalizeEffort} from './effort';
 import {providerLimit} from './usageLimit';
-import {recoverLocalLaunch,recordLocalFailure,restoreLocalBindings,localBinding,pollLocal,reconcileLocalRun,startLocal,followLocal,stopLocal,type StartLocal,type PollLocal} from './localAgents';
+import {localInputToken,steerLocal,recoverLocalLaunch,recordLocalFailure,restoreLocalBindings,localBinding,pollLocal,reconcileLocalRun,startLocal,type StartLocal,type PollLocal} from './localAgents';
 
-export type QueuedLocalMessage={id:ReturnType<typeof crypto.randomUUID>;mission:string;text:string;request:StartLocal;state:'queued'|'dispatching'|'accepted'|'error';error?:string;interrupted?:boolean;autoResumed?:boolean;resumes?:number;lastSyncedText?:string;cut?:'restart'|'connection'|'background';retryAfter?:number;waiting?:boolean;delegated?:boolean;scheduled?:boolean;receipt?:ClientRunReceipt;claimedAt?:number;userSynced?:boolean;result?:PollLocal;resultStatus?:'interrupted'|'failed'|'awaiting_user';resultId?:ReturnType<typeof crypto.randomUUID>;heldAt?:number};
+export type QueuedLocalMessage={id:ReturnType<typeof crypto.randomUUID>;mission:string;text:string;request:StartLocal;state:'queued'|'dispatching'|'accepted'|'error';error?:string;interrupted?:boolean;autoResumed?:boolean;resumes?:number;lastSyncedText?:string;cut?:'restart'|'connection'|'background';retryAfter?:number;waiting?:boolean;delegated?:boolean;scheduled?:boolean;receipt?:ClientRunReceipt;claimedAt?:number;userSynced?:boolean;result?:PollLocal;resultStatus?:'interrupted'|'failed'|'awaiting_user';resultId?:ReturnType<typeof crypto.randomUUID>;heldAt?:number;steerToken?:string};
 const [entries,publishEntries]=createSignal<QueuedLocalMessage[]>([]);
 // IndexedDB clones every read. Keep unchanged rows stable so the 1s worker
 // heartbeat does not invalidate every mounted conversation and its markdown.
@@ -25,7 +29,7 @@ const lostRun='Orb lost the local run. Your message is saved. Retry to resume it
 export const resumedPrompt=(prompt:string,cut:'restart'|'connection'|'background'='restart')=>{
  const note=cut==='background'
   ?'Your previous headless turn ended while a background task was still running, before its completion could wake the CLI. Check what is already done (and inspect any task logs or re-run foreground commands if needed), then continue from there. Do not redo finished work.'
-  :`${cut==='connection'?'The connection was lost':'Orb restarted'} while you were working on the request below, so your previous turn was cut short. Check what is already done, then continue from there. Do not redo finished work.`;
+  :`${cut==='connection'?'The connection was lost during the previous turn.':'The previous local run is no longer available; recovery confirmed it has stopped. This does not establish that Orb restarted.'} Check what is already done, then continue the request below. Do not redo finished work or restart surviving builds.`;
  const trimmed=prompt.trimStart();
  if(/^\/(?:goal|plan)(?:\s|$)/.test(trimmed))return `${trimmed}\n\n${note}`;
  return `${note}\n\n${prompt}`;
@@ -50,8 +54,6 @@ const CONNECTION_BACKOFF_MS=[1_000,5_000,15_000,30_000];
 export function connectionRetryDelayMs(resumes:number){
  return CONNECTION_BACKOFF_MS[Math.min(Math.max(resumes-1,0),CONNECTION_BACKOFF_MS.length-1)];
 }
-/** A turn that only waits for its background tasks yields to a waiting message after this long. */
-const BACKGROUND_WAIT_MS=10*60_000;
 const offline=(error:unknown)=>/Load failed|Failed to fetch|NetworkError|network connection was lost|timed out|error sending request/i.test(String(error));
 /** Core was restarting or unreachable: the answer to the launch was lost, not refused. */
 const unreachable=(error:unknown)=>offline(error)||/\b50[234]\b|Bad Gateway|Service Unavailable|Gateway Time-?out/i.test(String(error));
@@ -62,7 +64,7 @@ function requeue(stored:QueuedLocalMessage,cut:'restart'|'connection'|'backgroun
  delete stored.error;delete stored.interrupted;
  delete stored.receipt;delete stored.result;delete stored.resultId;delete stored.resultStatus;delete stored.userSynced;delete stored.claimedAt;
 }
-const wake=()=>window.dispatchEvent(new Event(wakeEvent));
+export const wakeLocalQueue=()=>window.dispatchEvent(new Event(wakeEvent));
 async function locked<T>(key:string,action:()=>Promise<T>):Promise<T>{
  if(!navigator.locks)throw new Error('Update Orb to queue messages safely on this computer.');
  return navigator.locks.request(key,action);
@@ -89,6 +91,16 @@ export async function confirmWakeupStops(confirmations:{mission:string;token:str
   for(const {mission,token} of confirmations)if(fences[mission]?.token===token&&fences[mission].blocked){fences[mission].blocked=false;changed=true;}
   if(changed)await saveSideThread(`${key}:wake-stops`,fences);
  });
+}
+/** Only a deliberate user action releases a paused conversation's saved queue. */
+async function releasePausedQueue(mission:string){
+ const version=connectionVersion(),state=await getMission(mission);
+ if(version!==connectionVersion())throw Error('Connection changed. The message stays saved.');
+ if(state.status!=='paused')return;
+ await api(`/api/control/missions/${encodeURIComponent(mission)}/status`,{
+  method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'awaiting_user'}),
+ });
+ if(version!==connectionVersion())throw Error('Connection changed. The message stays saved.');
 }
 export async function enqueueLocalMessage(request:StartLocal,text:string,options:{wakeupFence?:WakeupFence;id?:ReturnType<typeof crypto.randomUUID>;waiting?:boolean;delegated?:boolean;scheduled?:boolean;replace?:boolean}={}){
  const key=storageKey(),id=options.id??crypto.randomUUID();
@@ -131,7 +143,8 @@ export async function enqueueLocalMessage(request:StartLocal,text:string,options
   await write(key,rows);
   if(options.delegated)await saveSideThread(seenKey,[...seen,id]);
  });
- wake();return id;
+ if(!options.delegated&&!options.scheduled&&!options.replace)await releasePausedQueue(request.id);
+ wakeLocalQueue();return id;
 }
 /** A held message pauses its conversation's queue while it is being edited. Holds
  * expire so a closed window can never block the queue for good. */
@@ -143,7 +156,7 @@ export async function holdQueuedMessage(id:string){
  if(text===undefined)throw Error('This message was already sent.');
  return text;
 }
-export async function releaseQueuedMessage(id:string){await update(storageKey(),id,row=>{delete row.heldAt;});wake();}
+export async function releaseQueuedMessage(id:string){await update(storageKey(),id,row=>{delete row.heldAt;});wakeLocalQueue();}
 /** Move a waiting message ahead of the other waiting messages of its conversation. */
 export async function prioritizeQueuedMessage(id:string){
  const key=storageKey();
@@ -155,7 +168,7 @@ export async function prioritizeQueuedMessage(id:string){
   rows.splice(first<0?rows.length:first,0,row);
   await write(key,rows);
  });
- wake();
+ wakeLocalQueue();
 }
 export const canDiscardQueuedMessage=(row:QueuedLocalMessage)=>!['dispatching','accepted'].includes(row.state)||!!row.interrupted||(row.state==='dispatching'&&!!row.error);
 /** An interrupted send is removable only after native recovery confirms it stopped.
@@ -174,7 +187,7 @@ async function discardQueuedMessage(id:string):Promise<string|undefined>{
   await write(key,rows.filter(row=>row.id!==id));
   return row.text;
  });
- wake();return text;
+ wakeLocalQueue();return text;
 }
 export async function removeQueuedMessage(id:string){
  const prev=entries();
@@ -197,13 +210,15 @@ export async function takeQueuedMessage(id:string){
 export async function retryQueuedMessage(id:string){
  const key=storageKey(),row=(await read(key)).find(row=>row.id===id);
  if(!row)return;
+ if(row.steerToken)throw new Error('This steering delivery needs review; it cannot be replayed as a new run.');
+ await releasePausedQueue(row.mission);
  if(row.state==='accepted'&&row.interrupted){
   try{
    const native=await pollLocal(row.mission);
    if(!native.done){
     recordLocalFailure(row.mission,null);
     if(key===storageKey())await update(key,id,stored=>{if(stored.state==='accepted'&&stored.interrupted){delete stored.interrupted;delete stored.error;}});
-    wake();
+    wakeLocalQueue();
     return;
    }
   }catch{/* fall through to recovery */}
@@ -225,34 +240,76 @@ export async function retryQueuedMessage(id:string){
    delete stored.receipt;delete stored.result;delete stored.resultId;delete stored.resultStatus;delete stored.userSynced;delete stored.claimedAt;
   }
  });
- wake();
+ wakeLocalQueue();
 }
 const settling=new Map<string,Promise<void>>();
-const stopping=new Set<string>();
-export async function sendQueuedNow(mission:string,id?:string){
+const steeringMissions=new Set<string>();
+// Transport uncertainty is durable before stdin is touched. Presentation is
+// transient: a pending acknowledgement is not a failed delivery. After reopening
+// there is no pending promise, so the persisted uncertainty remains visible.
+const [pendingSteers,setPendingSteers]=createSignal(new Map<string,string>());
+export const localSteeringPending=(mission:string,id:string)=>pendingSteers().get(`${storageKey()}:${mission}`)===id;
+export type QueuedSendOutcome = "accepted" | "queued" | "unconfirmed";
+/** Only an acknowledged write to the existing session earns an accepted receipt. */
+export async function sendQueuedNow(mission:string,id?:string):Promise<QueuedSendOutcome>{
  const key=storageKey(),runKey=`${key}:${mission}`;
- if(stopping.has(runKey))return;
- stopping.add(runKey);
+ if(steeringMissions.has(runKey))return "unconfirmed";
+ steeringMissions.add(runKey);
  try {
+  // Inspect before retry/recovery: those operations must never be used to steer.
+  let running=false;
+  try {running=!(await pollLocal(mission)).done;}
+  catch(error){if(!/no local run/i.test(String(error)))throw error;}
+  if(key!==storageKey())return "unconfirmed";
+  if(running){
+   const row=(await read(key)).find(row=>row.mission===mission&&(id?row.id===id:row.state==='queued'));
+   if(!row||row.state!=='queued'||row.steerToken)throw new Error('This message is not available for live steering.');
+   setPendingSteers(previous=>new Map(previous).set(runKey,row.id));
+   const token=await localInputToken(mission);
+   const receipt=await clientRunReceipt(mission);
+   if(key!==storageKey())return "unconfirmed";
+   // Persist uncertainty before touching stdin. A crash or lost reply must not
+   // turn a possibly delivered steer into a fresh run after reopening Orb.
+   await locked(key,async()=>{
+    const rows=await read(key),stored=rows.find(r=>r.id===row.id);
+    if(key!==storageKey()||stored?.state!=='queued'||stored.steerToken)throw new Error('Queued message changed before steering.');
+    stored.steerToken=token;stored.state='error';stored.receipt=receipt;
+    stored.error='Live delivery is unconfirmed. This message will not be resent automatically.';
+    await write(key,rows);
+   });
+   if(key!==storageKey())return "unconfirmed";
+   const boundary={id:row.id,runId:receipt.run_id,text:row.text,before:localLiveText(mission),activityKeys:localActivitiesToStreamItems(localActivities(mission)).map(item=>item.key),accepted:false};
+   await saveLocalTranscriptBoundary(mission,boundary);
+   await steerLocal(mission,token,row.id,row.request.prompt);
+   if(key!==storageKey())return "unconfirmed";
+   await saveLocalTranscriptBoundary(mission,{...boundary,accepted:true});
+   if(key!==storageKey())return "unconfirmed";
+   await appendClientTranscript(mission,'user',row.text,row.id,receipt);
+   await locked(key,async()=>{const rows=await read(key);await write(key,rows.filter(r=>r.id!==row.id));if(key===storageKey())setAccepted(previous=>[...previous.filter(r=>r.id!==row.id),{...row,state:'accepted'}]);});
+   if(key===storageKey())window.dispatchEvent(new Event('orb:refresh'));
+   return "accepted";
+  }
+  // Confirmed idle: ordinary queue dispatch, never stop an agent to create room.
+  await releasePausedQueue(mission);
   if(id)await prioritizeQueuedMessage(id);
-  // The queue waits behind its first message: one that needs attention is retried first.
   const first=(await read(key)).find(row=>row.mission===mission);
+  if(first?.steerToken)throw new Error('Previous live delivery needs review before sending again.');
   if(first&&retryable(first))await retryQueuedMessage(first.id);
   else if(first?.state==='queued'&&first.retryAfter)await update(key,first.id,stored=>{delete stored.retryAfter;});
-  if(!(await read(key)).some(row=>row.mission===mission&&row.state==='queued'))return;
-  // An idle/recovered conversation has nothing to stop. Only an explicit
-  // missing-run response grants recovery; transport failures remain failures.
-  let running = false;
-  try { running = !(await pollLocal(mission)).done; }
-  catch (error) { if (!/no local run/i.test(String(error))) throw error; }
-  if (running) await stopLocal(mission, { cancelWakeups: false });
-  // The follower saves the partial answer before closing its run receipt.
+  if(!(await read(key)).some(row=>row.mission===mission&&row.state==='queued'))return "unconfirmed";
   const follower=settling.get(runKey);
   if(follower)await follower;else await recoverLocalLaunch(mission);
- }finally{stopping.delete(runKey);wake();}
+  return key===storageKey()?"queued":"unconfirmed";
+ }finally{
+  setPendingSteers(previous=>{const next=new Map(previous);next.delete(runKey);return next;});
+  steeringMissions.delete(runKey);wakeLocalQueue();
+ }
 }
 export function startLocalQueueWorker(){
  const key=storageKey(),version=connectionVersion();let stopped=false,busy=false,again=false;
+ // A missing Core record is not permission to discard input or restart a
+ // local agent. Retain the queue and back off just this mission's observation.
+ const missingMissions = new Map<string, {attempts:number; retryAt:number}>();
  let retryTimer:ReturnType<typeof setTimeout>|undefined,retryWakeAt=Infinity;
  const clearRetryTimer=()=>{if(retryTimer!==undefined){clearTimeout(retryTimer);retryTimer=undefined;retryWakeAt=Infinity;}};
  batch(()=>{setEntries([]);setAccepted([]);});
@@ -281,7 +338,9 @@ export function startLocalQueueWorker(){
    const resume=!row.resultStatus&&cutByConnection(row.result)&&(row.resumes??0)<RESUME_LIMIT;
    recordLocalFailure(row.mission,failed&&!resume?(row.result.error||`Local process exited with code ${row.result.exit_code}`):null);
    const status=row.resultStatus??(resume?'interrupted':failed?'failed':'awaiting_user');
-   if(row.scheduled&&!resume)await setClientMissionStatus(row.mission,status,row.receipt,row.id);
+   const failure=status==='failed'?(row.result.error||`Local process exited with code ${row.result.exit_code}`):undefined;
+   if(failure)await setClientMissionStatus(row.mission,status,row.receipt,row.scheduled&&!resume?row.id:undefined,failure);
+   else if(row.scheduled&&!resume)await setClientMissionStatus(row.mission,status,row.receipt,row.id);
    else await setClientMissionStatus(row.mission,status,row.receipt);
    if(!valid())return;
    if(resume){
@@ -304,7 +363,7 @@ export function startLocalQueueWorker(){
    if(closed){stored.state='error';stored.interrupted=true;stored.error=closedRun;}
    else stored.error=`Saved locally; could not finish syncing: ${String(error)}`;
   });
-  if(closed)wake();
+  if(closed)wakeLocalQueue();
  }
  function follow(row:QueuedLocalMessage){
   const runKey=`${key}:${row.mission}`;if(settling.has(runKey))return;
@@ -314,13 +373,13 @@ export function startLocalQueueWorker(){
    if(!lock)return;
    try {
     // Begin observing output immediately. A slow transcript write must not hide it.
-    const output=followLocal(row.mission,()=>{});
+    const output=followLocalReply(row.mission,row.receipt);
     const userSync=Promise.resolve(appendClientTranscript(row.mission,'user',row.text,row.id,row.receipt)).then(async()=>{
      row.userSynced=true;
      await update(key,row.id,stored=>{stored.userSynced=true;});
     }).catch(()=>{});
     const result=await output;await userSync;if(!valid())return;
-    row={...row,result,resultId:crypto.randomUUID(),resultStatus:stopping.has(runKey)?'interrupted':undefined};
+    row={...row,result,resultId:crypto.randomUUID()};
     await update(key,row.id,stored=>{stored.result=result;stored.resultId=row.resultId;stored.resultStatus=row.resultStatus;});
     await persistResult(row);finished=true;
    }catch(error){
@@ -338,7 +397,7 @@ export function startLocalQueueWorker(){
      finished=recovered;
     }else await syncFailed(row,error);
    }
-  }).then(()=>{}).finally(()=>{settling.delete(runKey);if(finished)wake();});settling.set(runKey,promise);
+  }).then(()=>{}).finally(()=>{settling.delete(runKey);if(finished)wakeLocalQueue();});settling.set(runKey,promise);
  }
  const tick=async()=>{
   if(!valid())return;if(busy){again=true;return;}busy=true;
@@ -348,16 +407,23 @@ export function startLocalQueueWorker(){
    for(const row of rows){
     if(!valid())return;if(seen.has(row.mission))continue;seen.add(row.mission);
     const runKey=`${key}:${row.mission}`;
-    if(stopping.has(runKey))continue;
-    if(settling.has(runKey)){
-     // This queue started the turn and follows it. It has answered and only waits for a
-     // background task: a message waiting behind it goes next after the same delay.
-     if(rows.some(r=>r.mission===row.mission&&r.state==='queued'&&!held(r))){
-      const native=await pollLocal(row.mission).catch(()=>undefined);
-      if(native&&!native.done&&native.waiting_since&&Date.now()-native.waiting_since>BACKGROUND_WAIT_MS)void sendQueuedNow(row.mission).catch(()=>{});
+    if(steeringMissions.has(runKey))continue;
+    // Neither queueing nor steering authorizes interrupting work.
+    if(row.steerToken)continue;
+    if(settling.has(runKey))continue;
+    // Paused means no automatic dispatch or recovery, including after UI restart.
+    // Keep every durable row intact until a user sends or explicitly resumes.
+    if ((missingMissions.get(row.mission)?.retryAt ?? 0) > Date.now()) continue;
+    const observed=await getMission(row.mission).catch(error=>{
+     if (error instanceof Error && 'status' in error && error.status === 404) {
+      const attempts = (missingMissions.get(row.mission)?.attempts ?? 0) + 1;
+      missingMissions.set(row.mission, {attempts, retryAt:Date.now()+Math.min(60_000, 5_000 * 2 ** Math.min(attempts-1,4))});
      }
-     continue;
-    }
+     return undefined;
+    });
+    if (observed) missingMissions.delete(row.mission);
+    if(!valid())return;
+    if(!observed||observed.status==='paused')continue;
     // A message that failed only because nothing could be reached was never sent: it waits again.
     if(row.state==='error'&&!row.interrupted&&!row.receipt&&unreachable(row.error)&&(row.resumes??0)<RESUME_LIMIT){
      await update(key,row.id,stored=>{if(stored.state==='error'&&!stored.receipt){stored.state='queued';stored.resumes=(stored.resumes??0)+1;stored.error='Waiting for the connection to come back.';}});
@@ -409,7 +475,8 @@ export function startLocalQueueWorker(){
      // retire the superseded interrupted row to the recovery archive so it never head-of-line blocks.
      const queuedBehind=rows.filter(r=>r.mission===row.mission&&r.id!==row.id&&r.state==='queued');
      if(row.state==='error'&&queuedBehind.length>0){
-      let superseded=!!row.userSynced&&queuedBehind.some(r=>!r.delegated&&!r.scheduled);
+      // Saving the input does not confirm that an auto-resumed execution finished.
+      let superseded=!!row.userSynced&&!(row.autoResumed&&row.error===lostRun)&&queuedBehind.some(r=>!r.delegated&&!r.scheduled);
       if(!superseded&&row.receipt?.generation!=null){
        const currentMission=await getMission(row.mission).catch(()=>undefined);
        superseded=currentMission?.execution?.generation!=null&&currentMission.execution.generation>row.receipt.generation;
@@ -460,9 +527,8 @@ export function startLocalQueueWorker(){
     const binding=localBinding(row.mission);if(!binding)continue;
     try {
      try{const native=await pollLocal(row.mission);if(!native.done){
-      // The turn has answered; a background task that never ends must not hold the queue.
-      if(native.waiting_since&&Date.now()-native.waiting_since>BACKGROUND_WAIT_MS)void sendQueuedNow(row.mission).catch(()=>{});
-      else await reconcileLocalRun(row.mission);
+      // Waiting age says nothing about completion (including memory pauses).
+      await reconcileLocalRun(row.mission);
       continue;}}catch(error){if(!/no local run/i.test(String(error)))throw error;}
      await reconcileLocalRun(row.mission);if(!valid())return;
      const mission=await getMission(row.mission);
@@ -470,7 +536,7 @@ export function startLocalQueueWorker(){
      if(['active','running','starting','resuming'].includes(mission.status)||mission.status==='pending'&&!row.delegated)continue;
      if(!valid())return;
      // Only the durable claim is locked: enqueue/cancel never waits for the network.
-     const claimed=await locked(key,async()=>{const current=await read(key);const first=current.find(r=>r.mission===row.mission);if(first?.id!==row.id||first.state!=='queued'||current.some(r=>r.mission===row.mission&&held(r))||!valid()||stopping.has(runKey))return false;first.state='dispatching';first.claimedAt=Date.now();delete first.retryAfter;await write(key,current);return true;});
+     const claimed=await locked(key,async()=>{const current=await read(key);const first=current.find(r=>r.mission===row.mission);if(first?.id!==row.id||first.state!=='queued'||current.some(r=>r.mission===row.mission&&held(r))||!valid()||steeringMissions.has(runKey))return false;first.state='dispatching';first.claimedAt=Date.now();delete first.retryAfter;await write(key,current);return true;});
      if(!claimed)continue;
      row.state='dispatching';
      // Sending a saved follow-up explicitly reopens an archived conversation.
@@ -486,10 +552,10 @@ export function startLocalQueueWorker(){
      // invocation under the queue lock, but never hold that lock for its network work.
      const launch=await locked(key,async()=>{
       const stored=(await read(key)).find(r=>r.id===row.id);
-      if(!stored||stored.state!=='dispatching'||!valid()||stopping.has(runKey))return;
+      if(!stored||stored.state!=='dispatching'||!valid()||steeringMissions.has(runKey))return;
       // Read effort at dispatch, not enqueue: changes made while a turn is
       // running apply to its next follow-up, including a cleared override.
-      const effort = row.request.harness === 'antigravity'
+      const effort = ['antigravity', 'claudecode'].includes(row.request.harness)
        ? normalizeEffort(mission.model_effort, row.request.harness) ?? undefined
        : row.request.effort;
       return {pending:startLocal({...row.request,effort,service_tier:row.request.harness==='codex' ? mission.service_tier ?? (mission.fast_mode ? 'fast' : 'standard') : undefined,prompt:row.autoResumed?resumedPrompt(row.request.prompt,row.cut):row.request.prompt,sessionId:localBinding(row.mission)?.sessionId})};
@@ -516,8 +582,8 @@ export function startLocalQueueWorker(){
   finally{busy=false;if(again&&valid()){again=false;queueMicrotask(()=>void tick());}}
  };
  const onWake=()=>void tick();window.addEventListener(wakeEvent,onWake);void tick();// A queued row waits on a turn this window may not be following: look again on its own.
- const timer=setInterval(()=>{if(entries().some(row=>row.state==='queued'||row.state==='dispatching'||!!row.error||!!row.interrupted))onWake();},3000);window.addEventListener('online',onWake);
- return ()=>{stopped=true;clearRetryTimer();clearInterval(timer);window.removeEventListener(wakeEvent,onWake);window.removeEventListener('online',onWake);};
+ const timer=setInterval(()=>{if(entries().some(row=>row.state==='queued'||row.state==='dispatching'||!!row.error||!!row.interrupted))onWake();},3000);const onOnline=()=>{missingMissions.clear();onWake();};window.addEventListener('online',onOnline);
+ return ()=>{stopped=true;clearRetryTimer();clearInterval(timer);window.removeEventListener(wakeEvent,onWake);window.removeEventListener('online',onOnline);};
 }
 
 /** Stop removes automatic continuations still waiting on this computer. */
@@ -528,5 +594,5 @@ export async function cancelQueuedWakeups(mission:string) {
   fences[mission]={token,blocked:true};await saveSideThread(`${key}:wake-stops`,fences);
   const rows=await read(key);await write(key,rows.filter(r=>r.mission!==mission||!r.scheduled||r.state==='accepted'));
  });
- wake();return token;
+ wakeLocalQueue();return token;
 }

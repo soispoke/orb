@@ -6,7 +6,9 @@ vi.mock('../src/api',()=>({api:vi.fn(),connectionVersion:()=>0}));
 import {api} from '../src/api';
 afterEach(()=>{vi.mocked(api).mockReset();cleanup();setDraftCyber('standard');});
 describe('cyber selection',()=>{
+ it('defaults new drafts to Automatic',()=>{expect(draftCyber()).toBe('automatic');});
  it('refuses unsupported remote selections before creating a mission without changing the requested mode',async()=>{
+  setDraftCyber('standard');
   vi.mocked(api).mockResolvedValue({version:2,route_supported:false,refusal:'unsupported_access_program: Choose Automatic explicitly.'});
   await expect(requireCyberSupport({model:'gpt-6.1-sol',mode:'standard',remote:true})).rejects.toThrow('Choose Automatic');
   expect(draftCyber()).toBe('standard');

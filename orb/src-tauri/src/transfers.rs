@@ -21,7 +21,7 @@ pub fn local_machine_identity() -> Result<String, String> {
     std::fs::write(path, &id).map_err(|e| e.to_string())?;
     Ok(id)
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub async fn local_machine_transfer(
     id: String,
     transfer_id: String,
@@ -107,6 +107,10 @@ pub async fn local_agents_start_authorized(
     )
     .await?;
     if !permit.legacy {
+        if let Ok(run_id) = permit.run_id.parse() {
+            crate::agent_observation::start(mission_id.clone(), run_id, permit.generation,
+                crate::run_recovery::Connection { api_url: permit.api_url.clone(), token: permit.token.clone() });
+        }
         let generation = crate::local_agents::native_generation(&mission_id);
         tauri::async_runtime::spawn(async move {
             let http = reqwest::Client::new();

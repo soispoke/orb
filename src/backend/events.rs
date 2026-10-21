@@ -30,6 +30,13 @@ pub enum ExecutionEvent {
     },
     /// Text content being streamed.
     TextDelta { content: String },
+    /// Full revision of one native assistant item. Identity must survive every
+    /// layer: a long-running goal can contain many independent replies.
+    TextSnapshot {
+        item_id: String,
+        content: String,
+        done: bool,
+    },
     /// Optional turn summary (backend-specific).
     TurnSummary { content: String },
     /// Token usage report from the backend (e.g. Codex turn.completed).

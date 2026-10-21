@@ -9,7 +9,7 @@ async function setup(page: Page, mixed = false) {
   const mission = {id:"active",title:"Queue and task review",status:"active",project:"test",backend:"codex",history:[],created_at:"",updated_at:""};
   const done = Array.from({length:6},(_,i)=>({...mission,id:`done-${i}`,title:`Finished mission ${i+1}`,status:"completed"}));
   let reject: boolean | string = false, loseReply = false, sequence = 5;
-  const pending: Array<{id:string;content:string;mission_id:string}> = [];
+  const pending: Array<{id:string;content:string;mission_id:string;source:string}> = [];
   const posts: Array<Record<string,any>> = [];
   const events: StoredEvent[] = [
     {id:1,event_id:"initial",sequence:1,event_type:"user_message",content:"Review this work",timestamp:"",metadata:{queued:false}},
@@ -29,7 +29,7 @@ async function setup(page: Page, mixed = false) {
       if(reject) return route.fulfill({json:{id:body.client_message_id,queued:false,message_accepted:false}});
       const id=body.client_message_id;
       const suffix=body.attachments?.length ? `\n\n<!-- paloma:attachment:${id} -->\nAttached context: read \`.paloma/messages/${id}/.paloma/attach.md\` (paths in that manifest are relative to \`.paloma/messages/${id}\`).` : "";
-      const row={id,content:body.content+suffix,mission_id:"active"};
+      const row={id,content:body.content+suffix,mission_id:"active",source:"remote-queue"};
       if(!pending.some(item=>item.id===id)) pending.push(row);
       extraFrames+=`event: user_message\ndata: ${JSON.stringify({...row,queued:true})}\n\n`;
       if(loseReply){loseReply=false;return route.abort("failed");}
@@ -120,6 +120,7 @@ test("combined queue and checklist survives failure, identical sends, reload and
   state.setReject(false);
   for(let i=0;i<2;i++){await field.fill("same text @README.md");await field.press("Escape");await field.press("Enter");await expect(field).toHaveValue("");}
   await expect(page.locator('.followup-queue .queue-row')).toHaveCount(2);
+  await expect.poll(()=>state.posts.length).toBe(3);
   expect(state.posts[1].attachments).toEqual([{kind:"path",path:"README.md"}]);
   await expect(page.locator('.followup-queue')).toContainText("Attached context");
   await expect(page.locator('.followup-queue')).not.toContainText(".paloma");
@@ -167,18 +168,20 @@ test("reserved attachment reference rejection keeps the follow-up draft and atta
 });
 
 
-test("remote queue appears while the message request is still pending",async({page})=>{
+test("steering appears in chat while admission is pending and queues only after live delivery declines",async({page})=>{
   const state=await setup(page,true);state.releaseSlow();
   let release!:()=>void;
   const receipt=new Promise<void>(resolve=>release=resolve);
   await page.route("**/api/control/message",async route=>{await receipt;await route.fallback();});
+  await page.route("**/api/control/queue/*/send-now",route=>route.fulfill({json:{ok:true,delivered:false}}));
   await page.getByRole("button",{name:"Queue and task review",exact:true}).click();
   const field=page.getByPlaceholder("Send follow-up");
   await field.fill("Continue overnight despite a slow connection");await field.press("Enter");
   const queue=page.getByRole("region",{name:"Queued messages",exact:true});
-  await expect(queue).toContainText("Continue overnight despite a slow connection");
-  await expect(queue).toContainText("Sending…");
-  await expect(queue.getByRole("button",{name:/Remove queued message/})).toHaveCount(0);
+  await expect(page.locator('.scroll .user').filter({hasText:"Continue overnight despite a slow connection"})).toHaveCount(1);
+  await expect(page.getByRole("status")).toContainText("Sending to the running session… Work continues.");
+  await expect(queue).toHaveCount(0);
+  await expect(field).toHaveValue("");
   expect(state.posts).toHaveLength(0);
   release();
   await expect(queue).toContainText("1 Queued");

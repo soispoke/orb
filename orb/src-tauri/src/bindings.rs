@@ -119,7 +119,7 @@ pub fn remove_local_bindings(ids: &[String]) -> Result<(), String> {
 }
 
 /// Reconcile the on-disk owner record before deciding a session belongs elsewhere.
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_bindings_refresh() -> Result<Snapshot, String> {
     store()
         .lock()
@@ -127,7 +127,7 @@ pub fn local_bindings_refresh() -> Result<Snapshot, String> {
         .refresh(&directory()?)
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_bindings_subscribe(on_event: Channel<Snapshot>) -> Result<u64, String> {
     let mut store = store().lock().map_err(|e| e.to_string())?;
     on_event
@@ -138,7 +138,7 @@ pub fn local_bindings_subscribe(on_event: Channel<Snapshot>) -> Result<u64, Stri
     store.subscribers.insert(token, on_event);
     Ok(token)
 }
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_bindings_unsubscribe(token: u64) -> Result<(), String> {
     store()
         .lock()
@@ -148,7 +148,7 @@ pub fn local_bindings_unsubscribe(token: u64) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_binding_set(
     id: String,
     binding: Value,

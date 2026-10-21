@@ -188,3 +188,56 @@ it('deduplicates trimmed terminal assistant_message receipt against native antig
  expect(texts(items)[0].text).toBe(`${msg}\n\n`);
 });
 
+
+
+it('keeps an in-flight response and command alive across delivered follow-ups',()=>{
+ const user=ev('user_message',{id:'steer',content:'Explain simply'});
+ const events=[snap('I will update the runner.'),tool,user,user,snap('I will update the runner.')];
+ const replay=buildTranscript(events);
+ let live=buildTranscript([]);for(const event of events)live=applyStreamEvent(live,event);
+ for(const items of [replay,live]){
+  expect(texts(items)).toMatchObject([{text:'I will update the runner.',live:false}]);
+  expect(items.filter(i=>i.kind==='user')).toHaveLength(1);
+  expect(items.find(i=>i.kind==='tool')).toMatchObject({done:false});
+ }
+ live=applyStreamEvent(live,result);
+ live=applyStreamEvent(live,final('The runner is updated.','first-response'));
+ live=applyStreamEvent(live,snap('Here is the simple explanation.'));
+ expect(texts(live)).toMatchObject([{text:'I will update the runner.',live:false},{text:'The runner is updated.',live:false},{text:'Here is the simple explanation.',live:true}]);
+});
+
+it('preserves deliberately repeated submissions with distinct message identities',()=>{
+ const items=buildTranscript([snap('Working'),ev('user_message',{id:'one',content:'Explain simply'}),ev('user_message',{id:'two',content:'Explain simply'}),snap('Working')]);
+ expect(items.filter(i=>i.kind==='user')).toHaveLength(2);
+ expect(texts(items)).toHaveLength(1);
+});
+
+
+it.each(['snapshot','delta','text_op'])('places %s continuation below a delivered question without replaying the prefix',mode=>{
+ const initial=snap('Checking the build.');
+ const question=ev('user_message',{id:'eta',content:'eta'});
+ const continuation=mode==='snapshot'?snap('Checking the build. About 10 minutes.'):
+  mode==='delta'?ev('text_delta',{mode:'delta',content:' About 10 minutes.'}):
+  ev('text_op',{ops:[{type:'insert',pos:19,text:' About 10 minutes.'}]});
+ const events=[initial,tool,question,continuation,final('Checking the build. About 10 minutes.')];
+ const items=buildTranscript(events);
+ expect(items.filter(i=>i.kind==='text'||i.kind==='user').map(i=>i.text)).toEqual(['Checking the build.','eta',' About 10 minutes.']);
+ let live=buildTranscript([]);for(const e of events)live=applyStreamEvent(live,e);
+ expect(live).toEqual(items);
+});
+it('handles multiple delivered questions, queued-only questions, and unicode producer offsets',()=>{
+ let items=buildTranscript([ev('text_op',{bubble_id:'one',ops:[{type:'insert',pos:0,text:'A😀'}]}),ev('user_message',{id:'q1',content:'status'}),ev('text_op',{bubble_id:'one',ops:[{type:'insert',pos:2,text:'B'}]}),ev('user_message',{id:'q2',content:'eta'}),ev('text_op',{bubble_id:'one',ops:[{type:'insert',pos:3,text:'C'}]})]);
+ expect(items.filter(i=>i.kind==='text'||i.kind==='user').map(i=>i.text)).toEqual(['A😀','status','B','eta','C']);
+ items=buildTranscript([snap('A'),ev('user_message',{id:'queued',content:'next',queued:true}),snap('AB')]);
+ expect(texts(items).map(i=>i.text)).toEqual(['AB']);
+});
+
+// Native messages with the same words are independent; terminal receipts are not.
+it.each(['codex','antigravity'])('replays %s replies across steering without loss or repeated final text', (agent)=>{
+ const bubble=(id:string)=>`${agent}:session:${id}`;
+ const canonical=(id:string,text:string):StreamEvent=>({type:'assistant_message',eventId:id,data:{canonical:true,bubble_id:bubble(id),revision:1,content:text}});
+ const events=[canonical('a','Audit running.'),ev('user_message',{id:'eta',content:'eta'}),canonical('b','Audit running.'),canonical('c','More precise status.'),final('More precise status.')];
+ let live=buildTranscript([]);for(const event of events)live=applyStreamEvent(live,event);
+ expect(live).toEqual(buildTranscript(events));
+ expect(live.filter(i=>i.kind==='text'||i.kind==='user').map(i=>i.text)).toEqual(['Audit running.','eta','Audit running.','More precise status.']);
+});

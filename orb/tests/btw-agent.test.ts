@@ -578,6 +578,3 @@ it('marks the session broken if a fresh side session also returns an empty compl
  await expect(askBtwAgent('empty-fresh-parent','Turn 1','ctx-1',[],new AbortController().signal,()=>{})).rejects.toThrow('The model returned an empty completion without running any tools; retry to start a clean side session.');
  expect(btwSession('empty-fresh-parent')?.brokenSession).toBe(true);
 });
-
-
-

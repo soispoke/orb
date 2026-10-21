@@ -3,14 +3,15 @@ import { test,expect,type Page } from "@playwright/test";
 import { writeFileSync } from "node:fs";
 const objective="Check remote startup without losing this draft";
 const prompt=`/goal ${objective}`;
-const base={id:"accepted",title:"Remote task",status:"pending",history:[],workspace_name:"host",backend:"grok",model_override:"grok-4.6",created_at:"",updated_at:""};
+const base={id:"accepted",project:"test",title:"Remote task",status:"pending",history:[],workspace_name:"host",backend:"grok",model_override:"grok-4.6",created_at:"",updated_at:""};
 const node={id:"dgx-spark",status:"online",cordoned:false};
 // What production (release 21e29373) advertises today. Grok appears only when a
 // backend that supports native Grok remote launches says so.
 type Capability={typed?:boolean;harnesses?:string[];raw_command?:boolean;proxy_url_configured?:boolean;requires_proxy_harnesses?:string[]};
 const typedCapability:Capability={typed:true,harnesses:["claudecode","opencode"],raw_command:true,proxy_url_configured:true};
-async function setup(page:Page, options:{cyberRefusal?:boolean;reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean;files?:{name:string;kind:string}[];emptyContext?:boolean}={}){
+async function setup(page:Page, options:{holdContext?:boolean;cyberRefusal?:boolean;reject?:boolean;legacy?:boolean;remoteSuccess?:boolean;missing?:boolean;failed?:boolean;remoteJob?:{phase:string;node_state?:string};emptyStatus?:string;capability?:Capability|null;fleetFailAfterFirst?:boolean;files?:{name:string;kind:string}[];emptyContext?:boolean}={}){
  let attachmentReads:string[]=[];
+ let releaseContext!:()=>void;const contextGate=new Promise<void>(resolve=>releaseContext=resolve);
  let posts:any[]=[], releasePost!:()=>void,releaseHistory!:()=>void;
  const postGate=new Promise<void>(resolve=>releasePost=resolve),historyGate=new Promise<void>(resolve=>releaseHistory=resolve);
  let fail=!!options.reject;let fleetReads=0;let listReads=0;let fleetChanged=false;
@@ -53,6 +54,7 @@ async function setup(page:Page, options:{cyberRefusal?:boolean;reject?:boolean;l
   }
   if(path.endsWith("/files") || path.includes("/controller")) {
    attachmentReads.push(path);
+   if(options.holdContext)await contextGate;
    if(!path.startsWith("/api/projects/test/")) return route.fulfill({status:404,body:"Unknown project"});
    if(options.emptyContext) return route.fulfill({json:path.endsWith("/files")?{entries:[]}:{job:null,runs:[]}});
   }
@@ -68,7 +70,7 @@ async function setup(page:Page, options:{cyberRefusal?:boolean;reject?:boolean;l
   await page.getByRole("button",{name:"Choose project",exact:true}).click();
   await page.getByRole("option",{name:"Test",exact:true}).click();
  }
- return {posts,attachmentReads,releasePost,releaseHistory,setSuccess:()=>{fail=false;},changeFleet:()=>{fleetChanged=true;},listReads:()=>listReads,fleetReads:()=>fleetReads};
+ return {posts,attachmentReads,releasePost,releaseHistory,releaseContext,setSuccess:()=>{fail=false;},changeFleet:()=>{fleetChanged=true;},listReads:()=>listReads,fleetReads:()=>fleetReads};
 }
 async function chooseRemote(page:Page){if(await page.getByRole("button",{name:/^DGX Spark$/}).isVisible())return;await page.getByRole("button",{name:/Core \(agent-core\)/}).click();await page.getByRole("button",{name:/dgx-spark online/}).click();}
 const composerInput=(page:Page)=>page.getByPlaceholder(/Describe a task, \/ for commands, @ for context|Describe the objective/);
@@ -423,7 +425,7 @@ test("context picks preserve multiline whitespace and land at the caret",async({
  await expect(input).toHaveValue("Before @notes/foo.md inserted after");
 });
 
-test("disk refusal shows a notification clear of the draft with details, an action and a dismiss button",async({page})=>{
+test("disk refusal stays below the draft with readable details and a dismiss action",async({page})=>{
  await setup(page);
  const raw="mission needs an estimated 64 GiB scratch plus a 64 GiB emergency floor (128 GiB required), but only 127 GiB is free at /root (filesystem statvfs:7321850625438636562); select a remote node or free space";
  await page.route("**/api/control/missions",async route=>{
@@ -432,26 +434,27 @@ test("disk refusal shows a notification clear of the draft with details, an acti
  });
  const input=composerInput(page);await input.fill("Summarize the Pareto audit progress");await input.press("Enter");
  const alert=page.getByRole("alert");await expect(alert).toContainText("Not enough disk space");await expect(input).toHaveValue("Summarize the Pareto audit progress");
- const composer=await page.locator(".composer").boundingBox(),notice=await alert.boundingBox();expect(notice!.y>=composer!.y+composer!.height||notice!.y+notice!.height<=composer!.y).toBe(true);
- await expect(alert.getByRole("button",{name:"Choose machine"})).toBeVisible();
- await expect(alert.locator("pre")).toBeHidden();await alert.getByText("Details").click();await expect(alert.locator("pre")).toHaveText(raw);await alert.getByText("Details").click();
- await page.screenshot({path:"test-results/error-toast-dark.png"});
+ const composer=await page.locator(".composer").boundingBox(),notice=await alert.boundingBox();expect(notice!.y).toBeGreaterThanOrEqual(composer!.y+composer!.height);
+ await expect(alert.locator("pre")).toBeHidden();await alert.getByText("Technical details").click();await expect(alert.locator("pre")).toHaveText(raw);await alert.getByText("Technical details").click();
+ await page.screenshot({path:"test-results/error-notice-dark.png"});
  await page.setViewportSize({width:480,height:850});
  await page.getByRole("button", {name:"Close sidebar", exact:true}).click();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
- await alert.getByRole("button",{name:"Dismiss"}).click();await expect(alert).toHaveCount(0);await expect(input).toHaveValue("Summarize the Pareto audit progress");
+ await alert.getByRole("button",{name:"Dismiss error"}).click();await expect(alert).toHaveCount(0);await expect(input).toHaveValue("Summarize the Pareto audit progress");
 });
 
 test('follow-up composer does not alternate layouts while typing wrapped text',async({page})=>{
  const state=await setup(page);state.releasePost();
  await composerInput(page).fill('hello');await composerInput(page).press('Enter');
  const input=page.getByPlaceholder('Send follow-up');await expect(input).toBeVisible();
- const shapes=await input.evaluate((el)=>{
+ const shapes=await input.evaluate(async(el)=>{
   const ta=el as HTMLTextAreaElement, box=ta.closest('.composer')!;
   const result:boolean[]=[];
   for(let i=1;i<=280;i++){
    ta.value='suggest a message to send him about the properties '.repeat(8).slice(0,i);
    ta.dispatchEvent(new Event('input',{bubbles:true}));
+   // Observe each displayed frame, not hundreds of synthetic edits in one task.
+   await new Promise(requestAnimationFrame);
    result.push(box.classList.contains('tall'));
   }
   return result;
@@ -462,9 +465,14 @@ test('follow-up composer does not alternate layouts while typing wrapped text',a
 });
 
 test("unsupported Cyber route keeps the draft and never submits a remote mission",async({page})=>{
- const state=await setup(page,{cyberRefusal:true,capability:{...typedCapability,harnesses:["grok","codex"]}});
- state.releasePost();state.releaseHistory();await chooseRemote(page);
+ const options={cyberRefusal:false,capability:{...typedCapability,harnesses:["grok","codex"]}};
+ const state=await setup(page,options);
+ state.releasePost();state.releaseHistory();
  await page.getByRole("button",{name:"Grok",exact:true}).click();await page.getByRole("option",{name:/^Codex/}).click();
+ await page.getByRole("button",{name:"Cyber program: Automatic"}).click();
+ await page.getByRole("menuitemradio",{name:/Standard/}).click();
+ options.cyberRefusal=true;
+ await chooseRemote(page);
  const input=composerInput(page);await input.fill(objective);await input.press("Enter");
  await expect(page.getByRole("alert")).toContainText("Choose Automatic explicitly");
  await expect(input).toHaveValue(objective);expect(state.posts).toHaveLength(0);
@@ -473,4 +481,16 @@ test("unsupported Cyber route keeps the draft and never submits a remote mission
  await expect(page.getByRole("menuitemradio",{name:/Automatic/})).toBeEnabled();
  await page.getByRole("menuitemradio",{name:/Automatic/}).click();await input.press("Enter");
  await expect.poll(()=>state.posts.length).toBe(1);expect(state.posts[0].cyber_access).toBe("automatic");
+});
+
+test('Enter shows the first message immediately despite a stalled project context read',async({page})=>{
+ const state=await setup(page,{holdContext:true});
+ const input=composerInput(page);
+ await input.fill('Start with this plain message');
+ await input.press('Enter');
+ await expect(page.locator('.scroll .user')).toBeVisible({timeout:500});
+ await expect(page.locator('.scroll .user')).toContainText('Start with this plain message');
+ await expect.poll(()=>state.posts.length,{timeout:500}).toBe(1);
+ state.releaseContext();state.releasePost();state.releaseHistory();
+ await expect(page.getByPlaceholder('Send follow-up')).toBeVisible();
 });

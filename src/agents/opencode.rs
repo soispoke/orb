@@ -79,7 +79,7 @@ impl OpenCodeAgent {
                     mission_id: ctx.mission_id,
                 }
             }
-            OpenCodeEvent::TextDelta { content } => {
+            OpenCodeEvent::TextDelta { content } | OpenCodeEvent::TextSnapshot { content, .. } => {
                 tracing::info!(
                     content_len = content.len(),
                     content_preview = %content.chars().take(100).collect::<String>(),

@@ -990,6 +990,8 @@ async fn run_grok_streaming_process(
     let mut reasoning_buffer = String::new();
     let mut last_reasoning_len = 0usize;
     let mut reasoning_delta_coalescer = TextDeltaCoalescer::new();
+    let mut text_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    text_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut cancelled = false;
@@ -1016,6 +1018,22 @@ async fn run_grok_streaming_process(
                     0,
                 )
                 .with_terminal_reason(if unbound_start { TerminalReason::NativeContinuityRequired } else { TerminalReason::LlmError });
+            }
+            _ = text_tick.tick() => {
+                // Flush trailing fragments even while the process remains alive
+                // doing tool work. EOF is not a usable UI delivery deadline.
+                if final_result.len() > last_streamed_len && text_delta_coalescer.should_emit() {
+                    last_streamed_len = final_result.len();
+                    let _ = events_tx.send(AgentEvent::TextDelta {
+                        content: final_result.clone(), mission_id: Some(mission_id),
+                    });
+                }
+                if reasoning_buffer.len() > last_reasoning_len && reasoning_delta_coalescer.should_emit() {
+                    last_reasoning_len = reasoning_buffer.len();
+                    let _ = events_tx.send(AgentEvent::Thinking {
+                        content: reasoning_buffer.clone(), done: false, mission_id: Some(mission_id),
+                    });
+                }
             }
             line_result = lines.next_line() => {
                 match line_result {
@@ -3953,6 +3971,66 @@ sys.exit(0 if sys.argv[1]=='success_without_id' else 1)
             ),
             Err(_) => {}
         }
+    }
+
+    #[tokio::test]
+    async fn grok_trailing_text_reaches_ui_before_process_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("finish");
+        let child = tokio::process::Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                r#"import json, pathlib, sys, time
+print(json.dumps({"type":"text","data":"Status: "}), flush=True)
+print(json.dumps({"type":"text","data":"work continues."}), flush=True)
+while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.01)
+"#,
+            ])
+            .arg(&release)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (tx, mut rx) = broadcast::channel(16);
+        let runner = tokio::spawn(async move {
+            run_grok_streaming_process(
+                None,
+                child,
+                None,
+                Uuid::new_v4(),
+                tx,
+                CancellationToken::new(),
+                false,
+            )
+            .await
+        });
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(AgentEvent::TextDelta { content, .. }) = rx.recv().await {
+                    if content == "Status: work continues." {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        let still_running = !runner.is_finished();
+        std::fs::write(release, "done").unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            observed.is_ok(),
+            "trailing text was buffered until process exit"
+        );
+        assert!(
+            still_running,
+            "fixture must exercise a still-running session"
+        );
+        assert!(result.success, "{}", result.output);
     }
 
     #[test]

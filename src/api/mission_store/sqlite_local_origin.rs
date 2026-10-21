@@ -55,6 +55,7 @@ mod tests {
     fn snapshot() -> Snapshot {
         Snapshot {
             origin: Origin {
+                fork_source_mission_id: None,
                 service_tier: None,
                 cyber_access: None,
                 id: Uuid::new_v4(),

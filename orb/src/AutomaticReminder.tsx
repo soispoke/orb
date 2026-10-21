@@ -1,3 +1,4 @@
+import {TranscriptDetails} from "./TranscriptDetails";
 import {createEffect, createMemo, createSignal, onCleanup, Show} from 'solid-js';
 import {api, connectionVersion, isConnected} from './api';
 import {copyText} from './clipboard';
@@ -25,12 +26,11 @@ export function reminderMessages(items: StreamItem[]): Map<string, Reminder> {
   return result;
 }
 
-export function AutomaticReminder(p: {text: string; reminder: Reminder}) {
+export function AutomaticReminder(p: {text: string; reminder: Reminder; disclosureKey?: string}) {
   const [copied, setCopied] = createSignal('');
-  return <details class="automatic-reminder">
-    <summary><span aria-hidden="true">◷</span><strong>Automatic reminder</strong><span class="reminder-origin">{p.reminder.origin}<Show when={p.reminder.seconds}> · after {Math.round(p.reminder.seconds! / 60)} min</Show></span><span class="reminder-summary">Resume mission follow-up</span></summary>
+  return <TranscriptDetails class="automatic-reminder" stateKey={p.disclosureKey} summary={<><span aria-hidden="true">◷</span><strong>Automatic reminder</strong><span class="reminder-origin">{p.reminder.origin}<Show when={p.reminder.seconds}> · after {Math.round(p.reminder.seconds! / 60)} min</Show></span><span class="reminder-summary">Resume mission follow-up</span></>}>
     <div class="reminder-details"><pre>{p.text}</pre><button class="s-btn sm" onClick={() => void copyText(p.text).then(() => setCopied('Copied'), () => setCopied('Copy failed'))}>Copy instructions</button><span role="status">{copied()}</span></div>
-  </details>;
+  </TranscriptDetails>;
 }
 
 type Wakeup = {active: boolean; driver?: string; trigger: {type: string; seconds?: number}; stop_policy: {type: string}; created_at: string; last_triggered_at?: string | null; variables?: Record<string,string>};

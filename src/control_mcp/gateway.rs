@@ -220,7 +220,7 @@ fn is_wakeup(name: &str) -> bool {
     matches!(name, "schedule_wakeup" | "schedule_job_wakeup")
 }
 
-async fn authorize(
+pub(crate) async fn authorize(
     state: &Arc<AppState>,
     p: &Principal,
     tool: &Tool,
@@ -403,7 +403,13 @@ async fn authorize(
                 .await
                 .map_err(|_| ToolError::denied("Mission unavailable"))?
                 .ok_or_else(|| ToolError::denied("Mission unavailable"))?;
-            if id != own && m.parent_mission_id != Some(own) {
+            let observes = field == "mission_id"
+                && !tool.mutation
+                && crate::api::control::fork_observation::read_tool(&tool.definition.name)
+                && crate::api::control::fork_observation::allows(state, &user, &owner, &m)
+                    .await
+                    .map_err(|_| ToolError::denied("Fork observation unavailable"))?;
+            if id != own && m.parent_mission_id != Some(own) && !observes {
                 return Err(ToolError::denied("Mission is outside this session's scope"));
             }
             if tool.definition.name == "start_workspace_job" && m.workspace_id != owner.workspace_id

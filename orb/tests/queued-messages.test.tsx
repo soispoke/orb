@@ -1,13 +1,15 @@
 import {afterEach,expect,it,vi} from 'vitest';
 import {cleanup,fireEvent,render,screen,waitFor} from '@solidjs/testing-library';
+import {createSignal} from 'solid-js';
 import {QueuedMessages} from '../src/QueuedMessages';
-const queue=vi.hoisted(()=>({rows:[] as any[],retry:vi.fn(),send:vi.fn(),prioritize:vi.fn(),remove:vi.fn()}));
+import {LiveInputUnavailable} from '../src/liveInputAvailability';
+const queue=vi.hoisted(()=>({rows:[] as any[],retry:vi.fn(),send:vi.fn(),prioritize:vi.fn(),remove:vi.fn(),pending:()=>false}));
 vi.mock('../src/localMessageQueue',()=>({
- queuedLocalMessages:()=>queue.rows,
+ queuedLocalMessages:()=>queue.rows,localSteeringPending:()=>queue.pending(),
  retryQueuedMessage:queue.retry,sendQueuedNow:queue.send,
  prioritizeQueuedMessage:queue.prioritize,removeQueuedMessage:queue.remove,canDiscardQueuedMessage:()=>true,
 }));
-afterEach(()=>{cleanup();queue.rows=[];vi.resetAllMocks();});
+afterEach(()=>{cleanup();queue.rows=[];queue.pending=()=>false;vi.resetAllMocks();});
 it('offers Retry without a disabled Send now for an interrupted message',async()=>{
  queue.rows=[{id:'interrupted',text:'vas-y',state:'accepted',interrupted:true,error:'Previous agent may still be running.'}];
  let finish!:()=>void;queue.retry.mockImplementation(()=>new Promise<void>(resolve=>{finish=resolve;}));
@@ -58,3 +60,47 @@ it('does not render a duplicate bottom alert when a row already shows the retry 
  expect(screen.getAllByRole('alert')).toHaveLength(1);
 });
 
+
+it('offers steering while work is active',async()=>{
+ queue.rows=[{id:'queued',text:'next',state:'queued',waiting:true}];
+ render(()=><QueuedMessages mission="local" busy/>);
+ expect(screen.queryByText('to Send')).toBeNull();
+ expect(screen.queryByRole('button',{name:'Send now: next'})).toBeNull();
+ await fireEvent.click(screen.getByRole('button',{name:'Steer now: next'}));
+ expect(queue.send).toHaveBeenCalledWith('local','queued');
+});
+
+it('keeps unsupported steering queued with a neutral notice, not a send failure',async()=>{
+ queue.rows=[{id:'queued',text:'status',state:'queued',waiting:true}];
+ queue.send.mockRejectedValue(new LiveInputUnavailable());
+ render(()=><QueuedMessages mission="local" busy/>);
+ await fireEvent.click(screen.getByRole('button',{name:'Steer now: status'}));
+ await waitFor(()=>expect(screen.getByRole('status').textContent).toContain('Queued for the next turn'));
+ expect(screen.queryByRole('alert')).toBeNull();
+ expect(screen.getByText('1 Queued')).toBeTruthy();
+ expect(queue.retry).not.toHaveBeenCalled();expect(queue.remove).not.toHaveBeenCalled();
+});
+
+
+it('shows pending steering neutrally and keeps lost-ack uncertainty visible after it settles',async()=>{
+ const [pending,setPending]=createSignal(true);queue.pending=pending;
+ queue.rows=[{id:'steer',text:'eta',state:'error',waiting:true,steerToken:'token',error:'Live delivery is unconfirmed. This message will not be resent automatically.'}];
+ const ui=render(()=><QueuedMessages mission="local" busy/>);
+ expect(screen.getByText('1 Sending…')).toBeTruthy();
+ expect(screen.getByRole('status').textContent).toContain('Sending to the running session');
+ expect(screen.queryByRole('alert')).toBeNull();expect(ui.container.querySelector('.failed')).toBeNull();
+ setPending(false);
+ await waitFor(()=>expect(screen.getByText('1 Delivery unconfirmed')).toBeTruthy());
+ expect(screen.getByRole('status').textContent).toContain('will not be resent automatically');
+ expect(screen.queryByRole('alert')).toBeNull();expect(screen.queryByRole('button',{name:'Retry'})).toBeNull();
+ cleanup();render(()=><QueuedMessages mission="local" busy/>);
+ expect(screen.getByText('1 Delivery unconfirmed')).toBeTruthy();
+ expect(queue.send).not.toHaveBeenCalled();expect(queue.retry).not.toHaveBeenCalled();
+});
+
+it('still presents a real pre-delivery error as a failure',()=>{
+ queue.rows=[{id:'failure',text:'question',state:'error',waiting:true,error:'Could not save your message.'}];
+ const ui=render(()=><QueuedMessages mission="local"/>);
+ expect(screen.getByRole('alert').textContent).toContain('Could not save');
+ expect(ui.container.querySelector('.failed')).not.toBeNull();
+});

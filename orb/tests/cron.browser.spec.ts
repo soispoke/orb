@@ -170,6 +170,7 @@ test("cron outage retains cached rows; Retry restores availability without loggi
   await expect(page.getByRole("status")).toHaveAttribute("title", /Cached jobs are retained/);
   await expect(page.locator(".row.cron")).toHaveCount(1);
   expect(await page.evaluate(() => localStorage.getItem("orb.jwt"))).toBe("local-browser-test");
+  await page.clock.pauseAt(await page.evaluate(()=>Date.now()+100));
   fail = false; await page.getByRole("button", { name: "Retry crons" }).click();
   await expect(page.getByRole("status")).toHaveCount(0);
   await expect(page.locator(".row.cron")).toHaveCount(1);
@@ -205,7 +206,7 @@ for (const status of [404, 500]) test(`cron ${status}: compact status preserves 
  await expect(page.locator(".row.cron")).toHaveCount(2);
  await page.bringToFront();
  expect(await page.evaluate(() => document.visibilityState)).toBe("visible");
- const failedCount=requests;await page.clock.fastForward(31000);
+ const failedCount=requests;await page.clock.runFor(31000);
  if(status===404){
   expect(requests).toBe(failedCount);await expect(page.getByRole("button",{name:"Retry crons"})).toHaveCount(0);
   await page.getByRole("button",{name:"Project actions for Project notes"}).click();await page.getByRole("menuitem",{name:"New cron",exact:true}).click();
@@ -214,7 +215,7 @@ for (const status of [404, 500]) test(`cron ${status}: compact status preserves 
   await page.getByRole("button",{name:"Close",exact:true}).click();
   await page.screenshot({path:"test-results/orb-cron-unsupported.png"});
   fail=false;await page.getByRole("button",{name:"Reconnect backend"}).click();await expect(row).toHaveCount(0);expect(requests).toBeGreaterThan(failedCount);
- } else {await expect.poll(()=>requests).toBeGreaterThan(failedCount);fail=false;await page.getByRole("button",{name:"Retry crons"}).click();await expect(row).toHaveCount(0);}
+ } else {await expect.poll(()=>requests).toBeGreaterThan(failedCount);await page.clock.pauseAt(await page.evaluate(()=>Date.now()+100));fail=false;await page.getByRole("button",{name:"Retry crons"}).click();await expect(row).toHaveCount(0);}
 });
 
 for (const disconnect of ["401", "logout"]) test(`cron ${disconnect} stops fetching until reconnect`, async ({ page }) => {

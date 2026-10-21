@@ -1,4 +1,6 @@
 //! Ordered, push-based output; a subscriber receives one snapshot, then deltas.
+#[path = "../../../shared/claude_task_status.rs"]
+pub(crate) mod claude_task_status;
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -34,6 +36,8 @@ pub struct Activity {
     pub updated_at: u64,
     pub finished_at: Option<u64>,
     pub thinking_tokens: Option<u64>,
+    #[serde(skip)]
+    confirmed_live: bool,
 }
 fn activity_now() -> u64 {
     std::time::SystemTime::now()
@@ -58,9 +62,30 @@ impl Activity {
             updated_at: now,
             finished_at: None,
             thinking_tokens: None,
+            confirmed_live: false,
         }
     }
+    fn live(&mut self) {
+        if self.done {
+            return;
+        } // A real terminal receipt remains final.
+        self.confirmed_live = true;
+        if self.status == "unknown" {
+            self.detail = None;
+        }
+        self.status = "running".into();
+        self.failed = false;
+        self.finished_at = None;
+    }
+    fn unconfirmed(&mut self) {
+        self.confirmed_live = false;
+        self.done = false;
+        self.failed = false;
+        self.status = "unknown".into();
+        self.finished_at = None;
+    }
     fn finish(&mut self, status: &str) {
+        self.confirmed_live = false;
         self.done = true;
         self.failed = matches!(status, "failed" | "stopped");
         self.status = status.into();
@@ -124,6 +149,8 @@ pub struct Output(
     /// the epoch), or zero.
     std::sync::atomic::AtomicU64,
     std::sync::atomic::AtomicBool,
+    /// Bounded native stderr, used only when the process actually fails.
+    Mutex<Option<String>>,
 );
 
 pub struct ReaderGuard(Arc<Output>);
@@ -135,6 +162,12 @@ impl Drop for ReaderGuard {
     }
 }
 impl Output {
+    pub fn set_diagnostic(&self, message: String) {
+        *self.7.lock().unwrap() = Some(message);
+    }
+    pub fn diagnostic(&self) -> Option<String> {
+        self.7.lock().unwrap().clone()
+    }
     pub fn set_retryable(&self, retryable: bool) {
         self.6.store(retryable, Ordering::SeqCst);
     }
@@ -160,6 +193,38 @@ impl Output {
     }
     pub fn activities(&self) -> Vec<Activity> {
         self.2.lock().unwrap().clone()
+    }
+    /// Inspect status receipts without copying transcript or tool-output buffers.
+    pub fn observe_activities<T>(&self, observe: impl FnOnce(&[Activity]) -> T) -> T {
+        observe(&self.2.lock().unwrap())
+    }
+    pub fn claude_quota_wait(&self, reset: Option<&str>) {
+        let mut activities = self.2.lock().unwrap();
+        let index = activities.iter().position(|a| a.id == "claude:quota");
+        if let Some(reset) = reset {
+            let mut item = Activity::new(
+                "claude:quota".into(),
+                format!("Waiting for Claude quota · resumes {reset}"),
+                "quota",
+                false,
+            );
+            item.status = "waiting".into();
+            if let Some(index) = index {
+                activities[index] = item;
+            } else {
+                activities.push(item);
+            }
+        } else if let Some(index) = index {
+            if activities[index].done {
+                return;
+            }
+            activities[index].label = "Claude quota wait finished".into();
+            activities[index].finish("completed");
+        } else {
+            return;
+        }
+        drop(activities);
+        self.publish_activities();
     }
     pub fn codex_reconnecting(&self, message: Option<&str>) {
         let mut activities = self.2.lock().unwrap();
@@ -385,11 +450,20 @@ impl Output {
                 _ => return,
             }
         };
-        let Some(raw_call_id) = item[if opencode { "callID" } else { "id" }].as_str() else {
+        let raw_call_id = if opencode {
+            item["callID"].as_str().or_else(|| item["id"].as_str())
+        } else {
+            item["id"].as_str()
+        };
+        let Some(raw_call_id) = raw_call_id else {
             return;
         };
         let id = if opencode {
-            if let Some(pid) = item["id"].as_str().filter(|pid| *pid != raw_call_id) {
+            if let Some(pid) = item["partID"]
+                .as_str()
+                .or_else(|| item["id"].as_str())
+                .filter(|pid| *pid != raw_call_id)
+            {
                 format!("native:{pid}:{raw_call_id}")
             } else {
                 format!("native:{raw_call_id}")
@@ -443,7 +517,14 @@ impl Output {
             || (opencode && matches!(status, "completed" | "error" | "failed" | "cancelled"))
         {
             activity.finish(
-                if matches!(status, "error" | "failed") || item["success"] == false {
+                if matches!(status, "error" | "failed")
+                    || item["success"] == false
+                    || (opencode
+                        && (item.pointer("/state/metadata/error")
+                            == Some(&serde_json::Value::Bool(true))
+                            || item.pointer("/state/metadata/metadata/error")
+                                == Some(&serde_json::Value::Bool(true))))
+                {
                     "failed"
                 } else if status == "cancelled" {
                     "stopped"
@@ -459,13 +540,35 @@ impl Output {
             match value["subtype"].as_str() {
                 Some("task_started" | "task_progress") => {
                     if let Some(activity) = upsert_task(&mut activities, value) {
-                        if let Some(tool) = value["last_tool_name"].as_str() {
+                        activity.live();
+                        if let Some(tool) =
+                            value["last_tool_name"].as_str().filter(|_| !activity.done)
+                        {
                             activity.detail = Some(format!("Latest tool: {tool}"));
                         }
                     }
                 }
                 Some("task_notification") => {
-                    if let Some(activity) = upsert_task(&mut activities, value) {
+                    if let Some(name) = value["summary"]
+                        .as_str()
+                        .and_then(claude_task_status::session_end_notice)
+                    {
+                        if let Some(activity) = upsert_task(&mut activities, value) {
+                            // A matching live snapshot/progress event outweighs a
+                            // replayed session-loss notice. Never invent liveness.
+                            if !activity.confirmed_live && !activity.done {
+                                activity.unconfirmed();
+                                activity.kind = "agent".into();
+                                if activity.label == "Background task" {
+                                    activity.label = name.chars().take(240).collect();
+                                }
+                                activity.detail = Some(
+                                    "Session ended before this agent's outcome was confirmed."
+                                        .into(),
+                                );
+                            }
+                        }
+                    } else if let Some(activity) = upsert_task(&mut activities, value) {
                         activity.finish(value["status"].as_str().unwrap_or("finished"));
                         if let Some(summary) = value["summary"].as_str().filter(|s| !s.is_empty()) {
                             activity.detail = Some(summary.chars().take(8000).collect());
@@ -475,15 +578,23 @@ impl Output {
                 Some("background_tasks_changed") => {
                     if let Some(tasks) = value["tasks"].as_array() {
                         for task in tasks {
-                            upsert_task(&mut activities, task);
+                            if let Some(activity) = upsert_task(&mut activities, task) {
+                                match task["status"].as_str() {
+                                    Some(
+                                        status @ ("completed" | "failed" | "stopped" | "cancelled"
+                                        | "canceled"),
+                                    ) => activity.finish(status),
+                                    _ => activity.live(),
+                                }
+                            }
                         }
                         for activity in activities.iter_mut().filter(|a| a.background && !a.done) {
                             if !tasks
                                 .iter()
                                 .any(|t| t["task_id"].as_str() == activity.id.strip_prefix("task:"))
                             {
-                                // Removal says it finished, not whether it succeeded.
-                                activity.finish("finished");
+                                // Absence is not a terminal receipt.
+                                activity.unconfirmed();
                             }
                         }
                     }
@@ -894,6 +1005,25 @@ mod tests {
         assert!(rows[0].done && !rows[0].failed);
     }
     #[test]
+    fn opencode_v2_tool_parts_keep_distinct_ids_and_nested_failures() {
+        let output = Output::default();
+        for (part, error) in [("part-1", false), ("part-2", true)] {
+            output.native_activity(&json!({"type":"tool_use","part":{
+                "partID":part,"id":"call_0","tool":"execute",
+                "state":{"status":"running"}}}));
+            output.native_activity(&json!({"type":"tool_use","part":{
+                "partID":part,"id":"call_0","tool":"execute",
+                "state":{"status":"completed","metadata":{"metadata":{"error":error}},
+                    "output":"public tool result"}}}));
+        }
+        let rows = output.activities();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].done && !rows[0].failed);
+        assert!(rows[1].done && rows[1].failed);
+        assert_ne!(rows[0].id, rows[1].id);
+    }
+
+    #[test]
     fn native_tools_preserve_identity_and_terminal_errors() {
         let output = Output::default();
         output.native_activity(&serde_json::json!({"method":"item/started","params":{"item":{"id":"a","type":"dynamicToolCall","tool":"exec"}}}));
@@ -921,6 +1051,51 @@ mod tests {
     }
 
     use serde_json::json;
+    fn lost_agent(id: &str) -> serde_json::Value {
+        json!({"type":"system","subtype":"task_notification","task_id":id,"status":"failed","summary":"Background agent \"Proof check\" didn't finish before the previous session ended"})
+    }
+    #[test]
+    fn resumed_agent_recovers_from_session_notice_and_replayed_notice_cannot_fail_live_task() {
+        let output = Output::default();
+        output.claude_activity(&lost_agent("a"));
+        let a = output.activities().remove(0);
+        assert_eq!(a.status, "unknown");
+        assert!(!a.failed && !a.done);
+        assert!(a.finished_at.is_none());
+        output.claude_activity(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"local_agent"}]}));
+        output.claude_activity(&lost_agent("a"));
+        assert_eq!(output.activities()[0].status, "running");
+        assert!(!output.activities()[0].failed);
+        output.claude_activity(&lost_agent("b"));
+        assert_eq!(output.activities()[1].status, "unknown"); // Same label, different identity.
+        output.claude_activity(&json!({"type":"system","subtype":"task_progress","task_id":"b","last_tool_name":"Read"}));
+        assert_eq!(output.activities()[1].status, "running");
+        assert_eq!(
+            output.activities()[1].detail.as_deref(),
+            Some("Latest tool: Read")
+        );
+        output.claude_activity(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Build exited with code 1"}));
+        output.claude_activity(&lost_agent("a"));
+        output.claude_activity(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}));
+        output.claude_activity(&json!({"type":"system","subtype":"task_progress","task_id":"a","last_tool_name":"Read"}));
+        assert!(output.activities()[0].failed); // A real failure remains terminal.
+        assert_eq!(
+            output.activities()[0].detail.as_deref(),
+            Some("Build exited with code 1")
+        );
+    }
+    #[test]
+    fn snapshots_preserve_explicit_outcomes_but_absence_does_not_imply_success() {
+        let output = Output::default();
+        output.claude_activity(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","status":"failed"},{"task_id":"b","status":"completed"},{"task_id":"c"}]}));
+        output.claude_activity(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+        );
+        let a = output.activities();
+        assert!(a[0].failed);
+        assert_eq!(a[1].status, "completed");
+        assert_eq!(a[2].status, "unknown");
+    }
     #[test]
     fn background_snapshot_recovers_task_and_notification_reports_failure() {
         let output = Output::default();
@@ -934,7 +1109,7 @@ mod tests {
         output.claude_activity(
             &json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
         );
-        assert_eq!(output.activities()[0].status, "finished");
+        assert_eq!(output.activities()[0].status, "unknown");
         output.claude_activity(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Build exited with code 1"}));
         let task = output.activities().remove(0);
         assert!(task.failed);
@@ -952,7 +1127,8 @@ mod tests {
         output.claude_activity(
             &json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
         );
-        assert!(output.activities()[0].done);
+        assert!(!output.activities()[0].done);
+        assert_eq!(output.activities()[0].status, "unknown");
     }
     #[test]
     fn claude_activity_tracks_thinking_and_tool_results() {

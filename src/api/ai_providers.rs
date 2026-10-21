@@ -2252,73 +2252,6 @@ pub(crate) fn has_fresh_cli_proxy_codex_account() -> bool {
     has_fresh_cli_proxy_account_of_type("codex-", "codex")
 }
 
-/// The freshest usable access token from the CLI proxy's auth directory for
-/// the given provider (e.g. `claude-*.json`). Under CLI-proxy ownership the
-/// proxy's file is the only credential that stays fresh, so the usage probe
-/// must read it instead of sandboxed.sh's own (deliberately stale) record.
-pub(crate) fn cli_proxy_access_token(file_prefix: &str, type_tag: &str) -> Option<String> {
-    let now = chrono::Utc::now();
-    let mut best: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
-    for dir in cli_proxy_auth_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !(name.starts_with(file_prefix) && name.ends_with(".json")) {
-                continue;
-            }
-            let Ok(contents) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
-                continue;
-            };
-            if value
-                .get("disabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                || value.get("type").and_then(|v| v.as_str()) != Some(type_tag)
-            {
-                continue;
-            }
-            let Some(access) = value
-                .get("access_token")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let expiry = value
-                .get("expired")
-                .or_else(|| value.get("expires"))
-                .or_else(|| value.get("expires_at"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&chrono::Utc));
-            // Prefer a token that is still valid; among valid ones take the
-            // longest-lived. Expired tokens are skipped: the proxy refreshes
-            // its files proactively, so an expired file means the account is
-            // dead anyway and probing with it would just 401.
-            let Some(expires_at) = expiry else {
-                continue;
-            };
-            if expires_at <= now {
-                continue;
-            }
-            if best.as_ref().is_none_or(|(e, _)| expires_at > *e) {
-                best = Some((expires_at, access));
-            }
-        }
-    }
-    best.map(|(_, token)| token)
-}
-
 /// Scan the CLI proxy's auth directory for entries with
 /// `name.starts_with(file_prefix)` and `type == type_tag`, returning true
 /// as soon as one is enabled and has a non-empty access_token that hasn't
@@ -8674,6 +8607,45 @@ async fn get_provider_usage(
         ));
     };
 
+    // Proxy-managed accounts have already been reconciled by their bound file.
+    // A ChatGPT workspace ID may be shared by multiple users; using it to look
+    // up a different credential silently reports that other user's quota.
+    if provider_type == ProviderType::OpenAI
+        && crate::api::oauth_owner::cli_proxy_owns(ProviderType::OpenAI)
+        && api_key_opt.is_none()
+    {
+        if let Some(oauth) = oauth.as_ref() {
+            let mut base = serde_json::json!({
+                "provider_type": "openai", "provider_name": provider_name,
+                "account_email": account_email, "status": "connected",
+            });
+            if let Some(account_id) = extract_chatgpt_account_id(&oauth.access_token) {
+                match crate::api::codex_usage::read_usage(
+                    &state.http_client,
+                    &oauth.access_token,
+                    &account_id,
+                )
+                .await
+                {
+                    Ok(snapshot) => return Ok(Json(merge_codex_usage(base, &snapshot))),
+                    Err(crate::api::codex_usage::UsageError::Unauthorized) => {
+                        base["status"] = serde_json::json!("needs_reauth");
+                        base["error"] = serde_json::json!(
+                            "This account's usage token was rejected; reconnect this account"
+                        );
+                    }
+                    Err(error) => {
+                        base["error"] = serde_json::json!(format!("Usage unavailable: {error:?}"));
+                    }
+                }
+            } else {
+                base["error"] =
+                    serde_json::json!("Usage unavailable: missing ChatGPT account identity");
+            }
+            return Ok(Json(base));
+        }
+    }
+
     // Codex can refresh its shared OAuth credential tier independently from
     // ai_providers.json. Reconcile the selected OpenAI provider before probing
     // usage so an expired store copy cannot hide a live Codex account behind a
@@ -8716,7 +8688,7 @@ async fn get_provider_usage(
             // — sending them as `x-api-key` gets rejected with 401, which
             // is what users on a Claude subscription (no api_key, OAuth only)
             // were seeing while their missions still worked via Claude Code.
-            let (mut auth, mut is_oauth) = if let Some(ref key) = api_key_opt {
+            let (auth, is_oauth) = if let Some(ref key) = api_key_opt {
                 (key.clone(), false)
             } else if let Some(ref o) = oauth {
                 // Refresh the token if expired before using it.
@@ -8822,16 +8794,10 @@ async fn get_provider_usage(
                 })));
             };
 
-            // Under CLI-proxy ownership, sandboxed.sh's own Anthropic OAuth
-            // record is deliberately stale (the proxy owns refresh). Probe
-            // with the proxy's live access token instead so the usage window
-            // data (5h / 7d) reflects the credential missions actually use.
-            if crate::api::oauth_owner::cli_proxy_owns(ProviderType::Anthropic) {
-                if let Some(token) = cli_proxy_access_token("claude-", "claude") {
-                    auth = token;
-                    is_oauth = true;
-                }
-            }
+            // reconcile() above refreshes this exact account from its bound
+            // proxy file. Never substitute a provider-wide token here: that
+            // attributes another account's quota to this row (and overrides
+            // explicitly configured API keys).
 
             // Minimal messages API call to get rate limit headers
             let mut req_builder = client

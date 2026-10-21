@@ -29,6 +29,7 @@ test("sidebar rows stay compact with distinct hover/selected and delayed real me
   });
   const missions = Array.from({ length: 36 }, (_, i) => ({
     id: `m${i}`,
+    project: "test",
     title: i === 0 ? "Orb DGX launch without losing this draft" : i < 4 ? `Live mission ${i}` : `Finished mission ${i} with a long truncated title`,
     status: i < 4 ? "active" : "completed",
     history: [],
@@ -204,7 +205,7 @@ test("project folders contain agents and crons and offer scoped creation", async
   await page.route("**/api/**", async route => {
     const url=new URL(route.request().url()), path=url.pathname;
     const json=path==="/api/projects" ? {projects:[{slug:"test",title:"Test"}]}
-      :path==="/api/control/missions" && url.searchParams.has("project") ? [{id:"nested",title:"Audit agent",status:"active",tags:["orb-folder:audit"],history:[],created_at:"",updated_at:""}]
+      :path==="/api/control/missions" && url.searchParams.has("project") ? [{id:"nested",project:"test",title:"Audit agent",status:"active",tags:["orb-folder:audit"],history:[],created_at:"",updated_at:""}]
       :path.endsWith("/files") ? {entries:url.searchParams.get("path") ? [] : [{name:"audit",kind:"dir"}]}
       :path.endsWith("/crons") ? {jobs:[{id:"scheduled",name:"Audit cron",folder:"audit",enabled:true,schedule:"every 1h"}]}
       :path.endsWith("/controller") ? {job:null,runs:[]}:[];

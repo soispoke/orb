@@ -411,7 +411,7 @@ async fn codex_continuity_reconnect_reads_stopped_goal_receipt_without_rearming(
     assert!(events.iter().any(
         |event| matches!(event, ExecutionEvent::GoalStatus { status, .. } if status == "blocked")
     ));
-    assert!(events.iter().any(|event| matches!(event, ExecutionEvent::TextDelta { content } if content == "Retained checkpoint receipt")));
+    assert!(events.iter().any(|event| matches!(event, ExecutionEvent::TextSnapshot { content, .. } if content == "Retained checkpoint receipt")));
     assert_eq!(f.requests("thread/start").len(), 1);
     assert_eq!(f.requests("thread/resume").len(), 1);
     assert_eq!(f.requests("thread/goal/set").len(), 1);

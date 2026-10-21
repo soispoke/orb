@@ -18,6 +18,7 @@ pub(crate) mod dispatch_admission;
 pub(crate) mod dispatch_admission_tests;
 pub(crate) mod execution_ownership;
 pub mod fork;
+pub mod fork_observation;
 pub(crate) mod machine_transfer;
 mod remote_failure;
 pub(crate) mod remote_grok;
@@ -69,7 +70,7 @@ use uuid::Uuid;
 
 #[allow(unused_imports)]
 use super::supervision::{
-    ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
+    background_task_autoresume_loop, cleanup_stale_active_missions_once,
     recover_server_shutdown_missions, reset_waiting_background_on_boot, stale_mission_cleanup_loop,
     stuck_mission_watchdog_loop, watchdog_skips_control_owned_mission,
 };
@@ -409,25 +410,14 @@ pub(crate) fn stuck_seconds() -> u64 {
         .unwrap_or(STUCK_SECONDS)
 }
 
-/// Grace period after the user first opens an `AwaitingUser` mission before
-/// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
-/// Resets whenever the user sends a new message (status returns to Active and
-/// `first_viewed_at` is cleared).
-pub(crate) const ACK_GRACE_SECONDS: u64 = 3600;
-
-/// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
-pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(60);
-
 /// Whether an incoming user message (a real one, or the background-task
 /// auto-resume synthetic message) should re-activate `status` to `Active`.
 ///
 /// Kept as one predicate so every message-dequeue site agrees. It deliberately
 /// includes `WaitingBackground`: a resume delivered while background jobs were
 /// still live must flip the mission to `Active` — which clears `first_viewed_at`
-/// (see `MissionStore::update_mission_status`) — otherwise the stale timestamp
-/// survives the later demotion back to `AwaitingUser` and the ack-promotion
-/// sweep can archive a mission whose next turn just started.
+/// (see `MissionStore::update_mission_status`) so read receipts belong to the
+/// new turn. Neither opening a chat nor an old read receipt archives it.
 /// Reason written when a cancel's JoinHandle never resolves. During a
 /// deploy/SIGTERM drain this must stay `server_shutdown` so boot recovery
 /// and reconcile resume the writer instead of leaving it stranded.
@@ -3360,6 +3350,38 @@ async fn try_llm_metadata_summarization(
     }
 }
 
+/// Restoring a finished chat preserves its established title. No runner is
+/// dispatched here; the status transition retains the existing resume behavior.
+async fn set_mission_status_preserving_title(
+    store: &Arc<dyn MissionStore>,
+    id: Uuid,
+    status: MissionStatus,
+) -> Result<(), String> {
+    let _title_guard = MISSION_TITLE_UPDATE_LOCK.lock().await;
+    if status == MissionStatus::Paused {
+        let mission = store
+            .get_mission(id)
+            .await?
+            .ok_or_else(|| format!("Mission {id} not found"))?;
+        if matches!(
+            mission.status,
+            MissionStatus::Acknowledged
+                | MissionStatus::Completed
+                | MissionStatus::Failed
+                | MissionStatus::Interrupted
+        ) {
+            if let Some(title) = mission
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+            {
+                store.update_mission_title(id, title).await?;
+            }
+        }
+    }
+    store.update_mission_status(id, status).await
+}
+
 async fn apply_generated_mission_metadata_updates(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &broadcast::Sender<AgentEvent>,
@@ -3373,12 +3395,24 @@ async fn apply_generated_mission_metadata_updates(
         return false;
     }
 
-    let _title_update_guard = if generated_title.is_some() {
-        Some(MISSION_TITLE_UPDATE_LOCK.lock().await)
-    } else {
-        None
+    // Generation can finish after a user rename/restore. Recheck under the
+    // same lock as those mutations, including description-only refreshes that
+    // could otherwise downgrade metadata_source and unprotect the title.
+    let _title_update_guard = MISSION_TITLE_UPDATE_LOCK.lock().await;
+    let current = match mission_store.get_mission(mission_id).await {
+        Ok(Some(mission)) => mission,
+        _ => return false,
     };
-
+    let user_managed = current.metadata_source.as_deref() == Some(METADATA_SOURCE_USER);
+    let generated_title = if user_managed { None } else { generated_title };
+    if generated_title.is_none() && generated_short_description.is_none() {
+        return false;
+    }
+    let metadata_source_update = if user_managed {
+        None
+    } else {
+        metadata_source_update
+    };
     let title_to_write = match generated_title {
         Some(title) => Some(disambiguate_generated_title(mission_store, mission_id, &title).await),
         None => None,
@@ -8686,8 +8720,36 @@ pub async fn get_mission_digest(
         .as_ref()
         .map(|run| mission_execution_projection(run, mission.status));
 
+    let observation_source =
+        fork_observation::source(&state, &user.id, id).map_err(internal_error)?;
+    let native_agents = fork_observation::agents(&state, &user.id, id, latest_run.as_ref())
+        .map_err(internal_error)?;
+    let children = control
+        .mission_store
+        .get_child_missions(id)
+        .await
+        .map_err(internal_error)?;
+    let children_omitted = children.len().saturating_sub(100);
+    let mut child_status = Vec::new();
+    for child in children.into_iter().take(100) {
+        // Child-list projections omit project metadata; recheck before exposing it.
+        if let Some(child) = control
+            .mission_store
+            .get_mission(child.id)
+            .await
+            .map_err(internal_error)?
+        {
+            if child.project.project == mission.project.project {
+                child_status.push(serde_json::json!({"id":child.id,"title":child.title,"status":child.status,"backend":child.backend,"updated_at":child.updated_at}));
+            }
+        }
+    }
     let goal = mission_goal_digest(&mission);
     Ok(Json(serde_json::json!({
+        "fork_source_mission_id": observation_source,
+        "children": child_status,
+        "children_omitted": children_omitted,
+        "native_agents": native_agents,
         "id": mission.id,
         "title": mission.title,
         "status": mission.status,
@@ -8978,6 +9040,7 @@ fn normalize_model_effort(raw: &str) -> Option<String> {
         "high" => Some("high".to_string()),
         "xhigh" => Some("xhigh".to_string()),
         "max" => Some("max".to_string()),
+        "ultracode" => Some("ultracode".to_string()),
         // Codex-only (gpt-6-astra, gpt-5.6-sol/terra): maximum reasoning with
         // automatic task delegation.
         "ultra" => Some("ultra".to_string()),
@@ -8989,7 +9052,10 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
     let normalized = normalize_model_effort(raw)?;
     match (backend, normalized.as_str()) {
         (Some("antigravity"), "low" | "medium" | "high") => Some(normalized),
-        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
+        (Some("opencode"), "low" | "medium" | "high") => Some(normalized),
+        (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max" | "ultracode") => {
+            Some(normalized)
+        }
         // Codex app-server accepts the GPT reasoning-effort values and passes
         // them through as `reasoningEffort`.
         (Some("codex"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
@@ -9000,7 +9066,8 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("antigravity") => "low, medium, high",
-        Some("claudecode") => "low, medium, high, xhigh, max",
+        Some("opencode") => "low, medium, high (supported routes only)",
+        Some("claudecode") => "low, medium, high, xhigh, max, ultracode",
         Some("codex") => "low, medium, high, xhigh, max, ultra",
         _ => "none",
     }
@@ -9965,14 +10032,8 @@ fn status_holds_pr_writer_lease(status: MissionStatus, reason: Option<&str>) -> 
 
 /// Grace window during which an `AwaitingUser` PR writer keeps its lease.
 ///
-/// `AwaitingUser` is non-terminal on purpose — a writer waiting for a human
-/// reply must not lose its branch. But agent-created writers are often never
-/// opened in the dashboard, so the view-gated ack-promotion tick never
-/// archives them, and a finished writer can hold its PR lease indefinitely
-/// (phantom lease: observed 2026-08-01, a writer 13h idle in a tenant store
-/// blocked every replacement while reading 404 from another tenant). After
-/// this many seconds without any update, the lease check itself releases the
-/// holder by acknowledging it.
+/// Expired PR-writer leases stop blocking replacement writers, but the chat
+/// remains visible. Lease ownership and explicit chat archiving are separate.
 pub(crate) fn pr_writer_awaiting_grace_secs() -> i64 {
     std::env::var("PR_WRITER_AWAITING_GRACE_SECS")
         .ok()
@@ -9991,35 +10052,14 @@ fn awaiting_pr_writer_lease_expired(updated_at: &str) -> bool {
     idle.num_seconds() > pr_writer_awaiting_grace_secs()
 }
 
-/// Gate a matched writer through the awaiting-grace policy. Fresh holders are
-/// returned as the lease; lapsed `AwaitingUser` holders are acknowledged in
-/// place (best effort) so the durable state converges with the release.
+/// Release an expired writer lease without archiving its conversation.
 async fn resolve_writer_lease_or_release(
-    store: &Arc<dyn MissionStore>,
+    _store: &Arc<dyn MissionStore>,
     mission: &Mission,
 ) -> Result<Option<PrWriterLease>, String> {
     if mission.status == MissionStatus::AwaitingUser
         && awaiting_pr_writer_lease_expired(&mission.updated_at)
     {
-        tracing::info!(
-            mission_id = %mission.id,
-            updated_at = %mission.updated_at,
-            "releasing lapsed AwaitingUser PR-writer lease (auto-acknowledge)"
-        );
-        if let Err(error) = store
-            .update_mission_status(mission.id, MissionStatus::Acknowledged)
-            .await
-        {
-            // The holder could not be archived (read-only store, race). Keep
-            // treating the lease as released for this decision: the mission is
-            // provably idle past grace, and exclusivity failing open here only
-            // after a long idle window is the lesser risk than a permanent
-            // phantom lease.
-            tracing::warn!(
-                mission_id = %mission.id,
-                "failed to acknowledge lapsed PR-writer holder: {error}"
-            );
-        }
         return Ok(None);
     }
     Ok(Some(pr_writer_lease(mission)))
@@ -11256,6 +11296,25 @@ pub(super) async fn create_mission_inner(
     shared_side_workspace: bool,
     side_launch_fingerprint: Option<&str>,
 ) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
+    create_mission_inner_with_observation(
+        State(state),
+        Extension(user),
+        body,
+        shared_side_workspace,
+        side_launch_fingerprint,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn create_mission_inner_with_observation(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    body: Option<Json<CreateMissionRequest>>,
+    shared_side_workspace: bool,
+    side_launch_fingerprint: Option<&str>,
+    observation_source: Option<Uuid>,
+) -> Result<(axum::http::HeaderMap, Json<serde_json::Value>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let mut req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -11801,10 +11860,10 @@ pub(super) async fn create_mission_inner(
         }
     }
 
-    // Model effort is supported for Codex and Claude Code missions.
+    // Normalize the harness ladder first, then validate routed model capabilities.
     if !matches!(
         backend.as_deref(),
-        Some("codex") | Some("claudecode") | Some("antigravity")
+        Some("codex") | Some("claudecode") | Some("antigravity") | Some("opencode")
     ) {
         model_effort = None;
     } else if let Some(value) = model_effort.as_ref() {
@@ -11825,6 +11884,26 @@ pub(super) async fn create_mission_inner(
     // OpenCode expects provider/model; Claude Code and Codex expect raw model IDs.
     if let Some(ref raw_model) = model_override {
         model_override = normalize_model_override_for_backend(backend.as_deref(), raw_model);
+    }
+
+    if backend.as_deref() == Some("opencode") {
+        if let Some(effort) = model_effort.as_deref() {
+            if req.remote_node_id.is_some()
+                || client_placement::is_client_placement(req.placement.as_deref())
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Routed OpenCode reasoning effort currently requires execution on Core"
+                        .to_string(),
+                ));
+            }
+            crate::opencode::effort::validate(
+                &state.config.working_dir,
+                model_override.as_deref(),
+                effort,
+            )
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        }
     }
 
     // Resolve the effective config profile:
@@ -12622,6 +12701,12 @@ pub(super) async fn create_mission_inner(
                 %error,
                 "could not absorb prior attempts on the same item"
             );
+        }
+    }
+    if let Some(source) = observation_source {
+        if let Err(error) = fork_observation::record(&state, &user, mission.id, source).await {
+            interrupt_new_mission(&control, mission.id, "fork_observation_unavailable").await;
+            return Err(internal_error(error));
         }
     }
     if let Some(prior_id) = req.supersedes_mission_id {
@@ -17200,6 +17285,40 @@ pub async fn update_mission_settings(
         }
     }
 
+    if effective_backend == "opencode" {
+        if let Some(Some(effort)) = model_effort.as_ref() {
+            if client_placement::is_tagged(&current.project.tags)
+                || remote_grok::placement(&state.config.working_dir, &control.mission_store, id)
+                    .await
+                    .map_err(internal_error)?
+                    .is_some()
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Routed OpenCode reasoning effort currently requires execution on Core"
+                        .to_string(),
+                ));
+            }
+            crate::opencode::effort::validate(
+                &state.config.working_dir,
+                effective_model.as_deref(),
+                effort,
+            )
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        } else if model_effort.is_none()
+            && current.model_effort.as_deref().is_some_and(|effort| {
+                crate::opencode::effort::validate(
+                    &state.config.working_dir,
+                    effective_model.as_deref(),
+                    effort,
+                )
+                .is_err()
+            })
+        {
+            model_effort = Some(None);
+        }
+    }
+
     if let Some(tier) = req.service_tier {
         fast_mode = Some(tier == crate::codex_speed::Tier::Fast);
     }
@@ -17350,8 +17469,7 @@ pub async fn load_mission(
 /// entered `AwaitingUser`. Sets `first_viewed_at` to now (no-op if already set)
 /// and broadcasts a `MissionStatusChanged` event so other clients can render
 /// the "opened" dot. The dashboard and iOS clients call this from their
-/// mission-detail entry points; the periodic ack-promotion tick uses the
-/// timestamp to decide when to move the mission to `Acknowledged`.
+/// mission-detail entry points. Opening a chat never schedules archiving.
 pub async fn mark_mission_opened(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
@@ -17406,6 +17524,8 @@ pub struct ClientStatusRequest {
     pub run_id: Option<Uuid>,
     pub generation: Option<u64>,
     pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Append one transcript row for a mission the Orb client is executing.
@@ -17489,6 +17609,24 @@ pub async fn set_client_mission_status(
             ))
         }
     };
+    // Preserve the harness failure across reloads and other clients. The
+    // interrupted marker remains stable for continuation ownership checks.
+    let failure = req
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    if failure.is_some_and(|e| e.len() > 16 * 1024) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Local failure exceeds 16 KiB".into(),
+        ));
+    }
+    let terminal_reason = if status == MissionStatus::Failed {
+        failure.unwrap_or("The local run stopped without a recorded error. Resume on the computer that started it.")
+    } else {
+        "client_runner"
+    };
     let control = control_for_user(&state, &user).await;
     if !mission_is_client_placed(&control, id)
         .await
@@ -17505,7 +17643,7 @@ pub async fn set_client_mission_status(
     // Explicit user Stop revokes wake-ups through continuations/cancel instead.
     control
         .mission_store
-        .update_mission_status_with_reason(id, status, Some("client_runner"))
+        .update_mission_status_with_reason(id, status, Some(terminal_reason))
         .await
         .map_err(internal_error)?;
     control
@@ -17518,14 +17656,14 @@ pub async fn set_client_mission_status(
                 MissionStatus::Completed | MissionStatus::AwaitingUser
             ),
             matches!(status, MissionStatus::Failed | MissionStatus::Interrupted)
-                .then(|| "client_runner".to_string()),
+                .then(|| terminal_reason.to_string()),
         )
         .await
         .map_err(internal_error)?;
     if let Some(run) = run {
         control
             .mission_store
-            .finish_mission_run(run.run_id, run.generation, Some("client_runner"))
+            .finish_mission_run(run.run_id, run.generation, Some(terminal_reason))
             .await
             .map_err(internal_error)?;
     }
@@ -17534,7 +17672,7 @@ pub async fn set_client_mission_status(
         execution: None,
         mission_id: id,
         status,
-        summary: Some("client_runner".into()),
+        summary: Some(terminal_reason.into()),
     });
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -18543,11 +18681,13 @@ pub async fn get_mission_tool_call_events(
 }
 
 const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
+    "text_delta",
     "user_message",
     "assistant_message",
     "assistant_message_canonical",
 ];
 const TRACE_EVENT_TYPES: &[&str] = &[
+    "subagent_update",
     "thinking",
     "tool_call",
     "tool_result",
@@ -18558,6 +18698,7 @@ const TRACE_EVENT_TYPES: &[&str] = &[
     "status",
 ];
 const HISTORY_EVENT_TYPES: &[&str] = &[
+    "subagent_update",
     "user_message",
     "assistant_message",
     "assistant_message_canonical",
@@ -20005,6 +20146,10 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
                 summary: None,
             })
         }
+        "subagent_update" => Some(AgentEvent::SubagentUpdate {
+            agent: serde_json::from_str(&event.content).ok()?,
+            mission_id,
+        }),
         "agent_phase" | "phase" => Some(AgentEvent::AgentPhase {
             phase: event.content.clone(),
             detail: event
@@ -21378,10 +21523,6 @@ fn spawn_control_session(
             Arc::clone(&tool_hub),
             workspaces.clone(),
             config.working_dir.clone(),
-        ));
-        tokio::spawn(ack_promotion_loop(
-            Arc::clone(&state.mission_store),
-            events_tx.clone(),
         ));
     }
 
@@ -26233,9 +26374,9 @@ async fn control_actor_loop(
                                     }
                                 }
 
-                                let result = mission_store
-                                    .update_mission_status(id, new_status)
-                                    .await;
+                                let result = set_mission_status_preserving_title(
+                                    &mission_store, id, new_status,
+                                ).await;
                                 if result.is_ok() {
                                     let runner_active = running_mission_id == Some(id)
                                         || parallel_runners
@@ -26348,6 +26489,7 @@ async fn control_actor_loop(
                                     if let Some(state) = control_hub.admission_state.get().and_then(std::sync::Weak::upgrade) {
                                         dispatch_admission::recover_dispatch(&state, &mission_store, id).await?;
                                     }
+                                    let _title_guard = MISSION_TITLE_UPDATE_LOCK.lock().await;
                                     mission_store.update_mission_title(id, &title).await
                                 }.await;
                                 if result.is_ok() {
@@ -29833,6 +29975,7 @@ async fn control_actor_loop(
                                 AgentEvent::Error { mission_id, .. } => *mission_id,
                                 AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
                                 AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
+                                AgentEvent::SubagentUpdate { mission_id, .. } => *mission_id,
                                 AgentEvent::AgentTree { mission_id, .. } => *mission_id,
                                 AgentEvent::Progress { mission_id, .. } => *mission_id,
                                 AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
@@ -30513,17 +30656,35 @@ async fn run_single_control_turn(
             return result;
         }
     }
-    // Vibe uses the same native prompt/session and transferred-workspace path
-    // as parallel mission turns. The generic control dispatcher below has no
-    // Vibe runner and frames resumed prompts differently.
-    if backend_id.as_deref() == Some("vibe") {
-        let mid = match require_mission_id(mission_id, "Mistral Vibe", &events_tx) {
+    // Forks must use the same workspace-aware dispatcher whether they become
+    // the main turn or a parallel turn. The legacy control path below prepares
+    // a new mission directory and ignores the fork's persisted source cwd.
+    let fork_workspace = if let Some(mid) = mission_id {
+        match mission_store.get_mission(mid).await {
+            Ok(Some(mission)) => {
+                mission.working_directory.is_some()
+                    && mission
+                        .project
+                        .tags
+                        .iter()
+                        .any(|tag| tag.starts_with("fork-workspace:"))
+            }
+            Ok(None) => false,
+            Err(error) => return crate::agents::AgentResult::failure(error, 0),
+        }
+    } else {
+        false
+    };
+    // Vibe also relies on this dispatcher for its native prompt/session path.
+    if backend_id.as_deref() == Some("vibe") || fork_workspace {
+        let backend = backend_id.as_deref().unwrap_or("opencode");
+        let mid = match require_mission_id(mission_id, backend, &events_tx) {
             Ok(id) => id,
             Err(result) => return result,
         };
         let mission = match mission_store.get_mission(mid).await {
             Ok(Some(mission)) => mission,
-            Ok(None) => return crate::agents::AgentResult::failure("Vibe mission not found", 0),
+            Ok(None) => return crate::agents::AgentResult::failure("Mission not found", 0),
             Err(error) => return crate::agents::AgentResult::failure(error, 0),
         };
         // New/queued control turns append this delivery before dispatch;
@@ -30556,7 +30717,7 @@ async fn run_single_control_turn(
             progress_snapshot,
             mid,
             workspace_id,
-            "vibe".into(),
+            backend.to_owned(),
             agent_override,
             model_override,
             model_effort,
@@ -34273,6 +34434,29 @@ mod tests {
         assert!(canonical_goal_message("plain message").is_none());
     }
 
+    #[tokio::test]
+    async fn expired_writer_lease_does_not_archive_chat() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mut mission = store
+            .create_mission(Some("writer"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        mission.status = MissionStatus::AwaitingUser;
+        mission.updated_at = "2000-01-01T00:00:00Z".into();
+        assert!(resolve_writer_lease_or_release(&store, &mission)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_mission(mission.id).await.unwrap().unwrap().status,
+            MissionStatus::AwaitingUser
+        );
+    }
+
     #[test]
     fn awaiting_writer_lease_grace_policy() {
         use super::awaiting_pr_writer_lease_expired;
@@ -36863,6 +37047,104 @@ And the report:
     }
 
     #[tokio::test]
+    async fn test_restored_title_survives_delayed_metadata_updates() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let (events, _) = broadcast::channel(16);
+        for status in [
+            MissionStatus::Acknowledged,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+        ] {
+            let mission = store
+                .create_mission(Some("Kohaku review"), None, None, None, None, None, None)
+                .await
+                .unwrap();
+            store
+                .update_mission_status(mission.id, status)
+                .await
+                .unwrap();
+            set_mission_status_preserving_title(&store, mission.id, MissionStatus::Paused)
+                .await
+                .unwrap();
+            // Simulate a refresh generated before restore, then a description-only
+            // refresh generated before the name became user-managed.
+            for title in [
+                Some("I'll start from the current synthesis".to_owned()),
+                None,
+            ] {
+                apply_generated_mission_metadata_updates(
+                    &store,
+                    &events,
+                    mission.id,
+                    title,
+                    Some("New description".to_owned()),
+                    Some(Some(METADATA_SOURCE_BACKEND_HEURISTIC)),
+                    Some("model"),
+                )
+                .await;
+                let updated = store.get_mission(mission.id).await.unwrap().unwrap();
+                assert_eq!(updated.status, MissionStatus::Paused);
+                assert_eq!(updated.title.as_deref(), Some("Kohaku review"));
+                assert_eq!(
+                    updated.metadata_source.as_deref(),
+                    Some(METADATA_SOURCE_USER)
+                );
+                assert_eq!(
+                    updated.short_description.as_deref(),
+                    Some("New description")
+                );
+                assert!(updated.history.is_empty());
+                assert_eq!(updated.session_id, mission.session_id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicit_title_survives_delayed_generation() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let (events, _) = broadcast::channel(16);
+        let mission = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            apply_generated_mission_metadata_updates(
+                &store,
+                &events,
+                mission.id,
+                Some("Generated name".to_owned()),
+                None,
+                Some(Some(METADATA_SOURCE_BACKEND_HEURISTIC)),
+                None
+            )
+            .await
+        );
+        store
+            .update_mission_title(mission.id, "User name")
+            .await
+            .unwrap();
+        assert!(
+            !apply_generated_mission_metadata_updates(
+                &store,
+                &events,
+                mission.id,
+                Some("Stale name".to_owned()),
+                None,
+                Some(Some(METADATA_SOURCE_BACKEND_HEURISTIC)),
+                None
+            )
+            .await
+        );
+        let updated = store.get_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(updated.title.as_deref(), Some("User name"));
+        assert_eq!(
+            updated.metadata_source.as_deref(),
+            Some(METADATA_SOURCE_USER)
+        );
+    }
+
+    #[tokio::test]
     async fn test_generate_mission_metadata_updates_does_not_overwrite_user_managed_title() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
         let mission = store
@@ -38748,6 +39030,22 @@ And the report:
         assert_eq!(
             normalize_model_effort_for_backend(Some("claudecode"), "max"),
             Some("max".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ultracode_is_claude_only() {
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("claudecode"), " Ultracode "),
+            Some("ultracode".to_string())
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("codex"), "ultracode"),
+            None
+        );
+        assert_eq!(
+            normalize_model_effort_for_backend(Some("antigravity"), "ultracode"),
+            None
         );
     }
 

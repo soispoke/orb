@@ -10,11 +10,12 @@ localStorage.setItem("orb.jwt", "test");
 document.documentElement.dataset.theme =
   new URLSearchParams(location.search).get("theme") ?? "dark";
 const [overlayOpen,setOverlayOpen]=createSignal(false);
-Object.assign(window,{openOverlayTest:()=>setOverlayOpen(true)});
+const [fileProject, setFileProject] = createSignal("verity-pareto");
+Object.assign(window,{openOverlayTest:()=>setOverlayOpen(true), setFileProject});
 render(
   () => (
     <div class="app" style={{ "--sb-w": "220px" }}>
-      <FilePanelProvider scope={{ project: "verity-pareto" }}>
+      <FilePanelProvider scope={{ project: fileProject() }}>
         <aside class="sidebar">
           <div class="sb-top" />
           <nav class="sb-scroll">

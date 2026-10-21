@@ -1,3 +1,4 @@
+import {reconcileAgentActivity} from './agentSessionStatus';
 import type { StreamItem } from "./transcriptModel";
 import type { LocalActivity } from "./localAgents";
 
@@ -49,7 +50,8 @@ export function latestChecklist(items: StreamItem[]): Checklist | null {
  * diff badges, and WorkFold components as remote streams. */
 export function localActivitiesToStreamItems(activities: LocalActivity[]): StreamItem[] {
   const out: StreamItem[] = [];
-  for (const act of activities) {
+  for (const raw of activities) {
+    const act = reconcileAgentActivity(raw);
     if (act.kind === "status" || act.id === "antigravity:status") continue;
     if (act.kind === "thinking") {
       if (act.detail?.trim()) {
@@ -89,7 +91,8 @@ export function localActivitiesToStreamItems(activities: LocalActivity[]): Strea
       name,
       args,
       result,
-      done: act.done,
+      done: act.status === 'unknown' || act.done,
+      unresolved: act.status === 'unknown',
     });
   }
   return out;

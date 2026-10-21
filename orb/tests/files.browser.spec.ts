@@ -3,6 +3,38 @@ test.use({
   browserName:
     process.env.ORB_TEST_BROWSER === "webkit" ? "webkit" : "chromium",
 });
+test("restored image ignores missing optional sources and isolates retriable folder errors", async ({ page }) => {
+  const png = [...Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64")];
+  let failFolder = false;
+  await page.route("**/api/**", route => {
+    if (!route.request().url().endsWith("/file-resources")) return route.fulfill({json:{settings:{}}});
+    const q = route.request().postDataJSON();
+    if(q.action === "roots") return route.fulfill({json:{sources:[{id:"workspace",label:"Workspace",available:true}]}});
+    if(q.action === "list" && failFolder) return route.fulfill({status:503,body:"Folder temporarily unavailable"});
+    if(q.action === "read") return route.fulfill({json:{content:null,binary:true,size:png.length,truncated:false}});
+    if(q.action === "download") return route.fulfill({json:{bytes:png,size:png.length,next:png.length}});
+    return route.fulfill({json:{entries:[],results:[]}});
+  });
+  await page.addInitScript(() => sessionStorage.setItem(`orb.files:${location.origin}:project:verity-pareto:controller:`, JSON.stringify({
+    tabs:[{source:"workspace",name:"figure.png",path:"figure.png",kind:"file"}],active:"workspace:figure.png",
+    expanded:["workspace:","controller:","removed:old/folder"],open:true,
+  })));
+  await page.goto("/tests/file-panel.html");
+  const image = page.getByRole("img", {name:"figure.png"});
+  await expect(image).toBeVisible();
+  await expect(page.getByText("File source is unavailable",{exact:true})).toHaveCount(0);
+  await page.getByRole("textbox",{name:"Draft"}).fill("Keep this draft");
+  failFolder = true;
+  await page.getByRole("button",{name:"Reload files",exact:true}).click();
+  await expect(page.locator(".file-tree")).toContainText("Couldn’t open folder");
+  await expect(page.locator(".file-preview")).not.toContainText("Couldn’t open");
+  await expect(image).toBeVisible();
+  failFolder = false;
+  await page.getByRole("button",{name:"Retry folder",exact:true}).click();
+  await expect(page.locator(".file-tree")).not.toContainText("Couldn’t open folder");
+  await expect(image).toBeVisible();
+  await expect(page.getByRole("textbox",{name:"Draft"})).toHaveValue("Keep this draft");
+});
 test("Cursor-style files preserve chat, resolve references and navigate Markdown/source", async ({
   page,
 }) => {

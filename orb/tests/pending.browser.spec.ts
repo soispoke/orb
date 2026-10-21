@@ -9,6 +9,7 @@ async function setup(page: Page, o: Options = {}) {
   let released = !o.hold;
   const mission = {
     id: MISSION,
+    project: "test",
     title: "Pareto audit",
     status: o.status ?? "active",
     history: [],

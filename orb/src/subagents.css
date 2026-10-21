@@ -1,0 +1,42 @@
+.subagents { margin: 14px 0; border: 1px solid var(--stroke); border-radius: 12px; overflow: hidden; font-size: 12px; color: var(--fg-2); }
+.subagents-heading, .subagent-toggle { display: flex; align-items: center; gap: 10px; width: 100%; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; padding: 10px 12px; min-height: 38px; }
+.subagents-heading { font-weight: 500; color: var(--fg); }
+.subagents-heading:hover, .subagent-toggle:hover { background: var(--hover); }
+.subagents-heading:focus-visible, .subagent-toggle:focus-visible, .subagents-more:focus-visible { outline: 2px solid var(--blue); outline-offset: -3px; border-radius: 7px; }
+.subagents-count, .subagents-summary, .subagent-status { color: var(--fg-3); font-size: 11px; font-weight: 400; }
+.subagents-summary { margin-left: auto; }
+.subagents-chevron { display: inline-block; color: var(--fg-3); transform: rotate(0); transition: transform 140ms ease; font-size: 16px; }
+.subagents-chevron[data-open=true] { transform: rotate(90deg); }
+.subagents-list { padding: 0 4px 4px; }
+.subagents-list[hidden], .subagent-details[hidden] { display: none; }
+.subagent-description { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-status { flex-shrink: 0; }
+.subagent-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--fg-3); opacity: .55; transition: background-color 180ms ease, opacity 180ms ease; }
+.subagent[data-state=running] .subagent-dot { background: #269dff; opacity: 1; box-shadow: 0 0 0 3px #269dff26, 0 0 10px #269dff99; }
+.subagent[data-state=waiting] .subagent-dot { background: #ffbb32; opacity: 1; box-shadow: 0 0 7px #ffbb3266; }
+.subagent[data-state=failed] .subagent-dot { background: #ff5268; opacity: 1; box-shadow: 0 0 7px #ff526866; }
+.subagent[data-state=failed] .subagent-status { color: var(--danger, #d57979); }
+.subagent-details { margin: 0 12px 10px 29px; padding-left: 12px; border-left: 1px solid var(--stroke); }
+.subagent-detail-label { color: var(--fg-3); font-size: 11px; margin: 10px 0 4px; }
+.subagent-details pre { font: inherit; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; margin: 0; }
+.subagents-more { background: transparent; border: 0; color: var(--fg-3); padding: 8px 12px; cursor: pointer; font-size: 11px; }
+@keyframes subagent-pulse { 50% { box-shadow: 0 0 0 5px #269dff12, 0 0 15px #269dffcc; } }
+@media (prefers-reduced-motion: reduce) { .subagent-dot { animation: none !important; transition: none; } .subagents-chevron { transition: none; } }
+@media (max-width: 440px) { .subagent-toggle { gap: 7px; padding-inline: 8px; } .subagent-status { max-width: 90px; } }
+
+.subagents-overview { display:flex; flex-wrap:wrap; gap:16px; padding:6px 12px 12px; color:var(--fg-3); font-size:11px; }
+.subagent { border:1px solid var(--stroke); border-radius:9px; margin:6px 4px; background:var(--hover); }
+.subagent-toggle { min-height:58px; }
+.subagent-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:5px; }
+.subagent-metrics { display:flex; flex-wrap:wrap; gap:5px 12px; color:var(--fg-3); font-size:11px; }
+.subagent-metrics:empty { display:none; }
+.subagent[data-state=running] .subagent-status { color:#269dff; }
+.subagent[data-state=completed] .subagent-dot, .subagent[data-state=finished] .subagent-dot { background:#8a8a92; box-shadow:none; }
+
+/* Interactive details must keep their real height while the conversation scrolls.
+   The generic offscreen 160px placeholder otherwise competes with bottom-follow. */
+.scroll .col > .subagents { content-visibility: visible; contain-intrinsic-size: none; }
+
+/* Unconfirmed history is neutral; reserve the bright blue dot for reported live work. */
+.subagent[data-state=unknown] .subagent-dot { background:#8a8a92; box-shadow:none; }
+.subagents > [role="status"] { font-size:12px; line-height:1.5; overflow-wrap:anywhere; color:var(--fg-2); margin:8px 0; }

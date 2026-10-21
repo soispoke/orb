@@ -11,6 +11,7 @@ VALID_TOKEN = "orb-fixture-" + str(uuid.uuid4())
 LOCK = threading.Lock()
 MISSIONS = {}
 RECEIPTS = {}
+SSH_HOSTS = {}
 PROVIDERS = {}
 CORDONED = False
 INBOX_STATE = {}
@@ -20,7 +21,8 @@ PROMPT = "Please test the new interface"
 def reset():
     global CORDONED
     CORDONED = False
-    MISSIONS.clear(); RECEIPTS.clear(); COUNTS.clear(); PROVIDERS.clear(); INBOX_STATE.clear()
+    MISSIONS.clear(); RECEIPTS.clear(); COUNTS.clear(); SSH_HOSTS.clear(); PROVIDERS.clear(); INBOX_STATE.clear()
+    SSH_HOSTS['fixture-host'] = dict(id='fixture-host', revision=1, name='Fixture SSH', host='fixture.test', user='ubuntu', port=22, note='Shared address')
     PROVIDERS['fixture-provider'] = dict(id='fixture-provider', name='Fixture provider', provider_type='openai', uses_oauth=False, enabled=True, status={'type':'connected'})
     for mid, title, tags in [('existing', 'Improve image previews', ['orb-folder:Design/Images']), ('local-only','Local Mac session',['placement:client'])]:
         MISSIONS[mid] = dict(id=mid,title=title,status='awaiting_user',project='orb-test',backend='claudecode',tags=tags,model_override='test-model',history=[dict(role='user',content=PROMPT),dict(role='assistant',content='# Ready\n\n- [x] Review complete\n\n| Feature | Status |\n| --- | --- |\n| Images | Ready |\n\n```swift\nlet orb = true\n```')])
@@ -46,6 +48,7 @@ class Handler(BaseHTTPRequestHandler):
             REQUIRE_AUTH = True
             return self.send({'error':'invalid or expired token'},401)
         if p=='/api/control/inbox-state': return self.send(INBOX_STATE)
+        if p=='/api/settings/ssh-hosts': return self.send(list(SSH_HOSTS.values()))
         if p=='/api/ai/providers': return self.send(list(PROVIDERS.values()))
         if p=='/api/ai/providers/usage': return self.send({'entries': {'fixture-provider': {'provider_type':'openai', 'codex_primary_used_percent':25}}})
         if p=='/api/cloud/usage': return self.send({'accounts':{}})
@@ -107,6 +110,18 @@ class Handler(BaseHTTPRequestHandler):
         if p.endswith('/inbox-digest'):
             mid=p.split('/')[4]; mission=MISSIONS[mid]
             return self.send(dict(schemaVersion=7, context='Restore the interrupted conversation safely.', contextDetails='Keep the original conversation and unsent drafts.', outcome='The account must be reconnected before continuing.', unresolved='Account reconnection is still required.', decision='Reconnect the account, then resume.', suggestions=['The account is reconnected; continue checking.'], sources=[dict(quote='Reconnect your ChatGPT account in Orb on your Mac.',eventSequence=None)], model=body.get('model','builtin/smart'), sourceRevision='fixture-shared-v7', sourceUpdatedAt=mission['updated_at'], generatedAt='2026-10-09T10:02:00Z'))
+        if p.startswith('/api/settings/ssh-hosts'):
+            if self.command == 'POST':
+                for existing in SSH_HOSTS.values():
+                    if all(existing[k] == body[k] for k in ['host','user','port']): return self.send(existing)
+                record = {k:body[k] for k in ['name','host','user','port','note']}
+                record.update(id=str(uuid.uuid4()), revision=1); SSH_HOSTS[record['id']]=record; return self.send(record)
+            key=p.split('/')[-1]; existing=SSH_HOSTS.get(key)
+            if not existing: return self.send({'error':'Not found'},404)
+            revision=int(parse_qs(urlparse(self.path).query).get('revision',[0])[0]) if self.command=='DELETE' else body.get('revision')
+            if revision != existing['revision']: return self.send({'error':'Conflict'},409)
+            if self.command=='DELETE': del SSH_HOSTS[key]; return self.send({})
+            existing.update({k:body[k] for k in ['name','host','user','port','note']}); existing['revision']+=1; return self.send(existing)
         if p.startswith('/api/nodes/test-node/'):
             CORDONED = p.endswith('/cordon'); return self.send({'cordoned':CORDONED})
         if p.startswith('/api/ai/providers/'):
@@ -134,7 +149,6 @@ class Handler(BaseHTTPRequestHandler):
             m=MISSIONS[p.split('/')[4]]
             if p.endswith('/title') or p.endswith('/status'): m.update(body)
             if p.endswith('/cancel'): m['status']='interrupted'
-            if p.endswith('/project'): m.update(project=body['project'], tags=body['tags'])
             return self.send(m)
         return self.send({'error':'Unknown route'},404)
 if __name__=='__main__':

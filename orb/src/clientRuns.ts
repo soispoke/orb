@@ -11,6 +11,7 @@ export async function machineIdentity(): Promise<string> {
   return await invoke("local_machine_identity") as string;
 }
 const receipts = new Map<string, ClientRunReceipt>();
+export const cachedClientRunReceipt = (id: string) => receipts.get(key(id));
 const key = (id: string) => `${getApiUrl()}:${id}`;
 export function rememberClientRunReceipt(id: string, receipt: ClientRunReceipt) {
   receipts.set(key(id), receipt);

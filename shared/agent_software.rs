@@ -184,7 +184,59 @@ pub fn resolve(bin: &str) -> Option<PathBuf> {
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/bin"),
     ]);
-    dirs.into_iter().map(|d| d.join(bin)).find(|p| p.is_file())
+    let applications = application_directories();
+    resolve_paths(bin, &dirs, &applications)
+}
+
+fn application_directories() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut paths = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            paths.push(PathBuf::from(home).join("Applications"));
+        }
+        paths.push(PathBuf::from("/Applications"));
+        paths
+    }
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+/// Prefer the user's CLI installation. The desktop bundle is only a fallback;
+/// discovery never copies, updates, or changes the bundled executable.
+fn resolve_paths(bin: &str, dirs: &[PathBuf], applications: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|d| d.join(bin))
+        .find(|p| p.is_file())
+        .or_else(|| {
+            if bin != "codex" {
+                return None;
+            }
+            applications
+                .iter()
+                .flat_map(|root| {
+                    ["ChatGPT.app", "Codex.app"]
+                        .into_iter()
+                        .flat_map(move |app| {
+                            [
+                                "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                                "Contents/Resources/codex",
+                            ]
+                            .into_iter()
+                            .map(move |relative| root.join(app).join(relative))
+                        })
+                })
+                .find(|path| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::metadata(path)
+                            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    }
+                    #[cfg(not(unix))]
+                    path.is_file()
+                })
+        })
 }
 /// Output goes to a temporary file, avoiding a full stdout pipe deadlocking wait.
 pub fn probe(path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
@@ -833,6 +885,50 @@ pub fn start_worker() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn bundled_codex_discovery_preserves_cli_precedence() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let applications = root.path().join("Applications");
+        let bundled = applications
+            .join("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "fixture").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dirs = vec![root.path().join("bin")];
+        let apps = vec![applications];
+        assert_eq!(resolve_paths("codex", &dirs, &apps), Some(bundled.clone()));
+        assert_eq!(resolve_paths("claude", &dirs, &apps), None);
+        assert_eq!(resolve_paths("codex", &dirs, &[]), None);
+        std::fs::create_dir_all(&dirs[0]).unwrap();
+        let installed = dirs[0].join("codex");
+        std::fs::write(&installed, "standalone fixture").unwrap();
+        assert_eq!(resolve_paths("codex", &dirs, &apps), Some(installed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_codex_discovery_skips_missing_and_non_executable_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let apps = vec![
+            root.path().join("UserApplications"),
+            root.path().join("Applications"),
+        ];
+        let unusable = apps[0].join("ChatGPT.app/Contents/Resources/codex");
+        std::fs::create_dir_all(unusable.parent().unwrap()).unwrap();
+        std::fs::write(&unusable, "not executable").unwrap();
+        std::fs::set_permissions(&unusable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(resolve_paths("codex", &[], &apps), None);
+        let bundled = apps[1].join("Codex.app/Contents/Resources/codex");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "fixture").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_paths("codex", &[], &apps), Some(bundled));
+        assert!(!codex_launcher(&unusable));
+    }
+
     #[test]
     fn versions_compare_numerically() {
         assert!(is_newer("1.10.0", "codex-cli 1.9.0"));

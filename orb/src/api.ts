@@ -323,6 +323,8 @@ export interface BackendInfo {
 }
 
 export interface BackendModelOption {
+  /** Core-validated effort levels for this route; absent means unavailable. */
+  efforts?: string[];
   value: string;
   label: string;
   description?: string;
@@ -366,7 +368,7 @@ export async function listBackendModels(): Promise<Record<string, BackendModelOp
   // Route identity comes from the chain store, never provider display labels.
   // Invalid responses must not silently remove an installed harness.
   if (!Array.isArray(chains)) throw new Error("Invalid model routing catalog");
-  return {...data.backends, opencode: chains.map(chain => ({value:chain.id,label:`Routing — ${chain.name}`}))};
+  return {...data.backends, opencode: chains.map(chain => ({...data.backends?.opencode?.find(model => model.value === chain.id),value:chain.id,label:`Routing — ${chain.name}`}))};
 }
 
 /** Harness order for the composer: the native agents first, then routers. */
@@ -514,11 +516,20 @@ export async function getSubscriptionLogin(sessionId: string): Promise<CliProxyL
 }
 
 export async function submitCliProxyLoginCallback(sessionId: string, url: string): Promise<CliProxyLoginState> {
-  return api(`/api/ai/providers/cli-proxy-login/${sessionId}/callback`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url }),
-  });
+  try {
+    return await api(`/api/ai/providers/cli-proxy-login/${sessionId}/callback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+  } catch (error) {
+    // Older Core versions reject a callback after the browser/poller has
+    // completed it. Read the result instead of resending a single-use code.
+    if (/409\b.*login session has already finished/i.test(String(error))) {
+      return getSubscriptionLogin(sessionId);
+    }
+    throw error;
+  }
 }
 
 /** Open a URL in the system browser (tauri shell when native, tab in dev). */
@@ -804,7 +815,12 @@ export function isBtwMission(mission: Pick<Mission, "tags">): boolean {
 export async function listProjectMissions(slug: string): Promise<Mission[]> {
   const origins=await import("./localOrigins"),observedAt=origins.observe();
   const local=(await origins.localOrigins()).filter(m=>m.project===slug && !isBtwMission(m));
-  try{const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);await origins.rememberCoreState(local,remote,observedAt);const pending=local.filter(origins.localPending).map(row=>origins.withCoreEffort(row,remote.find(m=>m.id===row.id)));return [...pending,...remote.filter(m=>!isBtwMission(m) && !pending.some(l=>l.id===m.id))];}catch(error){if(local.length)return local;throw error;}
+  try {
+    const remote=await api<Mission[]>(`/api/control/missions?project=${encodeURIComponent(slug)}&limit=100&all=true`);
+    const unlisted=await origins.unlistedCoreState(local,remote,id=>api<Mission>(`/api/control/missions/${id}`,{signal:AbortSignal.timeout(3000)}));
+    await origins.rememberCoreState(local,[...unlisted,...remote],observedAt);
+    return origins.mergeLocalOrigins(local,remote,unlisted,true).filter(m=>m.project===slug&&!isBtwMission(m));
+  } catch(error){if(local.length)return local;throw error;}
 }
 
 export async function listProjectFiles(slug: string, path: string): Promise<ProjectFileEntry[]> {
@@ -850,7 +866,12 @@ export async function deleteProjectFile(slug: string, path: string): Promise<voi
 export async function listMissions(limit = 200): Promise<Mission[]> {
   const origins = await import("./localOrigins"), observedAt = origins.observe();
   const local = (await origins.localOrigins()).filter(m=>!isBtwMission(m));
-  try { const remote = await api<Mission[]>(`/api/control/missions?limit=${limit}`, {signal:AbortSignal.timeout(3000)}); await origins.rememberCoreState(local,[...remote,...await origins.unlistedCoreState(local,remote,id=>api<Mission>(`/api/control/missions/${id}`,{signal:AbortSignal.timeout(3000)}))],observedAt); const pending=local.filter(origins.localPending).map(row=>origins.withCoreEffort(row,remote.find(m=>m.id===row.id))); return [...pending,...remote.filter(row=>!isBtwMission(row) && !pending.some(item=>item.id===row.id))]; }
+  try {
+    const remote=await api<Mission[]>(`/api/control/missions?limit=${limit}`,{signal:AbortSignal.timeout(3000)});
+    const unlisted=await origins.unlistedCoreState(local,remote,id=>api<Mission>(`/api/control/missions/${id}`,{signal:AbortSignal.timeout(3000)}));
+    await origins.rememberCoreState(local,[...unlisted,...remote],observedAt);
+    return origins.mergeLocalOrigins(local,remote,unlisted).filter(m=>!isBtwMission(m));
+  }
   catch(error){if(local.length)return local;throw error;}
 }
 
@@ -865,13 +886,13 @@ export async function listCompletedMissions(limit = 100): Promise<Mission[]> {
   }
 }
 
-export async function getMission(id: string): Promise<Mission> {
+export async function getMission(id: string, requireCore = false): Promise<Mission> {
   const origins = await import("./localOrigins"), observedAt = origins.observe();
   const local = (await origins.localOrigins(id)).find(row=>row.id===id);
   try{
     const path = `/api/control/missions/${id}`;
     const read = async () => {
-      const value = await api<Mission>(path, local ? { signal: AbortSignal.timeout(3000) } : undefined);
+      const value = await api<Mission>(path, {signal: AbortSignal.timeout(requireCore ? 15000 : local ? 3000 : 30000)});
       if (!value || typeof value !== "object" || value.id !== id) throw new InvalidApiResponseError(`GET ${path}`);
       return value;
     };
@@ -882,10 +903,11 @@ export async function getMission(id: string): Promise<Mission> {
       // Retry only this read. Retrying a POST could duplicate a sent message.
       remote = await read();
     }
-    if(local && origins.localPending(local))return origins.withCoreEffort(local,remote);
+    origins.rememberSuccessor(remote);
+    if(!requireCore && local && origins.localPending(local))return origins.withCoreEffort(local,remote);
     if(local)await origins.rememberCoreState([local],[remote],observedAt);
     return remote;
-  }catch(error){if(local)return local;throw error;}
+  }catch(error){if(!requireCore && local)return origins.confirmedSuccessor(id) ?? local;throw error;}
 }
 
 export async function createMission(body: CreateMissionBody): Promise<Mission> {
@@ -1066,11 +1088,11 @@ export async function appendClientTranscript(id: string, role: "user" | "assista
   });
 }
 
-export async function setClientMissionStatus(id: string, status: "completed" | "failed" | "interrupted" | "awaiting_user", receipt?: ClientRunReceipt, scheduledExecutionId?: string): Promise<void> {
+export async function setClientMissionStatus(id: string, status: "completed" | "failed" | "interrupted" | "awaiting_user", receipt?: ClientRunReceipt, scheduledExecutionId?: string, error?: string): Promise<void> {
   await api(`/api/control/missions/${id}/client-status`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status, ...(scheduledExecutionId ? {scheduled_execution_id: scheduledExecutionId} : {}), ...(receipt ?? await import("./clientRuns").then(m => m.clientRunReceipt(id))) }),
+    body: JSON.stringify({ status, ...(status === "failed" && error ? {error} : {}), ...(scheduledExecutionId ? {scheduled_execution_id: scheduledExecutionId} : {}), ...(receipt ?? await import("./clientRuns").then(m => m.clientRunReceipt(id))) }),
   });
 }
 
@@ -1101,11 +1123,17 @@ export async function reopenMission(id: string): Promise<void> {
   if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
   if (!["completed", "failed", "interrupted", "acknowledged", "cancelled"].includes(mission.status)
     || mission.execution?.state === "running") throw new Error("This mission is no longer finished. Refresh its status before reopening it.");
+  // Preserve the established name across restore, including against older Core
+  // versions that refresh generated metadata when the status changes.
+  if (mission.title?.trim()) {
+    await renameMission(id, mission.title);
+    if (connectionVersion() !== version) throw new Error("Connection changed. Try again.");
+  }
   await api(`/api/control/missions/${encodeURIComponent(id)}/status`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ status: "paused" }),
   });
-  await confirmCoreChange({ id, status: "paused" });
+  await confirmCoreChange({ id, status: "paused", ...(mission.title ? { title: mission.title } : {}) });
 }
 
 /** Rename the conversation without changing its execution settings. */
@@ -1119,7 +1147,10 @@ export async function renameMission(id: string, title: string): Promise<void> {
 }
 /** Core accepted the change just now: any list requested earlier is older than this. */
 async function confirmCoreChange(change: { id: string; status?: string; title?: string }): Promise<void> {
-  await import("./localOrigins").then(m => m.confirmLocalOrigins([{ ...change, observed_at: m.observe() }]));
+  await import("./localOrigins").then(m => {
+    m.forgetUnlistedReads(change.id);
+    return m.confirmLocalOrigins([{ ...change, observed_at: m.observe() }]);
+  });
 }
 
 export async function cancelMission(id: string): Promise<void> {

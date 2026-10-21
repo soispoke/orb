@@ -58,3 +58,22 @@ describe("provider usage limits", () => {
     expect(describeError("Increased the rate of the limit checker loop.").tone).toBeUndefined();
   });
 });
+
+
+it("explains an unavailable model route without calling it a usage limit", async () => {
+  const {describeError} = await import("../src/ErrorNotice");
+  const info = describeError("All 1 providers in chain 'personal-argon' are unavailable (server/network errors)");
+  expect(info.title).toBe("The model provider is unavailable");
+  expect(info.message).toContain("server or network error");
+  expect(info.message).not.toContain("usage limit");
+});
+
+
+it("explains account incompatibility, provider refusal and missing routes without hiding them behind JSON", async () => {
+  const { describeError } = await import("../src/ErrorNotice");
+  expect(describeError(JSON.stringify({detail: "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}))).toMatchObject({title: "Model unavailable for this Codex account", message: expect.stringContaining("gpt-5.5")});
+  expect(describeError("API Error: Opus 5.5's safeguards flagged this message").title).toBe("Request declined by the model provider");
+  const route = describeError("429 All providers in chain 'personal-argon' are currently in cooldown or unconfigured");
+  expect(route.title).toBe("No available route to the selected model");
+  expect(route.tone).toBeUndefined();
+});

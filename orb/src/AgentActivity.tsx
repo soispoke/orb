@@ -1,3 +1,4 @@
+import {reconcileAgentActivity} from './agentSessionStatus';
 import {anchoredDisclosure} from "./anchoredDisclosure";
 import {For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX} from 'solid-js';
 import {BranchIcon, DotsIcon, FileIcon, SearchIcon, PencilIcon, GearIcon} from './icons';
@@ -9,7 +10,9 @@ export function activityShouldCollapse(status: string | undefined, running: bool
   return !running && ["completed", "awaiting_user", "acknowledged"].includes(status ?? "");
 }
 
-export function activityState(item: LocalActivity, running: boolean) {
+export function activityState(raw: LocalActivity, running: boolean) {
+  const item = reconcileAgentActivity(raw);
+  if (item.status === 'unknown') return 'Status unconfirmed';
   if (item.status === 'stopped') return 'Stopped';
   if (item.failed) return 'Failed';
   if (item.done) return item.status === 'finished' ? 'Finished' : 'Done';
@@ -32,13 +35,14 @@ export function AgentActivity(p: {items: LocalActivity[]; running: boolean; comp
   onCleanup(() => clearInterval(timer));
   const progress = () => p.items.find(a => a.id === 'antigravity:status');
   const hasThoughts = () => p.items.some(a => a.id.startsWith('antigravity:thought:') && a.detail);
-  const tasks = createMemo(() => p.items.filter(a => a.background || a.id.startsWith('task:')));
+  const reconciled = createMemo(() => p.items.map(reconcileAgentActivity));
+  const tasks = createMemo(() => reconciled().filter(a => a.background || a.id.startsWith('task:')));
   const tools = createMemo(() => {
     const spawned = new Set(tasks().map(a => a.tool_use_id).filter(Boolean));
-    return p.items.filter(a => a.kind !== 'status' && !a.background && !a.id.startsWith('task:') && !spawned.has(a.id));
+    return reconciled().filter(a => a.kind !== 'status' && !a.background && !a.id.startsWith('task:') && !spawned.has(a.id));
   });
   const all = createMemo(() => [...tasks(), ...tools()]);
-  const isActive = (a: LocalActivity) => p.running && !a.done && !a.failed && a.status !== 'stopped';
+  const isActive = (a: LocalActivity) => p.running && !a.done && !a.failed && a.status !== 'stopped' && a.status !== 'unknown';
   const [visible, setVisible] = createSignal<string[]>([]);
   const retiring = new Map<string, ReturnType<typeof setTimeout>>();
   createEffect(() => {
@@ -94,42 +98,21 @@ function ActivityHistory(p: {ids: string[]; label: string; failures: number; row
   const [open,setOpen] = createSignal(false);
   const [limit,setLimit] = createSignal(20);
   let toggle!: HTMLButtonElement;
-  let earlier: HTMLButtonElement | undefined;
   const remaining = () => Math.max(0,p.ids.length-limit());
-  const scroller = () => {
-    let node: HTMLElement | null = toggle.parentElement;
-    while (node) {
-      if (/(auto|scroll)/.test(getComputedStyle(node).overflowY)) return node;
-      node=node.parentElement;
-    }
-    return document.scrollingElement as HTMLElement;
-  };
-  let frame = 0;
-  function anchored(change: () => void) {
-    const container=scroller(), before=toggle.getBoundingClientRect().top;
-    change();
-    cancelAnimationFrame(frame);
-    frame=requestAnimationFrame(()=> { container.scrollTop += toggle.getBoundingClientRect().top-before; });
+  const anchor = anchoredDisclosure();
+  const anchored = (change: () => void) => anchor(toggle, change);
+  function loadEarlier() {
+    const first = toggle.parentElement?.querySelector<HTMLElement>('.agent-task');
+    anchor(first ?? toggle, () => setLimit(n => n + 20));
   }
-  function loadEarlier() { anchored(()=>setLimit(n=>n+20)); }
-  createEffect(()=> {
-    if (!open() || !remaining() || !earlier || typeof IntersectionObserver === 'undefined') return;
-    const container=scroller();
-    const observer=new IntersectionObserver(entries=> {
-      if (entries.some(entry=>entry.isIntersecting)) { observer.disconnect(); loadEarlier(); }
-    },{root: container===document.scrollingElement ? null : container,rootMargin:'200px 0px 0px'});
-    observer.observe(earlier);
-    onCleanup(()=>observer.disconnect());
-  });
-  onCleanup(()=>cancelAnimationFrame(frame));
   return <div class="agent-activity-history" data-open={open()}>
-    <Show when={open()}><div class="agent-history-entries">
-      <Show when={remaining()}><button ref={earlier} class="agent-history-earlier" onClick={loadEarlier}>Show earlier actions ({remaining()})</button></Show>
-      <For each={p.ids.slice(-limit())}>{p.row}</For>
-    </div></Show>
     <button ref={toggle} class="agent-history-toggle" classList={{"has-current": !!p.active}} aria-expanded={open()} onClick={()=>anchored(()=> {setLimit(20);setOpen(v=>!v);})}>
       <Show when={p.active} fallback={p.label}>{p.lead}</Show><span class="history-chevron" aria-hidden="true">›</span><Show when={p.failures}><span class="agent-activity-failed"> · {p.failures} {p.failures===1?'error':'errors'}</span></Show>
     </button>
+    <Show when={open()}><div class="agent-history-entries">
+      <Show when={remaining()}><button class="agent-history-earlier" onClick={loadEarlier}>Show earlier actions ({remaining()})</button></Show>
+      <For each={p.ids.slice(-limit())}>{p.row}</For>
+    </div></Show>
   </div>;
 }
 
@@ -138,9 +121,6 @@ function ActivityRow(p: {item: LocalActivity; running: boolean; now: number; ret
   const anchored=anchoredDisclosure();
   let toggle!:HTMLButtonElement;
   return <div class="agent-task" data-open={open()} classList={{'is-running': !p.item.done && !p.item.failed && p.item.status !== 'stopped' && p.running, 'is-failed': p.item.failed && p.item.status !== 'stopped', 'is-retiring': p.retiring}}>
-    <Show when={open()}>
-    <div class="agent-task-detail"><Show when={p.item.detail} fallback={<span class="agent-task-empty">{p.item.done ? 'No additional details were reported.' : 'Waiting for the next update…'}</span>}><pre>{p.item.detail}</pre></Show></div>
-    </Show>
     <button class="agent-task-toggle" ref={toggle} aria-expanded={open()} onClick={()=>anchored(toggle,()=>setOpen(v=>!v))}>
       <span class="agent-task-icon" aria-hidden="true">{p.item.kind === 'agent' || p.item.label === 'Agent' ? <BranchIcon size={15}/> : p.item.kind === 'thinking' || p.item.label === 'Thinking' ? <DotsIcon size={15}/> : '›_'}</span>
       <span class="agent-task-name" title={p.item.label}><span>{p.item.label}</span></span>
@@ -148,6 +128,9 @@ function ActivityRow(p: {item: LocalActivity; running: boolean; now: number; ret
       <time class="agent-task-time">{activityDuration(p.item, p.now, p.running)}</time>
       <span class="agent-task-chevron" aria-hidden="true">›</span>
     </button>
+    <Show when={open()}>
+    <div class="agent-task-detail"><Show when={p.item.detail} fallback={<span class="agent-task-empty">{p.item.done ? 'No additional details were reported.' : 'Waiting for the next update…'}</span>}><pre>{p.item.detail}</pre></Show></div>
+    </Show>
 
   </div>;
 }

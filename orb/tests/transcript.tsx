@@ -2,7 +2,13 @@ import { render } from "solid-js/web";
 import { createSignal } from "solid-js";
 const source = new URLSearchParams(location.search).has("baseline") ? "/src/_benchmarkBefore.tsx" : "/src/Transcript.tsx";
 const { Transcript, buildTranscript, applyStreamEvent } = await import(/* @vite-ignore */ source);
+import {recoverLocalTranscript} from '../src/localTranscriptRecovery';
+import {projectLocalTranscript,createLocalTranscriptProjection} from '../src/localTranscript';
+import type {LocalTranscriptBoundary} from '../src/localTranscript';
+import type {StreamItem} from '../src/transcriptModel';
+import {saveLocalTranscriptBoundary,loadLocalTranscriptBoundaries,localTranscriptBoundaries} from '../src/localTranscriptStorage';
 import type { StreamEvent } from "../src/stream";
+import {storedToStream, type StoredEvent} from '../src/stream';
 import "../src/styles.css";
 const events: StreamEvent[] = [];
 for (let i=0;i<300;i++) events.push(
@@ -16,7 +22,25 @@ const [items,setItems]=createSignal(buildTranscript(events));
 // Match the bounded conversation scroller used by the app. Without it the
 // transcript deliberately renders every turn for non-scrolling embeddings.
 render(()=><main id="transcript" class="scroll" style={{height:'100vh',overflow:'auto'}}><Transcript items={items()}/></main>,document.getElementById("root")!);
+const projectAcrossRuns=createLocalTranscriptProjection();
 Object.assign(window,{transcriptHarness:{
+ storedLocal:(rows:StoredEvent[],boundaries:LocalTranscriptBoundary[],current:Parameters<typeof projectLocalTranscript>[2])=>setItems(projectAcrossRuns(buildTranscript(rows.map(storedToStream).filter((event):event is StreamEvent=>event!==null)),boundaries,current)),
+ transition:(canonical:StreamItem[],boundaries:LocalTranscriptBoundary[],current:Parameters<typeof projectLocalTranscript>[2])=>setItems(projectAcrossRuns(canonical,boundaries,current)),
+ recover:async(canonical:StreamItem[],cuts:{id:string;before:string}[])=>{
+  const host=window as any;
+  host.__TAURI_INTERNALS__={invoke:async(command:string)=>{
+   if(command==='local_transcript_recover')return cuts;
+   throw new Error('Unexpected native command: '+command);
+  }};
+  try { await recoverLocalTranscript('fixture','run',canonical); }
+  finally { delete host.__TAURI_INTERNALS__; }
+  setItems(projectLocalTranscript(canonical,localTranscriptBoundaries('fixture'),{text:'',active:false,activities:[]}));
+ },
+ local:async(canonical:StreamItem[],boundaries:LocalTranscriptBoundary[],current:Parameters<typeof projectLocalTranscript>[2])=>{
+  for(const cut of boundaries)await saveLocalTranscriptBoundary('fixture',cut);
+  await loadLocalTranscriptBoundaries('fixture');
+  setItems(projectLocalTranscript(canonical,localTranscriptBoundaries('fixture'),current));
+ },
  reset:(ev:StreamEvent[])=>setItems(buildTranscript(ev)),
  apply:(ev:StreamEvent)=>setItems(v=>applyStreamEvent(v,ev)),
  benchmark:async()=>{

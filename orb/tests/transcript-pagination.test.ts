@@ -93,3 +93,69 @@ it('joins an in-flight initial load when refreshTranscript is called before init
  expect(mocks.page).toHaveBeenCalledTimes(1);
 });
 
+
+it('does not resurrect deleted queued receipts from cached history',async()=>{
+ mocks.page.mockResolvedValue({events:[{id:1,event_id:'deleted',sequence:1,event_type:'user_message',content:'Old retry',timestamp:'',metadata:{queued:true}},{id:2,event_id:'delivered',sequence:2,event_type:'user_message',content:'Actual message',timestamp:''}],hasMore:false,pageMax:2});
+ const result=await loadTranscript('queue-ghost');
+ expect(result.items.filter(i=>i.kind==='user').map(i=>i.text)).toEqual(['Actual message']);
+});
+it('keeps queued history when the authoritative queue cannot be reached',async()=>{
+ mocks.queue.mockRejectedValue(new Error('Offline'));
+ mocks.page.mockResolvedValue({events:[{id:1,event_id:'pending',sequence:1,event_type:'user_message',content:'Keep this',timestamp:'',metadata:{queued:true}}],hasMore:false,pageMax:1});
+ const result=await loadTranscript('queue-offline');
+ expect(result.items.some(i=>i.kind==='user'&&i.text==='Keep this')).toBe(true);
+ expect(result.queueError).toContain('Offline');
+});
+
+it('reads the queue after history so a racing acceptance is not erased',async()=>{
+ let finish!:(page:unknown)=>void;
+ mocks.page.mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+ const loading=loadTranscript('queue-race');
+ await vi.waitFor(()=>expect(mocks.page).toHaveBeenCalled());
+ expect(mocks.queue).not.toHaveBeenCalled();
+ mocks.queue.mockResolvedValue([{id:'new',content:'New message',mission_id:'queue-race'}]);
+ finish({events:[{id:1,event_id:'new',sequence:1,event_type:'user_message',content:'New message',timestamp:'',metadata:{queued:true}}],hasMore:false,pageMax:1});
+ const result=await loading;
+ expect(result.items.filter(i=>i.kind==='user'&&i.messageId==='new')).toHaveLength(1);
+});
+
+it('revalidates a mutable local reply behind the cursor before loading a new turn',async()=>{
+ const question={id:46,event_id:'eta',sequence:46,event_type:'user_message',content:'eta',timestamp:''};
+ mocks.page.mockResolvedValueOnce({events:[row(45,'Before eta.'),question],pageMax:54,nextCursor:45,hasMore:false});
+ await loadTranscript('local-final');
+ mocks.page.mockResolvedValueOnce({events:[row(45,'Before eta. Full overnight answer.')],pageMax:45,nextCursor:45,hasMore:true})
+ .mockResolvedValueOnce({events:[{...question,id:57,event_id:'next',sequence:57,content:'what next?'},row(58,'New reply')],pageMax:58,nextCursor:58,hasMore:false});
+ const result=await refreshTranscript('local-final',true);
+ expect(mocks.page.mock.calls.slice(1)).toEqual([['local-final',{before:46,view:'transcript',limit:1}],['local-final',{since:54}]]);
+ expect(result.items.filter(i=>i.kind==='text').map(i=>i.text)).toEqual(['Before eta. Full overnight answer.','New reply']);
+ expect(result.stream.filter(e=>e.eventId==='event-45')).toHaveLength(1);
+ expect(result.cursor).toBe(58);
+});
+it('does not replace a cached reply with a different row returned during revalidation',async()=>{
+ mocks.page.mockResolvedValueOnce({events:[row(45,'Keep this')],pageMax:54,hasMore:false});
+ await loadTranscript('local-missing');
+ mocks.page.mockResolvedValueOnce({events:[row(44,'Different reply')],hasMore:false})
+ .mockResolvedValueOnce({events:[],hasMore:false});
+ const result=await refreshTranscript('local-missing',true);
+ expect(result.items.filter(i=>i.kind==='text').map(i=>i.text)).toEqual(['Keep this']);
+});
+
+it('hydrates replies even when a tool-heavy tail contains a new status question', async()=>{
+ const user={id:2000,event_id:'status',sequence:2000,event_type:'user_message',content:'status',timestamp:''};
+ mocks.page.mockResolvedValueOnce({events:[user],nextCursor:1990,pageMax:2000,hasMore:true})
+ .mockResolvedValueOnce({events:[row(100,'Earlier commentary'),row(500,'Latest commentary')],nextCursor:100,pageMax:500,hasMore:false});
+ const result=await loadTranscript('remote-status');
+ expect(result.items.filter(i=>i.kind==='text'||i.kind==='user').map(i=>i.text)).toEqual(['Earlier commentary','Latest commentary','status']);
+ expect(result.before).toBe(1990);
+});
+
+it('reconciles durable replies behind an active tool cursor without rereading full activity',async()=>{
+ mocks.page.mockResolvedValueOnce({events:[row(2,'Earlier reply')],pageMax:10000,hasMore:false});
+ await loadTranscript('recovered');
+ mocks.page.mockResolvedValueOnce({events:[row(2,'Earlier reply'),row(10,'Recovered by native identity')],pageMax:10,hasMore:false})
+ .mockResolvedValueOnce({events:[],hasMore:false});
+ const result=await refreshTranscript('recovered',false,true);
+ expect(result.items.filter(i=>i.kind==='text').map(i=>i.text)).toEqual(['Earlier reply','Recovered by native identity']);
+ expect(result.cursor).toBe(10000);
+ expect(mocks.page.mock.calls.slice(1)).toEqual([['recovered',{view:'transcript'}],['recovered',{since:10000}]]);
+});

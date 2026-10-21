@@ -112,3 +112,50 @@ it('selects the first destination model when changing harness', async()=>{
  expect((screen.getByLabelText('Transfer model') as HTMLSelectElement).value).toBe('node-only');
  expect((screen.getByRole('button',{name:'Prepare transfer'}) as HTMLButtonElement).disabled).toBe(false);
 });
+
+it('checks the local CLI before stopping the source run', async()=>{
+ const clients=await import('../src/clientRuns');
+ const agents=await import('../src/localAgents');
+ const api=await import('../src/api');
+ vi.spyOn(clients,'nativeInvoke').mockReturnValue(vi.fn());
+ vi.spyOn(clients,'machineIdentity').mockResolvedValue('computer');
+ vi.spyOn(agents,'refreshLocalAgents').mockResolvedValue([{id:'codex',bin:'codex',path:'/codex',installed:true}]);
+ vi.spyOn(transfers,'inspectTransfer').mockResolvedValue({version:1,actions:[],destinations:[]});
+ vi.spyOn(transfers,'requireLocalTransferHarness').mockRejectedValue(new Error('CLI removed before transfer'));
+ const stop=vi.spyOn(api,'cancelMission');
+ const prepare=vi.spyOn(transfers,'transferRequest');
+ render(()=><ChangeMachine mission={{...mission,status:'active'}} choices={choices} onClose={()=>{}} onMoved={()=>{}}/>);
+ await waitFor(()=>expect(screen.getByRole('menuitem',{name:/This computer/})).toBeTruthy());
+ fireEvent.click(screen.getByRole('menuitem',{name:/This computer/}));
+ expect(screen.getByText(/work held only in memory cannot move/)).toBeTruthy();
+ fireEvent.click(screen.getByRole('button',{name:'Stop and prepare'}));
+ await waitFor(()=>expect(screen.getByText(/CLI removed before transfer/)).toBeTruthy());
+ expect(stop).not.toHaveBeenCalled();expect(prepare).not.toHaveBeenCalled();
+ fireEvent.click(screen.getByRole('button',{name:'Refresh local agents'}));
+ await waitFor(()=>expect(agents.refreshLocalAgents).toHaveBeenCalledWith(true,true));
+});
+
+it('rejects a source-only Codex model on the destination', async()=>{
+ vi.spyOn(transfers,'inspectTransfer').mockResolvedValue({version:1,actions:[],destinations:[{machine:{kind:'node',id:'node'},label:'Node',available:true,harnesses:['codex']}]});
+ const destination:HarnessChoice[]=[{backend:{id:'codex',name:'Codex'},models:[{value:'other-model',label:'Other model'}]}];
+ render(()=><ChangeMachine mission={mission} choices={choices} choicesFor={()=>destination} onClose={()=>{}} onMoved={()=>{}}/>);
+ await waitFor(()=>expect(screen.getByRole('menuitem',{name:/Node/})).toBeTruthy());
+ fireEvent.click(screen.getByRole('menuitem',{name:/Node/}));
+ expect((screen.getByRole('button',{name:'Prepare transfer'}) as HTMLButtonElement).disabled).toBe(true);
+ fireEvent.change(screen.getByLabelText('Transfer model'),{target:{value:'other-model'}});
+ expect((screen.getByRole('button',{name:'Prepare transfer'}) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it('keeps remote destinations usable when the local scan fails',async()=>{
+ const clients=await import('../src/clientRuns');
+ const agents=await import('../src/localAgents');
+ vi.spyOn(clients,'nativeInvoke').mockReturnValue(vi.fn());
+ vi.spyOn(clients,'machineIdentity').mockResolvedValue('computer');
+ vi.spyOn(agents,'refreshLocalAgents').mockRejectedValue(new Error('scan failed'));
+ vi.spyOn(transfers,'inspectTransfer').mockResolvedValue({version:1,actions:[],destinations:[{machine:{kind:'core'},label:'Core',available:true,harnesses:['codex']}]});
+ render(()=><ChangeMachine mission={{...mission,remote_node_id:'source-node'}} choices={choices} onClose={()=>{}} onMoved={()=>{}}/>);
+ await waitFor(()=>expect(screen.getByRole('menuitem',{name:/Core/})).toBeTruthy());
+ expect((screen.getByRole('menuitem',{name:/Core/}) as HTMLButtonElement).disabled).toBe(false);
+ expect((screen.getByRole('menuitem',{name:/This computer/}) as HTMLButtonElement).disabled).toBe(true);
+ expect(screen.getByRole('menuitem',{name:'Refresh machines'})).toBeTruthy();
+});

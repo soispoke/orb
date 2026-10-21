@@ -61,6 +61,18 @@ export interface FileOp {
   paths?: string[];
   offset?: number;
 }
+/** A download must either advance contiguously or finish an empty file. */
+export function checkedFileChunk(reply: FileReply, offset: number, expectedSize?: number) {
+  const {bytes, next, size} = reply;
+  if (!Array.isArray(bytes) || !Number.isSafeInteger(size) || size! < 0 ||
+      next !== offset + bytes.length || next! > size! ||
+      (bytes.length === 0 && !(offset === 0 && size === 0)) ||
+      (expectedSize !== undefined && size !== expectedSize) ||
+      bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+    throw new Error("Incomplete file download. Retry the download.");
+  }
+  return {bytes: new Uint8Array(bytes), next: next!, size: size!};
+}
 export const fileScopeKey = (s: FileScope) =>
   `${getApiUrl()}:${s.mission?.id ?? `project:${s.project ?? ""}:controller:${s.controller ?? ""}`}${s.mission?.machine_transfer ? `:transfer:${s.mission.machine_transfer.id}` : ""}`;
 export function createFileClient(scope: FileScope) {
@@ -89,6 +101,7 @@ export function createFileClient(scope: FileScope) {
   const artifacts = new Map<string, string>();
 
   async function roots() {
+    if (version !== connectionVersion()) throw new Error("Connection changed. Reopen the file.");
     try {
       sources = (await server("", { action: "roots" })).sources ?? [];
     } catch (e) {
@@ -176,6 +189,7 @@ export function createFileClient(scope: FileScope) {
     return sources;
   }
   async function call(source: string, op: FileOp): Promise<FileReply> {
+    if (version !== connectionVersion()) throw new Error("Connection changed. Reopen the file.");
     const root = sources.find((s) => s.id === source);
     if (!root?.available) throw new Error("File source is unavailable");
     if (source === "controller" || source === "artifacts") {

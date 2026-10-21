@@ -1,6 +1,7 @@
 import {batch} from "solid-js";
 import { clearConnection, getApiUrl, getJwt, connectionVersion } from "./api";
 import { streamLoad, timed } from "./diagnostics";
+import {snapshotTextReader} from './snapshotTextReader';
 
 export interface StoredEvent {
   id: number;
@@ -25,6 +26,7 @@ export function isGeneratedRemoteJobStatus(ev: Pick<StoredEvent, "content" | "me
 }
 
 export interface StreamEvent {
+  timestamp?: string;
   eventId?: string;
   sequence?: number;
   storedId?: number;
@@ -49,9 +51,10 @@ async function apiRaw(path: string): Promise<Response> {
 }
 
 export interface EventPage { events: StoredEvent[]; nextCursor?: number; pageMax?: number; reset?:boolean; hasMore: boolean }
-export async function getMissionEventPage(id:string, cursor:{since?:number;before?:number;view?:'transcript'|'trace'|'history'|'all'}={}):Promise<EventPage>{
- const query=new URLSearchParams({limit:'200',include_counts:'false'});
+export async function getMissionEventPage(id:string, cursor:{since?:number;before?:number;limit?:number;view?:'transcript'|'trace'|'history'|'all'}={}):Promise<EventPage>{
+ const query=new URLSearchParams({limit:String(cursor.limit ?? 200),include_counts:'false'});
  if(cursor.view)query.set('view',cursor.view);
+ if(cursor.view==='transcript')query.set('types','user_message,assistant_message,assistant_message_canonical,text_delta');
  if(cursor.since!==undefined)query.set('since_seq',String(cursor.since));
  if(cursor.before!==undefined)query.set('before_seq',String(cursor.before));
  const response=await apiRaw(`/api/control/missions/${id}/events?${query}`);
@@ -66,7 +69,7 @@ export async function getMissionEvents(id:string):Promise<StoredEvent[]>{return 
 
 /** Map a stored (replayed) event row onto the live-stream event shape. */
 export function storedToStream(ev: StoredEvent): StreamEvent | null {
-  const d = (obj: Record<string, unknown>): StreamEvent => ({ type: ev.event_type, data: obj, eventId: ev.event_id ?? undefined, sequence: ev.sequence, storedId: ev.id });
+  const d = (obj: Record<string, unknown>): StreamEvent => ({ timestamp: ev.timestamp, type: ev.event_type, data: obj, eventId: ev.event_id ?? undefined, sequence: ev.sequence, storedId: ev.id });
   switch (ev.event_type) {
     case "text_delta":
       return d({ content: ev.content });
@@ -89,6 +92,9 @@ export function storedToStream(ev: StoredEvent): StreamEvent | null {
         ops = [];
       }
       return d({ bubble_id: ev.metadata?.bubble_id, ops });
+    }
+    case "subagent_update": {
+      try { return d({agent: JSON.parse(ev.content)}); } catch { return null; }
     }
     case "tool_call": {
       let args: unknown = null;
@@ -137,6 +143,14 @@ export function streamMission(
   // re-renders a growing block (up to 70 ms each on a long thought). They are
   // painted together with text, once per frame.
   const deliver=(event:StreamEvent)=>{if(event.type==='text_delta'||event.type==='text_op'||(event.type==='thinking'&&event.data.done!==true)){fragments.push(event);paint??=setTimeout(flush,16);}else{flush();timed(`stream ${event.type}`,()=>onEvent(event));}};
+  const snapshots = snapshotTextReader(async () => {
+    const response = await apiRaw(`/api/control/missions/${encodeURIComponent(missionId)}/events?types=text_delta,assistant_message&limit=2&include_counts=false`);
+    const rows: StoredEvent[] = await response.json();
+    if (!Array.isArray(rows)) throw new Error('Invalid text snapshot');
+    const latest = rows.filter(row => row.event_type !== 'assistant_message' || row.metadata?.success === false || !isGeneratedRemoteJobStatus(row))
+      .reduce<StoredEvent | undefined>((last, row) => !last || row.sequence > last.sequence ? row : last, undefined);
+    return latest?.event_type === 'text_delta' ? storedToStream(latest) ?? undefined : undefined;
+  }, deliver, onLagged);
   let retry = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let controller: AbortController | undefined;
@@ -192,7 +206,13 @@ export function streamMission(
           }
           try {
             const parsed = JSON.parse(data);
-            deliver({ type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence });
+            const event = { timestamp: parsed.timestamp ?? new Date().toISOString(), type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence };
+            if (eventType === 'text_op' && parsed.bubble_id === 'text_delta_latest') {
+              snapshots.invalidate();
+            } else {
+              if (eventType === 'assistant_message' && (parsed.success === false || !isGeneratedRemoteJobStatus({content: String(parsed.content ?? ''), metadata: parsed}))) snapshots.finalize();
+              deliver(event);
+            }
           } catch {
             /* malformed frame — skip */
           }
@@ -212,6 +232,7 @@ export function streamMission(
   void connect();
   return () => {
     stopped = true;
+    snapshots.dispose();
     clearTimeout(paint);fragments=[];
     if (timer) clearTimeout(timer);
     controller?.abort();

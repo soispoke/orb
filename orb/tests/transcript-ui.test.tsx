@@ -173,3 +173,11 @@ it('does not turn uploads quoted in a fork history into thumbnails',()=>{
  const {container}=render(()=><Transcript items={[{kind:'user',key:'u',text:prompt}]}/>);
  expect(container.querySelector('.message-images')).toBeNull();
 });
+
+it('separates adjacent bold summary headings without changing source text',()=>{
+ const source='**Checking the parser****Checking the compiler****Preserving evidence**';
+ const items=buildTranscript([ev('thinking',{content:source,done:false})]);
+ const {container}=render(()=><Transcript items={items}/>);
+ expect(container.querySelector('.st-think-body')?.textContent).toBe('Checking the parser\n\nChecking the compiler\n\nPreserving evidence');
+ expect(items[0]).toMatchObject({text:source});
+});

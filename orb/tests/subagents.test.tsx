@@ -1,0 +1,211 @@
+import {createSignal} from 'solid-js';
+import {afterEach, describe, expect, it, vi} from 'vitest';
+import {cleanup, fireEvent, render, screen} from '@solidjs/testing-library';
+import {collectSubagents, Subagents} from '../src/Subagents';
+import {applyStreamEvent, buildTranscript, type StreamItem} from '../src/transcriptModel';
+import {storedToStream} from '../src/stream';
+afterEach(() => {cleanup(); vi.unstubAllGlobals();});
+const call: StreamItem = {kind:'tool',key:'call',callId:'call',name:'Agent',args:{description:'Inspect parser',prompt:'Check unicode boundaries',run_in_background:true},done:true,result:'Agent launched'};
+const agent = (status = 'running', detail = 'Using Read'): StreamItem => ({kind:'subagent',key:'agent:a',text:'Inspect parser',agent:{id:'a',tool_call_id:'call',description:'Inspect parser',status,detail}});
+
+describe('subagent lifecycle', () => {
+  it('does not mistake an asynchronous launch result for child completion', () => {
+    expect(collectSubagents([call])[0].status).toBe('unknown');
+    expect(collectSubagents([call,agent()])).toHaveLength(1);
+    expect(collectSubagents([call,agent()])[0].status).toBe('running');
+    expect(collectSubagents([call,agent('failed')])[0].status).toBe('failed');
+  });
+  it('replays persisted lifecycle and keeps children running after parent final', () => {
+    const data = (agent() as Extract<StreamItem,{kind:'subagent'}>).agent;
+    const saved = storedToStream({id:1,sequence:1,event_type:'subagent_update',timestamp:'2026-10-14',content:JSON.stringify(data)})!;
+    let items = buildTranscript([saved,{type:'assistant_message',data:{content:'I started a helper',success:true}}]);
+    expect(collectSubagents(items)[0].status).toBe('running');
+    items = applyStreamEvent(items,{type:'subagent_update',sequence:2,data:{agent:{...data,status:'completed'}}});
+    items = applyStreamEvent(items,saved);
+    expect(collectSubagents(items)).toHaveLength(1);
+    expect(collectSubagents(items)[0].status).toBe('completed');
+  });
+  it('keeps the same expanded row when native task identity arrives and finishes', () => {
+    const [items,setItems] = createSignal<StreamItem[]>([{...call,done:false}]);
+    const {container} = render(() => <Subagents items={items()}/>);
+    const button = screen.getByRole('button',{name:/Inspect parser/});
+    fireEvent.click(button);
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    setItems([call,agent()]);
+    expect(screen.getByRole('button',{name:/Inspect parser/})).toBe(button);
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('Using Read')).toBeTruthy();
+    setItems([call,agent('completed','No defects found')]);
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.subagent')?.getAttribute('data-state')).toBe('completed');
+    expect(screen.getByText('No defects found')).toBeTruthy();
+  });
+  it('retains list order across status changes and supports keyboard-native controls', () => {
+    const first = agent(), second = {...agent(), key:'agent:b',agent:{id:'b',description:'Check tests',status:'running'}};
+    const [items,setItems] = createSignal<StreamItem[]>([first,second]);
+    render(() => <Subagents items={items()}/>);
+    setItems([agent('completed'),second]);
+    expect(screen.getAllByRole('button').slice(1).map(b => b.textContent)).toEqual(['Inspect parserDone›','Check testsWorking›']);
+    const heading = screen.getByRole('button',{name:/Subagents/});
+    fireEvent.click(heading);
+    expect(screen.queryByRole('button',{name:/Inspect parser/})).toBeNull();
+    fireEvent.click(heading);
+    expect(screen.getByRole('button',{name:/Inspect parser/})).toBeTruthy();
+  });
+  it('does not label interrupted work as successfully completed', () => {
+    const {container}=render(() => <Subagents items={[agent()]} interrupted/>);
+    expect(container.querySelector('.subagent')?.getAttribute('data-state')).toBe('unknown');
+    expect(screen.getByText('Status unconfirmed')).toBeTruthy();
+  });
+});
+
+it('keeps new live agents visible beyond folded history, including after completion',()=>{
+ const history:StreamItem[]=Array.from({length:8},(_,i)=>({kind:'subagent',key:`old-${i}`,text:`Old ${i}`,agent:{id:`old-${i}`,description:`Old ${i}`,status:'completed'}}));
+ const [items,setItems]=createSignal([...history,agent()]);
+ render(()=><Subagents items={items()}/>);
+ const row=screen.getByRole('button',{name:/Inspect parser/});
+ fireEvent.click(row);
+ setItems([...history,agent('completed','Finished last task')]);
+ expect(screen.getByRole('button',{name:/Inspect parser/})).toBe(row);
+ expect(row.getAttribute('aria-expanded')).toBe('true');
+});
+
+it('preserves the launch time when a terminal lifecycle event has no start timestamp', () => {
+ const items: StreamItem[]=[{...call,startedAt:1000}, {...agent('completed'),agent:{id:'a',tool_call_id:'call',description:'Inspect parser',status:'completed',startedAt:undefined,finishedAt:64000}} as StreamItem];
+ expect(collectSubagents(items)[0]).toMatchObject({startedAt:1000,finishedAt:64000});
+});
+
+it('loads real Workflow children through the mission-scoped API and cancels on unmount', async () => {
+  const receipt: StreamItem = {...call, name:'Workflow', result:'Workflow launched in background.\nTranscript dir: /root/.claude/subagents/workflows/wf_test\nRun ID: wf_test'};
+  const journal = [{type:'started',agentId:'a',label:'subagent-1',phase:'Wait'}, {type:'started',agentId:'b',label:'subagent-2'}, {type:'result',agentId:'a',result:{ok:true}}].map(x=>JSON.stringify(x)).join('\n');
+  const fetcher = vi.fn(async (url:string) => url.includes('journal.jsonl') ? new Response(journal) : new Response('',{status:404}));
+  vi.stubGlobal('fetch', fetcher);
+  const {unmount,container} = render(() => <Subagents items={[receipt]} missionId="mission" workspaceId="workspace"/>);
+  await screen.findByRole('button', {name:/subagent-1/});
+  expect(container.querySelectorAll('.subagent')).toHaveLength(2);
+  expect(container.querySelectorAll('[data-state="running"]')).toHaveLength(0);
+  expect(container.querySelectorAll('[data-state="unknown"]')).toHaveLength(1);
+  expect(fetcher.mock.calls[0][0]).toContain('mission_id=mission');
+  const signal = fetcher.mock.calls[0][1].signal as AbortSignal;
+  unmount();
+  // A completed request is no longer attached; no further polling remains after cleanup.
+  expect(signal.aborted).toBe(false);
+});
+
+it('keeps an expanded Workflow child mounted when another workflow appears or history refreshes', async () => {
+  const receipt=(id:string):StreamItem=>({...call,callId:id,name:'Workflow',result:`Transcript dir: /root/.claude/subagents/workflows/${id}\nRun ID: ${id}`});
+  vi.stubGlobal('fetch',vi.fn().mockImplementation(async(url:string)=>url.includes('journal.jsonl') ? new Response(JSON.stringify({type:'started',agentId:'a',label:'Stable child'})) : new Response('',{status:404})));
+  const [items,setItems]=createSignal<StreamItem[]>([receipt('first')]);
+  render(()=><Subagents items={items()} missionId="m" workspaceId="w"/>);
+  const row=await screen.findByRole('button',{name:/Stable child/});
+  fireEvent.click(row);
+  setItems([receipt('first'),receipt('second')]);
+  expect(screen.getByRole('button',{name:/Stable child/})).toBe(row);
+  expect(row.getAttribute('aria-expanded')).toBe('true');
+  setItems([]);
+  expect(screen.getByRole('button',{name:/Stable child/})).toBe(row);
+  expect(row.getAttribute('aria-expanded')).toBe('true');
+});
+
+it('does not restart Workflow polling when mission metadata refreshes with the same workspace', async () => {
+  const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/.claude/subagents/workflows/stable\nRun ID: stable'};
+  const fetcher=vi.fn(async(url:string)=>url.includes('journal.jsonl') ? new Response(JSON.stringify({type:'started',agentId:'a',label:'Metadata stable'})) : new Response('',{status:404}));
+  vi.stubGlobal('fetch',fetcher);
+  const [mission,setMission]=createSignal({id:'m',workspace_id:'w',status:'active'});
+  render(()=><Subagents items={[receipt]} missionId={mission().id} workspaceId={mission().workspace_id}/>);
+  const row=await screen.findByRole('button',{name:/Metadata stable/});
+  fireEvent.click(row);
+  expect(fetcher).toHaveBeenCalledTimes(3); // journal, saved state and expanded child transcript
+  setMission({id:'m',workspace_id:'w',status:'idle'});
+  expect(screen.getByRole('button',{name:/Metadata stable/})).toBe(row);
+  expect(row.getAttribute('aria-expanded')).toBe('true');
+  expect(fetcher).toHaveBeenCalledTimes(3);
+});
+
+it('loads child activity only when expanded and keeps lifecycle status from the journal', async () => {
+ const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/.claude/subagents/workflows/live\nRun ID: live'};
+ const fetcher=vi.fn(async(url:string)=>!url.includes('.jsonl') ? new Response('',{status:404}) : new Response(url.includes('journal.jsonl')
+   ? JSON.stringify({type:'started',agentId:'agent1',label:'Live child'})
+   : JSON.stringify({type:'assistant',timestamp:'2026-10-14T17:00:00Z',message:{model:'test-model',content:[{type:'tool_use',name:'Bash',input:{description:'Checking proof results'}}]}})));
+ vi.stubGlobal('fetch',fetcher);
+ const view=render(()=><Subagents items={[receipt]} missionId="m" workspaceId="w"/>);
+ const row=await screen.findByRole('button',{name:/Live child/});
+ expect(fetcher).toHaveBeenCalledTimes(2);
+ fireEvent.click(row);
+ expect(await screen.findByText('Bash: Checking proof results')).toBeTruthy();
+ expect(screen.getByText(/Last recorded activity:/)).toBeTruthy();
+ expect(row.textContent).toContain('Status unconfirmed');
+ expect(fetcher.mock.calls[2][0]).toContain('agent-agent1.jsonl');
+ view.unmount();
+});
+
+
+it('accepts out-of-order updates for different children without losing either', () => {
+ const update=(id:string,status:string,sequence:number)=>({type:'subagent_update',sequence,data:{agent:{id,description:id,status}}});
+ let items=buildTranscript([update('a','running',1),update('b','running',2)]);
+ items=applyStreamEvent(items,update('a','completed',5));
+ items=applyStreamEvent(items,update('b','failed',4));
+ expect(collectSubagents(items).map(a=>a.status)).toEqual(['completed','failed']);
+});
+
+it.each(['completed','finished','failed','stopped'])('does not revive a %s child from a late running notification', status => {
+ let items=buildTranscript([{type:'subagent_update',sequence:1,data:{agent:{id:'a',description:'A',status}}}]);
+ items=applyStreamEvent(items,{type:'subagent_update',sequence:2,data:{agent:{id:'a',description:'A',status:'running'}}});
+ expect(collectSubagents(items)[0].status).toBe(status);
+});
+
+it('keeps prior children unconfirmed when an interrupted mission resumes', () => {
+ let items=buildTranscript([{type:'subagent_update',sequence:1,data:{agent:{id:'a',description:'A',status:'running'}}},
+  {type:'mission_status_changed',sequence:2,data:{status:'interrupted'}}]);
+ items=applyStreamEvent(items,{type:'mission_status_changed',sequence:3,data:{status:'active'}});
+ expect(collectSubagents(items)[0].status).toBe('unknown');
+ items=applyStreamEvent(items,{type:'subagent_update',sequence:4,data:{agent:{id:'a',description:'A',status:'running'}}});
+ expect(collectSubagents(items)[0].status).toBe('running');
+});
+
+it('shows all queued native workflow children, deduplicates journal starts and keeps disclosures on start', async()=>{
+ const make=(started:boolean):StreamItem[]=>Array.from({length:10},(_,i)=>({kind:'subagent',key:`native-${i}`,text:`Reviewer ${i+1}`,agent:{id:`native-${i}`,workflowTaskId:'task',workflowIndex:i+1,workflowAgentId:i<2?`a${i}`:undefined,description:`Reviewer ${i+1}`,status:i<2||started&&i===2?'running':'queued'}}));
+ const [items,setItems]=createSignal(make(false));
+ const {container}=render(()=><Subagents items={items()}/>);
+ expect(container.querySelectorAll('.subagent')).toHaveLength(10);
+ expect(screen.getByText('8 queued')).toBeTruthy();
+ const row=screen.getByRole('button',{name:/Reviewer 3/});fireEvent.click(row);
+ setItems(make(true));
+ expect(screen.getByRole('button',{name:/Reviewer 3/})).toBe(row);
+ expect(row.getAttribute('aria-expanded')).toBe('true');expect(row.textContent).toContain('Working');
+});
+
+it('recovers a stopped native workflow with two started and eight never-started reviewers', async()=>{
+ const receipt:StreamItem={...call,name:'Workflow',result:'Transcript dir: /root/session/subagents/workflows/wf_review\nRun ID: wf_review'};
+ vi.stubGlobal('fetch',vi.fn(async(url:string)=>new Response(url.includes('journal.jsonl')
+  ? [0,1].map(i=>JSON.stringify({type:'started',agentId:`a${i}`})).join('\n')
+  : JSON.stringify({runId:'wf_review',taskId:'task',status:'killed',timestamp:'2026-10-15T05:20:20Z',workflowProgress:Array.from({length:10},(_,i)=>({type:'workflow_agent',index:i+1,label:`Reviewer ${i+1}`,state:i<2?'progress':'start',...(i<2?{agentId:`a${i}`,startedAt:1000}:{})}))}))));
+ const {container}=render(()=><Subagents items={[receipt]} missionId="m" workspaceId="w"/>);
+ await screen.findByText('10 stopped');
+ fireEvent.click(screen.getByRole('button',{name:'Show all 10 agents'}));
+ expect(container.querySelectorAll('.subagent')).toHaveLength(10);
+ expect(container.querySelectorAll('[data-state="running"]')).toHaveLength(0);
+ fireEvent.click(screen.getByRole('button',{name:/Reviewer 10/}));
+ expect(container.querySelector('.subagent-details:not([hidden])')?.textContent).toContain('The workflow stopped before this agent started.');
+});
+
+it('recovers saved local agent IDs and provider failures, while current activity wins', async()=>{
+ const invoke=vi.fn(async()=>({agents:[{id:'call',description:'Saved porter',status:'stopped',detail:'Saved agent ID: abc123'}],providerError:'429 All providers are cooling down',providerErrorAt:'2026-10-18T18:43:33Z'}));
+ vi.stubGlobal('__TAURI_INTERNALS__',{invoke});
+ const [local,setLocal]=createSignal<any[]>([]);
+ render(()=><Subagents items={[]} local={local()} missionId="m"/>);
+ await screen.findByText(/429 All providers/);
+ const row=await screen.findByRole('button',{name:/Saved porter/});
+ expect(row.textContent).toContain('Stopped');fireEvent.click(row);
+ expect(screen.getByText('Saved agent ID: abc123')).toBeTruthy();
+ setLocal([{id:'call',tool_use_id:'call',kind:'agent',background:true,label:'Resumed porter',done:false,status:'running'}]);
+ expect(screen.getByRole('button',{name:/Resumed porter/}).textContent).toContain('Working');
+ expect(document.querySelectorAll('.subagent')).toHaveLength(1);
+ expect(invoke).toHaveBeenCalledWith('local_agent_history',{mission:'m'});
+});
+
+it('never reads local saved agents for a remote conversation', async()=>{
+ const invoke=vi.fn();vi.stubGlobal('__TAURI_INTERNALS__',{invoke});
+ render(()=><Subagents items={[]} missionId="remote"/>);
+ await Promise.resolve();expect(invoke).not.toHaveBeenCalled();
+});

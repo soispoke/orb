@@ -41,7 +41,9 @@ export function trackScrollbarHover() {
     pointer = {x: event.clientX, y: event.clientY};
     if (drag && current) {
       if (event.pointerId !== drag.pointer) return;
-      current.scrollTop = drag.top + (event.clientY - drag.y) * drag.ratio;
+      const nextTop = drag.top + (event.clientY - drag.y) * drag.ratio;
+      current.dispatchEvent(new CustomEvent("orb:reader-scroll", {detail:{unpin:nextTop < current.scrollTop}}));
+      current.scrollTop = nextTop;
       draw(); return;
     }
     if (event.pointerType === 'touch') { clear(); return; }

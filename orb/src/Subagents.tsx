@@ -1,0 +1,293 @@
+import {reconcileAgentActivity} from './agentSessionStatus';
+import {For, Show, createMemo, createSignal, createEffect, onCleanup, untrack} from 'solid-js';
+import {anchoredDisclosure} from './anchoredDisclosure';
+import type {StreamItem} from './transcriptModel';
+import type {LocalActivity} from './localAgents';
+import './subagents.css';
+import {ElapsedTime} from './ElapsedTime';
+import {workflowJournals, parseWorkflowJournal, parseWorkflowTranscript, workflowStatePath, parseWorkflowState, mergeWorkflowAgents} from './workflowAgents';
+import {connectionVersion, getApiUrl, getJwt} from './api';
+import {nativeInvoke} from './clientRuns';
+
+export interface Subagent {
+  id: string;
+  tool_call_id?: string | null;
+  description: string;
+  status: string;
+  detail?: string | null;
+  prompt?: string;
+  startedAt?: number;
+  updatedAt?: number;
+  finishedAt?: number;
+  model?: string;
+  tokens?: number;
+  phase?: string;
+  transcriptPath?: string;
+  workflowLabel?: string;
+  workflowTaskId?: string;
+  workflowIndex?: number;
+  workflowAgentId?: string;
+}
+const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' ? value as Record<string, unknown> : {};
+const text = (value: unknown): string => {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(v => text(record(v).text ?? v)).join('\n');
+  return value == null ? '' : JSON.stringify(value, null, 2);
+};
+const label = (value: unknown) => typeof value === 'string' ? value : '';
+
+/** Native task status overrides the launch tool's result. Starting an async
+ * agent is a successful tool call, not a completed agent. Stable call identities
+ * also preserve expanded rows when the first lifecycle notification arrives. */
+export function collectSubagents(items: StreamItem[], local: LocalActivity[] = []): Subagent[] {
+  const rows = new Map<string, Subagent>();
+  for (const item of items) {
+    if (item.kind !== 'tool' || !['agent', 'task', 'delegate_task'].includes(item.name.toLowerCase())) continue;
+    const args = record(item.args), result = record(item.result);
+    const background = args.run_in_background === true;
+    rows.set(item.callId, {
+      id: item.callId, description: label(args.description) || label(args.subagent_type) || 'Subagent',
+      prompt: label(args.prompt), model: label(args.model) || undefined, phase: label(args.phase) || undefined,
+      startedAt: item.startedAt, finishedAt: background ? undefined : item.finishedAt,
+      status: item.unresolved ? 'unknown' : result.is_error === true ? 'failed' : background ? (item.done ? 'unknown' : 'running') : item.done ? 'completed' : 'running',
+      detail: item.done && !background ? text(item.result) : undefined,
+    });
+  }
+  for (const item of items) {
+    if (item.kind !== 'subagent') continue;
+    const agent = item.agent, key = agent.tool_call_id || agent.id, old = rows.get(key);
+    rows.set(key, {...old, ...agent, startedAt: agent.startedAt ?? old?.startedAt, finishedAt: agent.finishedAt ?? old?.finishedAt, id: key, description: agent.description === 'Subagent' && old ? old.description : agent.description});
+  }
+  const spawned = new Set(local.filter(a => a.background && a.kind === 'agent').map(a => a.tool_use_id));
+  for (const raw of local) {
+    const activity = reconcileAgentActivity(raw);
+    if (activity.kind !== 'agent' || (!activity.background && spawned.has(activity.id))) continue;
+    const key = activity.tool_use_id || activity.id, old = rows.get(key);
+    rows.set(key, { ...old, id: key, description: activity.label,
+      status: activity.status === 'unknown' ? 'unknown' : activity.status === 'stopped' ? 'stopped' : activity.failed ? 'failed' : activity.done ? (activity.status === 'finished' ? 'finished' : 'completed') : 'running',
+      detail: activity.detail,
+    });
+  }
+  return [...rows.values()];
+}
+const states: Record<string,string> = {running:'Working', completed:'Done', finished:'Finished', failed:'Failed', stopped:'Stopped', waiting:'Waiting', queued:'Queued', unknown:'Status unconfirmed'};
+
+function WorkflowActivity(p: {path: string; mission: string; workspace: string; active: boolean}) {
+  const [activity, setActivity] = createSignal<ReturnType<typeof parseWorkflowTranscript>>();
+  const [error, setError] = createSignal('');
+  const identity = createMemo(() => JSON.stringify([p.path, p.mission, p.workspace, p.active]));
+  createEffect(() => {
+    const [path, mission, workspace, active] = JSON.parse(identity());
+    connectionVersion();
+    if (!active) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      const request = new AbortController(), abort = () => request.abort();
+      controller.signal.addEventListener('abort', abort, {once:true});
+      const timeout = setTimeout(abort, 10000);
+      try {
+        const query = new URLSearchParams({path, mission_id:mission, workspace_id:workspace});
+        const response = await fetch(`${getApiUrl()}/api/fs/download?${query}`, {headers:{Authorization:`Bearer ${getJwt()}`},signal:request.signal});
+        if (!response.ok) throw new Error('Transcript unavailable');
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error('Transcript unavailable');
+        const decoder = new TextDecoder(); let content = '', bytes = 0;
+        try {
+          while (true) {
+            const chunk = await reader.read(); if (chunk.done) break;
+            bytes += chunk.value.byteLength;
+            if (bytes > 8 * 1024 * 1024) throw new Error('Transcript exceeds the live preview limit');
+            content += decoder.decode(chunk.value, {stream:true});
+          }
+          content += decoder.decode();
+        } finally { await reader.cancel().catch(() => {}); }
+        if (!controller.signal.aborted) { setActivity(parseWorkflowTranscript(content)); setError(''); }
+      } catch (e) {
+        if (!controller.signal.aborted) setError(e instanceof Error ? e.message : 'Activity unavailable');
+      } finally {clearTimeout(timeout);controller.signal.removeEventListener('abort',abort);}
+      if (!controller.signal.aborted) timer = setTimeout(poll, 15000);
+    };
+    void poll();
+    onCleanup(() => {controller.abort();clearTimeout(timer);});
+  });
+  return <div class="workflow-activity">
+    <Show when={activity()?.model}><div>{activity()!.model}</div></Show>
+    <Show when={activity()?.updatedAt}><div>Last recorded activity: {new Date(activity()!.updatedAt!).toLocaleTimeString()}</div></Show>
+    <pre>{activity()?.detail || (error() ? 'No activity preview available.' : 'Loading agent transcript…')}</pre>
+    <Show when={error()}><div role="status">{error()}. Retrying while this card is open.</div></Show>
+  </div>;
+}
+
+export function Subagents(p: {items: StreamItem[]; local?: LocalActivity[]; interrupted?: boolean; missionId?: string; workspaceId?: string; onInspect?: () => void}) {
+  const [savedAgents, setSavedAgents] = createSignal<Subagent[]>([]);
+  const [savedError, setSavedError] = createSignal('');
+  const [providerError, setProviderError] = createSignal('');
+  const historyIdentity = createMemo(() => JSON.stringify([p.missionId, p.local !== undefined, connectionVersion()]));
+  createEffect(() => {
+    const [mission, local] = JSON.parse(historyIdentity());
+    setSavedAgents([]); setSavedError(''); setProviderError('');
+    const invoke = nativeInvoke();
+    if (!mission || !local || !invoke) return;
+    let disposed = false, timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async () => {
+      try {
+        const result = await invoke('local_agent_history', {mission}) as {agents:Subagent[];providerError?:string;providerErrorAt?:string};
+        if (disposed) return;
+        if (!Array.isArray(result.agents)) throw new Error('Invalid saved agent history');
+        setSavedAgents(result.agents); setSavedError('');
+        setProviderError(result.providerError ? `Last recorded provider error${result.providerErrorAt ? ` (${new Date(result.providerErrorAt).toLocaleTimeString()})` : ''}: ${result.providerError}` : '');
+      } catch {
+        if (!disposed) setSavedError('Saved agent history is unavailable. Retrying…');
+      }
+      if (!disposed) timer = setTimeout(read, 30000);
+    };
+    void read();
+    onCleanup(() => {disposed = true; clearTimeout(timer);});
+  });
+  const [workflowRows, setWorkflowRows] = createSignal<Subagent[]>([], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
+  const [workflowError, setWorkflowError] = createSignal(false);
+  const journals = createMemo(() => workflowJournals(p.items), [], {equals: (a,b) => JSON.stringify(a) === JSON.stringify(b)});
+  // Parent mission objects refresh frequently. Only a change of identity
+  // should restart the reader, clear its rows, and reset disclosures.
+  const missionIdentity = createMemo(() => p.missionId);
+  const workspaceIdentity = createMemo(() => p.workspaceId);
+  createEffect(() => {
+    const mission = missionIdentity(), workspace = workspaceIdentity();
+    connectionVersion();
+    setWorkflowRows([]); setWorkflowError(false);
+    if (!mission || !workspace) return;
+    const knownPaths = new Set<string>();
+    const controller = new AbortController();
+    const cache = new Map<string, Subagent[]>();
+    const workflowLabels = new Map<string, string>();
+    let workflowNumber = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      let failed = false;
+      // History replay and new launches must not clear existing cards or their disclosure state.
+      for (const path of untrack(journals)) {
+        knownPaths.add(path);
+        if (!workflowLabels.has(path)) workflowLabels.set(path, `Workflow ${++workflowNumber}`);
+      }
+      while (knownPaths.size > 20) { const oldest = knownPaths.values().next().value!; knownPaths.delete(oldest); cache.delete(oldest); }
+      for (const path of knownPaths) {
+        if (controller.signal.aborted) break;
+        const read = async (file: string) => {
+          const request = new AbortController(), abort = () => request.abort();
+          controller.signal.addEventListener('abort', abort, {once:true});
+          const timeout = setTimeout(abort, 10000);
+          try {
+            const query = new URLSearchParams({path:file, mission_id:mission, workspace_id:workspace});
+            const response = await fetch(`${getApiUrl()}/api/fs/download?${query}`, {headers:{Authorization:`Bearer ${getJwt()}`},signal:request.signal});
+            if (!response.ok) throw new Error('Workflow record unavailable');
+            const reader = response.body?.getReader();
+            if (!reader) throw new Error('Missing workflow record');
+            const decoder = new TextDecoder(); let content = '', size = 0;
+            try {
+              while (true) {
+                const chunk = await reader.read(); if (chunk.done) break;
+                size += chunk.value.byteLength;
+                if (size > 2 * 1024 * 1024) throw new Error('Workflow record too large');
+                content += decoder.decode(chunk.value, {stream:true});
+              }
+              return content + decoder.decode();
+            } finally { await reader.cancel().catch(() => {}); }
+          } finally { clearTimeout(timeout); controller.signal.removeEventListener('abort',abort); }
+        };
+        const statePath = workflowStatePath(path);
+        const [journal, state] = await Promise.allSettled([
+          read(path).then(content => parseWorkflowJournal(content, path)),
+          statePath ? read(statePath).then(content => parseWorkflowState(content, path)) : Promise.reject(new Error('No state path')),
+        ]);
+        // Older CLIs and running workflows may not have a saved state yet.
+        // Keep known rows through transient read failures and partial writes.
+        const previous = cache.get(path) ?? [];
+        if (journal.status === 'fulfilled' || state.status === 'fulfilled') {
+          cache.set(path, mergeWorkflowAgents(
+            journal.status === 'fulfilled' ? journal.value : previous.filter(a => !a.workflowTaskId),
+            state.status === 'fulfilled' ? state.value : previous.filter(a => a.workflowTaskId),
+          ).map(agent => ({...agent, workflowLabel:workflowLabels.get(path)})));
+        } else failed = true;
+      }
+      if (controller.signal.aborted) return;
+      setWorkflowRows([...cache.values()].flat().map(agent => failed && agent.status === 'running' ? {...agent, status: 'unknown'} : agent));
+      setWorkflowError(failed);
+      timer = setTimeout(poll, failed ? 10000 : 3000);
+    };
+    void poll();
+    onCleanup(() => {controller.abort(); clearTimeout(timer);});
+  });
+  const agents = createMemo(() => {
+    const rows = new Map(savedAgents().map(agent => [agent.id, agent]));
+    // A current native activity overrides the historical snapshot, including
+    // its outcome. Never mark a resumed agent stopped because an old run was.
+    for (const agent of collectSubagents(p.items, p.local)) rows.set(agent.id, {...rows.get(agent.id), ...agent});
+    return mergeWorkflowAgents([...rows.values()], workflowRows());
+  });
+  const [expanded, setExpanded] = createSignal(true);
+  const [showAll, setShowAll] = createSignal(false);
+  const anchored = anchoredDisclosure();
+  const disclose = (trigger: HTMLElement, change: () => void) => {
+    p.onInspect?.();
+    anchored(trigger, change);
+  };
+  let toggle!: HTMLButtonElement;
+  const status = (agent: Subagent) => p.interrupted && ['running', 'queued', 'waiting'].includes(agent.status) ? 'unknown' : agent.status;
+  const working = () => agents().filter(a => status(a) === 'running').length;
+  const queued = () => agents().filter(a => status(a) === 'queued').length;
+  const stopped = () => agents().filter(a => status(a) === 'stopped').length;
+  const completed = () => agents().filter(a => ['completed', 'finished'].includes(status(a))).length;
+  const failed = () => agents().filter(a => status(a) === 'failed').length;
+  // Iterate IDs, not fresh event objects: an update never remounts an open row.
+  const revealed = createMemo<Set<string>>(previous => {
+    const ids = new Set(previous);
+    for (const agent of agents()) if (["running", "queued", "waiting", "failed"].includes(status(agent))) ids.add(agent.id);
+    return ids;
+  }, new Set());
+  const visible = () => agents().filter((agent, index) => showAll() || index < 6 || revealed().has(agent.id)).map(a => a.id);
+  return <Show when={agents().length || journals().length || savedError() || providerError()}><section class="subagents" aria-label="Subagents">
+    <Show when={providerError()}><p role="status">{providerError()}</p></Show>
+    <Show when={savedError()}><p role="status">{savedError()}</p></Show>
+    <button class="subagents-heading" ref={toggle} aria-expanded={expanded()} onClick={() => disclose(toggle, () => setExpanded(v => !v))}>
+      <span class="subagents-chevron" data-open={expanded()} aria-hidden="true">›</span>
+      <span>Subagents</span><span class="subagents-count">{agents().length}</span>
+      <span class="subagents-summary">{working() ? `${working()} working` : 'Activity'}{queued() ? ` · ${queued()} queued` : ''}{failed() ? ` · ${failed()} failed` : ''}{stopped() ? ` · ${stopped()} stopped` : ''}</span>
+    </button>
+    <div hidden={!expanded()} class="subagents-list">
+      <Show when={workflowError()}><div role="status">Workflow updates unavailable. Retrying…</div></Show>
+      <div class="subagents-overview"><span>{agents().length} agents</span><span>{working()} working</span><Show when={queued()}><span>{queued()} queued</span></Show><span>{completed()} finished</span><Show when={stopped()}><span>{stopped()} stopped</span></Show></div>
+      <For each={visible()}>{id => {
+        const agent = () => agents().find(a => a.id === id)!;
+        const [open, setOpen] = createSignal(false);
+        let row!: HTMLButtonElement;
+        return <div class="subagent" data-state={status(agent())}>
+          <button ref={row} class="subagent-toggle" aria-expanded={open()} onClick={() => disclose(row, () => setOpen(v => !v))}>
+            <span class="subagent-dot" aria-hidden="true"/>
+            <span class="subagent-copy">
+              <span class="subagent-description" title={agent().description}>{agent().description}</span>
+              <span class="subagent-metrics">
+                <Show when={agent().workflowLabel}><span>{agent().workflowLabel}</span></Show>
+                <Show when={agent().phase}><span>{agent().phase}</span></Show>
+                <Show when={agent().model}><span>{agent().model}</span></Show>
+                <Show when={agent().tokens !== undefined}><span>{agent().tokens!.toLocaleString()} tokens</span></Show>
+                <ElapsedTime startedAt={agent().startedAt} finishedAt={agent().finishedAt} running={status(agent()) === 'running'} />
+              </span>
+            </span>
+            <span class="subagent-status">{states[status(agent())] ?? 'Status unavailable'}</span>
+            <span class="subagents-chevron" data-open={open()} aria-hidden="true">›</span>
+          </button>
+          <div hidden={!open()} class="subagent-details">
+            <Show when={agent().prompt}><div class="subagent-detail-label">Task</div><pre>{agent().prompt}</pre></Show>
+            <div class="subagent-detail-label">{['running', 'unknown', 'waiting', 'queued'].includes(status(agent())) ? 'Latest recorded activity' : 'Result'}</div>
+            <Show when={agent().transcriptPath && p.missionId && p.workspaceId} fallback={<pre>{agent().detail || (status(agent()) === 'running' ? 'No activity details received yet.' : 'No additional result was reported.')}</pre>}>
+              <WorkflowActivity path={agent().transcriptPath!} mission={p.missionId!} workspace={p.workspaceId!} active={open() && expanded()} />
+              <Show when={agent().detail && status(agent()) !== 'running'}><pre>{agent().detail}</pre></Show>
+            </Show>
+          </div>
+        </div>;
+      }}</For>
+      <Show when={showAll() || visible().length < agents().length}><button class="subagents-more" onClick={e => disclose(e.currentTarget, () => setShowAll(v => !v))}>{showAll() ? 'Show fewer' : `Show all ${agents().length} agents`}</button></Show>
+    </div>
+  </section></Show>;
+}

@@ -10,7 +10,7 @@ test('live work, completed tasks and failures remain distinct on desktop and mob
  await expect(page.getByText('Validate generated reports')).not.toBeVisible();
  await page.locator('.agent-history-toggle').click();
  await expect(page.getByText('Regenerate verification artifacts')).toBeVisible();
- await expect(page.locator('.history-chevron')).toHaveCSS('transform','matrix(0, -1, 1, 0, 0, 0)');
+ await expect(page.locator('.history-chevron')).toHaveCSS('transform','matrix(0, 1, -1, 0, 0, 0)');
  await page.getByText('Validate generated reports').click();
  await expect(page.getByText('The trust-surface report is stale.',{exact:false})).toBeVisible();
  await page.screenshot({path:'/tmp/orb-background-work-desktop.png'});
@@ -41,7 +41,7 @@ test('successful turns awaiting a follow-up collapse activity and resumed turns 
  await expect(collapsed).toBeHidden();
 });
 
-test('history opens upward without moving its toggle and loads earlier rows near the top',async({page})=>{
+test('history and task details open downward without moving their toggles',async({page})=>{
  await page.setViewportSize({width:800,height:400});
  await page.goto('/tests/agent-activity.html?long');
  const toggle=page.locator('.agent-history-toggle');
@@ -51,8 +51,18 @@ test('history opens upward without moving its toggle and loads earlier rows near
  await expect.poll(async()=>Math.abs((await toggle.boundingBox())!.y-before)).toBeLessThan(2);
  await expect(page.locator('.agent-history-entries .agent-task')).toHaveCount(20);
  const earlier=page.getByRole('button',{name:/Show earlier actions/});
- await earlier.scrollIntoViewIfNeeded();
- await expect.poll(()=>page.locator('.agent-history-entries .agent-task').count()).toBeGreaterThan(20);
+ expect((await page.locator('.agent-history-entries').boundingBox())!.y).toBeGreaterThan((await toggle.boundingBox())!.y);
+ await earlier.click();
+ await expect(page.locator('.agent-history-entries .agent-task')).toHaveCount(40);
+ await page.evaluate(()=>new Promise<void>(resolve=>{let frames=6;const step=()=>--frames?requestAnimationFrame(step):resolve();requestAnimationFrame(step);}));
+ const task=page.locator('.agent-task-toggle').last();
+ await task.scrollIntoViewIfNeeded();
+ const taskBefore=(await task.boundingBox())!.y;
+ await task.click();
+ await expect.poll(async()=>Math.abs((await task.boundingBox())!.y-taskBefore)).toBeLessThan(2);
+ expect((await page.locator('.agent-task-detail').last().boundingBox())!.y).toBeGreaterThan((await task.boundingBox())!.y);
+ await task.click();
+ await expect(page.locator('.agent-task-detail')).toHaveCount(0);
 });
 
 test('CI waits show one collapsed group with the original actions inside',async({page})=>{

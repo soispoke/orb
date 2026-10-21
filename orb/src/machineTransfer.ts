@@ -109,19 +109,28 @@ export async function verifyTransfer(action: TransferAction): Promise<TransferAc
   const receipt = await transferFiles(action, "destination", { op: "verify" });
   return transferRequest(action.mission_id, { op: "client_verified", transfer_id: action.id, client_id: await machineIdentity(), receipt });
 }
+/** Validate the destination before interrupting the source or committing a move. */
+export async function requireLocalTransferHarness(backend: string) {
+  const rows = await refreshLocalAgents(true, true);
+  const cli = rows.find(row => row.id === backend && row.installed && row.path);
+  if (!cli?.path) throw new Error("The selected local agent is unavailable. Open Settings → Local agents and scan again before transferring.");
+  return cli;
+}
 export async function adoptTransferredWorkspace(action: TransferAction) {
   if (action.phase !== "activated" || action.destination.kind !== "client") return;
   if (action.destination.id !== await machineIdentity()) return;
   if (!action.destination_root) throw new Error("Destination receipt has no workspace.");
   const old = localBinding(action.mission_id);
-  if (old?.cwd === action.destination_root && (!["antigravity", "vibe"].includes(action.backend) || old.transferId === action.id)) return; // retain the new native session on subsequent reads
-  const rows = await refreshLocalAgents();
-  const cli = rows.find(r => r.id === action.backend && r.installed && r.path);
-  if (!cli?.path) throw new Error("Install the selected harness on this computer before continuing.");
+  if (old?.cwd === action.destination_root && old.harness === action.backend && old.transferId === action.id) return; // retain the new native session on subsequent reads
+  const cli = await requireLocalTransferHarness(action.backend);
   const planMode = action.backend === "vibe" && (await getMission(action.mission_id)).agent === "plan";
-  await rememberBinding(action.mission_id, { harness: action.backend, bin: cli.path, cwd: action.destination_root, model: action.model ?? undefined, transferId: action.id, planMode });
+  await rememberBinding(action.mission_id, { harness: action.backend, bin: cli.path!, cwd: action.destination_root, model: action.model ?? undefined, effort: action.effort ?? undefined, transferId: action.id, planMode });
 }
 export async function activateTransfer(action: TransferAction): Promise<Mission> {
+  if (action.destination.kind === "client") {
+    if (action.destination.id !== await machineIdentity()) throw new Error("Open Orb on the destination computer before activating this transfer.");
+    await requireLocalTransferHarness(action.backend);
+  }
   let clientSourceVerified: string | undefined;
   if (action.source.kind === "client") {
     await transferFiles(action, "source", { op: "check_source" });

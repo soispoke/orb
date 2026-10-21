@@ -1,4 +1,5 @@
 import { getCyber, requireCyberSupport, type CyberMode } from "./cyberAccess";
+import { LiveInputUnavailable } from "./liveInputAvailability";
 import {followNative} from "./nativeInteractionStream";
 import { rememberClientRunReceipt, type ClientRunReceipt } from "./clientRuns";
 /**
@@ -41,6 +42,7 @@ export interface ScanRow {
 }
 
 export interface LocalBinding {
+  shareFolder?: boolean;
   harness: string;
   bin: string;
   cwd: string;
@@ -154,6 +156,7 @@ export function restoreLocalBindings(): Promise<void> {
 const [scanning, setScanning] = createSignal(false);
 export const localAgentsScanning = scanning;
 let scanPromise: Promise<ScanRow[]> | undefined;
+let scanFallbackPromise: Promise<ScanRow[]> | undefined;
 let scannedAt = 0;
 let scannedPaths = "";
 /** A known binary can start while inventory refreshes. Native spawn validates its path. */
@@ -176,8 +179,8 @@ function refreshLocalAntigravityModels() {
   }).finally(() => localModelRequests.delete(path));
 }
 
-export function refreshLocalAgents(force = false): Promise<ScanRow[]> {
-  if (scanPromise) return scanPromise;
+export function refreshLocalAgents(force = false, strict = false): Promise<ScanRow[]> {
+  if (scanPromise) return strict ? scanPromise : scanFallbackPromise!;
   const paths = pathOverrides();
   const key = JSON.stringify(paths);
   if (!force && key === scannedPaths && Date.now() - scannedAt < 60_000) return Promise.resolve(installed());
@@ -185,17 +188,16 @@ export function refreshLocalAgents(force = false): Promise<ScanRow[]> {
   scanPromise = (async () => {
     const invoke = tauriInvoke();
     if (!invoke) { setInstalled([]); return []; }
-    try {
-      const rows = await invoke("local_agents_scan", { request: { overrides: paths } }) as ScanRow[];
-      // Older desktop builds tied `installed` to the version probe succeeding.
-      // Vibe also checks its bridge interpreter; retain that native preflight result.
-      setInstalled(Array.isArray(rows) ? rows.map(row => ({...row, installed: !!row.path && (row.id !== "vibe" || row.installed)})) : []);
-      scannedAt = Date.now(); scannedPaths = key;
-      refreshLocalAntigravityModels();
-      return installed();
-    } catch { return installed(); }
-  })().finally(() => { setScanning(false); scanPromise = undefined; });
-  return scanPromise;
+    const rows = await invoke("local_agents_scan", { request: { overrides: paths } }) as ScanRow[];
+    // Older desktop builds tied `installed` to the version probe succeeding.
+    // Vibe also checks its bridge interpreter; retain that native preflight result.
+    setInstalled(Array.isArray(rows) ? rows.map(row => ({...row, installed: !!row.path && (row.id !== "vibe" || row.installed)})) : []);
+    scannedAt = Date.now(); scannedPaths = key;
+    refreshLocalAntigravityModels();
+    return installed();
+  })().finally(() => { setScanning(false); scanPromise = undefined; scanFallbackPromise = undefined; });
+  scanFallbackPromise = scanPromise.catch(() => installed());
+  return strict ? scanPromise : scanFallbackPromise;
 }
 
 export function installedIds(): string[] {
@@ -495,7 +497,7 @@ async function reconcileRun(id: string): Promise<void> {
   try {
     const state = await pollLocal(id);
     if (runVersions.get(id)!==version) return;
-    if (!state.done) recordLocalFailure(id, null);
+    recordLocalFailure(id, state.done ? state.error : null);
     setRunning(prev => ({ ...prev, [id]: !state.done }));
     if(!state.done&&!followers.has(id))void followLocal(id,()=>{}).catch(console.error);
     setLiveText(prev => ({ ...prev, [id]: state.text }));
@@ -590,7 +592,7 @@ export async function localSessionGit(cwd: string): Promise<{ repository: string
 }
 
 /** Initial runs have a native-generated identity and a durable synchronization journal. */
-export async function startLocalOrigin(request: Omit<StartLocal,"id">, draft: {key:string;title:string;project:string;prompt:string;tags:string[]}): Promise<import("./api").Mission> {
+export async function startLocalOrigin(request: Omit<StartLocal,"id">, draft: {key:string;title:string;project:string;prompt:string;tags:string[];share_folder?:boolean;fork_source_mission_id?:string}): Promise<import("./api").Mission> {
  const invoke=tauriInvoke();if(!invoke)throw new Error("Open Orb desktop to start on this computer.");
  if(request.harness==='codex'){await requireCyberSupport();await requireLocalCyber(invoke);}
  await import("./localWakeups").then(m=>m.replayLocalWakeupStops());
@@ -721,4 +723,21 @@ export async function localCodexSpeedOptions(model: string): Promise<{tiers: {id
  const invoke=tauriInvoke(); if(!invoke)throw new Error('Open Orb desktop to check the local Codex subscription.');
  const cli=await localAgentForLaunch('codex'); if(!cli?.path)throw new Error('Codex is not installed on this computer.');
  return await invoke('local_codex_speed_options',{bin:cli.path,model}) as {tiers: {id: import('./api').CodexServiceTier; available: boolean; reason?: string}[]};
+}
+
+/** Capability is checked on the owning worker, never inferred from the UI version. */
+export async function localInputToken(id: string): Promise<string> {
+  const invoke = tauriInvoke();
+  if (!invoke) throw new LiveInputUnavailable();
+  let result: {token?: string};
+  try { result = await invoke("local_agents_input_status", {id}) as {token?: string}; }
+  catch { throw new LiveInputUnavailable(); }
+  if (!result?.token) throw new LiveInputUnavailable();
+  return result.token;
+}
+export async function steerLocal(id: string, token: string, messageId: string, text: string): Promise<void> {
+  const invoke = tauriInvoke();
+  if (!invoke) throw new Error("Steering delivery is unconfirmed.");
+  const receipt = await invoke("local_agents_steer", {id, token, messageId, text}) as {state?: string};
+  if (receipt.state !== "accepted") throw new Error("Steering delivery is unconfirmed.");
 }

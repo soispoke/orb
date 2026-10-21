@@ -180,6 +180,10 @@ pub enum AgentEvent {
         mission_id: Option<Uuid>,
     },
     /// Agent tree update (for real-time tree visualization)
+    SubagentUpdate {
+        agent: super::super::runners::subagents::Subagent,
+        mission_id: Option<Uuid>,
+    },
     AgentTree {
         /// The full agent tree structure
         tree: AgentTreeNode,
@@ -331,6 +335,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::MissionStatusChanged { .. } => "mission_status_changed",
             AgentEvent::AgentPhase { .. } => "agent_phase",
+            AgentEvent::SubagentUpdate { .. } => "subagent_update",
             AgentEvent::AgentTree { .. } => "agent_tree",
             AgentEvent::Progress { .. } => "progress",
             AgentEvent::SessionIdUpdate { .. } => "session_id_update",
@@ -357,6 +362,7 @@ impl AgentEvent {
             AgentEvent::Error { mission_id, .. } => *mission_id,
             AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
             AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
+            AgentEvent::SubagentUpdate { mission_id, .. } => *mission_id,
             AgentEvent::AgentTree { mission_id, .. } => *mission_id,
             AgentEvent::Progress { mission_id, .. } => *mission_id,
             AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
@@ -617,8 +623,8 @@ pub enum MissionStatus {
     /// Agent's turn / automation cycle finished cleanly with no follow-up
     /// queued; mission is parked waiting for the user to read it.
     AwaitingUser,
-    /// User opened the mission while it was AwaitingUser and the ack grace
-    /// period elapsed without a new message — mission is auto-archived.
+    /// Explicitly archived. Viewing a mission or leaving it idle never sets
+    /// this status.
     Acknowledged,
     /// The agent's turn finished but it left one or more background shell jobs
     /// (`Bash run_in_background`) running in the workspace. The mission is NOT

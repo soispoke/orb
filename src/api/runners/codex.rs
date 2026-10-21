@@ -1603,6 +1603,64 @@ async fn run_codex_turn(
     result
 }
 
+/// Coalesce revisions within an identified native reply, never across replies.
+struct NativeTextStream {
+    pending: Option<(String, String, bool)>,
+    revision: u64,
+    deadline: tokio::time::Instant,
+}
+
+impl Default for NativeTextStream {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            revision: 0,
+            deadline: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl NativeTextStream {
+    fn update(
+        &mut self,
+        mission: Uuid,
+        id: String,
+        text: String,
+        done: bool,
+        tx: &broadcast::Sender<AgentEvent>,
+    ) {
+        if self.pending.as_ref().is_some_and(|(old, _, _)| old != &id) {
+            self.flush(mission, tx);
+        }
+        if self.pending.is_none() {
+            self.deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        }
+        self.pending = Some((id, text, done));
+        if done {
+            self.flush(mission, tx);
+        }
+    }
+
+    fn flush(&mut self, mission: Uuid, tx: &broadcast::Sender<AgentEvent>) {
+        let Some((id, text, done)) = self.pending.take() else {
+            return;
+        };
+        self.revision += 1;
+        let mut ops = vec![crate::api::control::TextOp::Snapshot {
+            text,
+            revision: self.revision,
+        }];
+        if done {
+            ops.push(crate::api::control::TextOp::Finalize);
+        }
+        let _ = tx.send(AgentEvent::TextOp {
+            mission_id: mission,
+            bubble_id: format!("codex:{mission}:{id}"),
+            ops,
+        });
+    }
+}
+
 /// Drain the native driver before classifying its result. Shared with transcript
 /// regressions so stopped-goal tests exercise the production final-response path.
 pub(crate) async fn consume_codex_events(
@@ -1620,6 +1678,8 @@ pub(crate) async fn consume_codex_events(
     let mut raw_error_message: Option<String> = None;
     let mut text_delta_coalescer = TextDeltaCoalescer::new();
     let mut text_delta_pending = false;
+    let mut native_text = NativeTextStream::default();
+    let mut text_flush_deadline = tokio::time::Instant::now();
     let mut success = false;
     let mut error_message: Option<String> = None;
     // A usage limit reported after the reply is not an error of this turn,
@@ -1660,6 +1720,20 @@ pub(crate) async fn consume_codex_events(
                 codex_cancel_deferred = true;
                 continue;
             }
+            _ = tokio::time::sleep_until(text_flush_deadline), if text_delta_pending => {
+                // A final fragment may be followed by hours of tool work. Flush
+                // on a fixed deadline rather than waiting for another token or
+                // session completion. Other events cannot postpone this timer.
+                text_delta_pending = false;
+                let _ = text_delta_coalescer.should_emit();
+                let _ = events_tx.send(AgentEvent::TextDelta {
+                    content: assistant_message.clone(),
+                    mission_id: Some(mission_id),
+                });
+            }
+            _ = tokio::time::sleep_until(native_text.deadline), if native_text.pending.is_some() => {
+                native_text.flush(mission_id, &events_tx);
+            }
             Some(event) = event_rx.recv() => {
                 match event {
                     ExecutionEvent::CodexSessionBound { thread_id, goal_mode } => {
@@ -1670,6 +1744,10 @@ pub(crate) async fn consume_codex_events(
                             mission_id,
                             session_id: format!("{}{thread_id}", continuity::SESSION_PREFIX),
                         });
+                    }
+                    ExecutionEvent::TextSnapshot { item_id, content, done } => {
+                        assistant_message = content.clone();
+                        native_text.update(mission_id, item_id, content, done, &events_tx);
                     }
                     ExecutionEvent::TextDelta { content } => {
                         // For Codex backend, TextDelta is handled as the latest snapshot for
@@ -1686,6 +1764,10 @@ pub(crate) async fn consume_codex_events(
                                 mission_id: Some(mission_id),
                             });
                         } else {
+                            if !text_delta_pending {
+                                text_flush_deadline = tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(50);
+                            }
                             text_delta_pending = true;
                         }
                     }
@@ -1891,6 +1973,8 @@ pub(crate) async fn consume_codex_events(
             }
         }
     }
+
+    native_text.flush(mission_id, &events_tx);
 
     // P3-#21 final flush: ensure the closing delta the coalescer may
     // have suppressed reaches the dashboard. AssistantMessage emits
@@ -2123,6 +2207,54 @@ mod tests {
     use crate::agents::TerminalReason;
 
     #[tokio::test]
+    async fn trailing_text_flushes_while_long_running_session_stays_open() {
+        use crate::api::control::AgentEvent;
+        use crate::backend::events::ExecutionEvent;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (events, mut output) = tokio::sync::broadcast::channel(16);
+        let consumer = tokio::spawn(super::consume_codex_events(
+            rx,
+            events,
+            tokio_util::sync::CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            "keep working",
+            None,
+        ));
+        tx.send(ExecutionEvent::TextDelta {
+            content: "It avoids".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(ExecutionEvent::TextDelta {
+            content: "It avoids restarting the build.".into(),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                if let AgentEvent::TextDelta { content, .. } = output.recv().await.unwrap() {
+                    if content == "It avoids restarting the build." {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("last text must flush without another model event or run completion");
+        assert!(
+            !consumer.is_finished(),
+            "flushing text must not finish the run"
+        );
+        tx.send(ExecutionEvent::MessageComplete {
+            session_id: "fixture".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let _ = consumer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn native_goal_stop_without_chat_output_is_resumable_not_auth_failure() {
         use crate::backend::events::ExecutionEvent;
         for status in ["blocked", "paused", "usageLimited", "budgetLimited"] {
@@ -2267,5 +2399,44 @@ mod scheduled_reply_tests {
         let actionable =
             crate::util::frame_turn_prompt(history, "Run cargo test and report failures.");
         assert!(codex_turn_requires_tool_activity(&actionable, "All done."));
+    }
+    #[tokio::test]
+    async fn native_text_keeps_item_identity_and_finalizes_before_the_next_reply() {
+        use crate::api::control::{AgentEvent, TextOp};
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mission = uuid::Uuid::new_v4();
+        let mut stream = super::NativeTextStream::default();
+        stream.update(mission, "a".into(), "Same words".into(), false, &tx);
+        stream.update(mission, "b".into(), "Same words".into(), false, &tx);
+        stream.update(
+            mission,
+            "b".into(),
+            "Same words, complete".into(),
+            true,
+            &tx,
+        );
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        let AgentEvent::TextOp {
+            bubble_id: a,
+            ops: a_ops,
+            ..
+        } = first
+        else {
+            panic!("identified snapshot required")
+        };
+        let AgentEvent::TextOp {
+            bubble_id: b,
+            ops: b_ops,
+            ..
+        } = second
+        else {
+            panic!("identified snapshot required")
+        };
+        assert_ne!(a, b);
+        assert!(matches!(&a_ops[0], TextOp::Snapshot {text, ..} if text == "Same words"));
+        assert!(matches!(&b_ops[0], TextOp::Snapshot {text, ..} if text == "Same words, complete"));
+        assert_eq!(b_ops.last(), Some(&TextOp::Finalize));
+        assert!(stream.pending.is_none());
     }
 }

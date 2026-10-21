@@ -4,7 +4,7 @@ import { applyStreamEvent, buildTranscript, type StreamItem } from "./transcript
 import { getMissionEventPage, storedToStream, type StreamEvent } from "./stream";
 import { cacheDelete, cachePeek, cachePut } from "./pageCache";
 
-export type TranscriptSnap = { items: StreamItem[]; stream: StreamEvent[]; fromLog?: boolean; queueError?: string; cursor?: number; before?: number; hasOlder?: boolean };
+export type TranscriptSnap = { items: StreamItem[]; stream: StreamEvent[]; fromLog?: boolean; queueError?: string; cursor?: number; before?: number; hasOlder?: boolean; checkedReceiptIds?: string[] };
 
 const key = (id: string) => `c:${connectionVersion()}:m:${id}:tx`;
 const heightKey = (id: string) => `c:${connectionVersion()}:m:${id}:h`;
@@ -75,19 +75,38 @@ function mergeStreamBySequence(older: StreamEvent[], newer: StreamEvent[]): Stre
   return merged.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
 }
 
-async function fetchTranscript(id: string): Promise<TranscriptSnap> {
+async function fetchTranscript(id: string, mutableReply = false, reconcileConversation = false): Promise<TranscriptSnap> {
   const version=connectionVersion();const check=()=>{if(version!==connectionVersion())throw Error("Connection changed during transcript load.");};
-  // Start pending queue read in parallel with the event page read rather than
-  // blocking the event log round-trip on /queue. Any delivery racing this read
-  // wins by message identity in the reducer; held SSE fills the live boundary.
+  // Read the authoritative queue after history. An older queue snapshot must
+  // not erase a message accepted while the history request was in flight.
+  // Held SSE events cover deliveries after this snapshot.
   let queueError: string | undefined;
-  const queuedPromise = listQueuedMessages(id).catch(error => {
+  const readQueue = () => listQueuedMessages(id).catch(error => {
     queueError = `Queued messages could not refresh: ${error instanceof Error ? error.message : String(error)}`;
     return [];
   });
   const previous=peekReadyTranscript(id);
   let stream:StreamEvent[]=[...(previous?.stream??[])];
   let cursor=previous?.cursor, before=previous?.before, hasOlder=previous?.hasOlder;
+  // Local reply mirrors update an existing row without advancing its sequence.
+  // A forward-only cursor cannot retrieve that final revision. Revalidate the
+  // previous tail reply before consuming the next turn, retaining older pages.
+  const tailReply = mutableReply ? [...stream].reverse().find(event => event.type === 'assistant_message' && event.sequence !== undefined) : undefined;
+  if (tailReply?.sequence !== undefined) {
+    const page = await getMissionEventPage(id, {before:tailReply.sequence + 1, view:'transcript', limit:1});
+    check();
+    const row = page.events.find(row => row.sequence === tailReply.sequence && row.event_id === tailReply.eventId && row.event_type.startsWith('assistant_message'));
+    const updated = row && storedToStream(row);
+    if (updated) stream = stream.map(event => event === tailReply ? updated : event);
+  }
+  // Finalized/recovered replies can arrive behind the raw tool cursor. Refresh
+  // only the bounded conversational window, never the full activity history.
+  if (previous && reconcileConversation) {
+    const page = await getMissionEventPage(id, {view:'transcript'});
+    check();
+    const replies = page.events.map(storedToStream).filter((event):event is StreamEvent => event !== null);
+    stream = mergeStreamBySequence(replies, stream);
+  }
   let resets=0;
   for(;;){
    const page=await getMissionEventPage(id,cursor===undefined?{}:{since:cursor});
@@ -102,7 +121,7 @@ async function fetchTranscript(id: string): Promise<TranscriptSnap> {
     // the recent conversation turns. Fetch the lightweight conversational
     // spine (view=transcript) before nextCursor so the latest messages always
     // appear immediately above the active work fold on first paint.
-    if(hasOlder && before !== undefined && !stream.some(e => e.type === "user_message" || e.type === "assistant_message")){
+    if(hasOlder && before !== undefined && !stream.some(e => e.type === "assistant_message")){
      const spinePage = await getMissionEventPage(id, { before, view: "transcript" }).catch(() => null);
      check();
      if(spinePage?.events?.length){
@@ -115,14 +134,38 @@ async function fetchTranscript(id: string): Promise<TranscriptSnap> {
    if(page.nextCursor!==undefined){if(page.nextCursor<=cursor)throw Error('Event cursor did not advance.');cursor=page.nextCursor;}
    if(!page.hasMore)break;
   }
-  const queued = await queuedPromise;
+  const queued = await readQueue();
   check();
-  const queueEvents: StreamEvent[] = queued.map(row => ({ type: "user_message", eventId: row.id, data: { id: row.id, content: row.content, queued: row.inflight !== true } }));
+  // Recovery receipts can outlive the recent event window. Resolve their
+  // original delivery positions before treating them as new transcript rows.
+  const checkedReceiptIds = new Set(resets ? [] : previous?.checkedReceiptIds ?? []);
+  const deliveredIds = () => new Set(stream.filter(event => event.type === "user_message" && event.data.queued !== true).map(event => String(event.data.id ?? event.eventId)));
+  const known = deliveredIds();
+  const unresolved = queued.filter(row => row.inflight && !known.has(row.id) && !checkedReceiptIds.has(row.id));
+  if (unresolved.length && hasOlder && before !== undefined) {
+    let olderCursor = before;
+    for (;;) {
+      const page = await getMissionEventPage(id, {before: olderCursor, view: "transcript"});
+      check();
+      const older = page.events.map(storedToStream).filter((event): event is StreamEvent => event !== null);
+      stream = mergeStreamBySequence(older, stream);
+      const delivered = deliveredIds();
+      if (!page.hasMore || unresolved.every(row => delivered.has(row.id))) break;
+      if (page.nextCursor === undefined || page.nextCursor >= olderCursor) throw Error("Receipt history cursor did not advance.");
+      olderCursor = page.nextCursor;
+    }
+    for (const row of unresolved) checkedReceiptIds.add(row.id);
+  }
+  if (!queueError) {
+    const pendingIds = new Set(queued.map(row => row.id));
+    stream = stream.filter(event => event.type !== "user_message" || event.data.queued !== true || pendingIds.has(String(event.data.id ?? event.eventId)));
+  }
+  const queueEvents: StreamEvent[] = queued.map(row => ({ type: "user_message", eventId: row.id, data: { id: row.id, content: row.content, queued: row.inflight !== true, receipt: true } }));
   // History first puts accepted user turns at their actual transcript positions.
-  return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError, cursor, before, hasOlder };
+  return { items: buildTranscript([...stream, ...queueEvents]), stream, fromLog: true, queueError, cursor, before, hasOlder, checkedReceiptIds: [...checkedReceiptIds] };
 }
 
-type JobKind='initial'|'refresh'|'older';
+type JobKind='initial'|'refresh'|'revalidate'|'older';
 const jobs=new Map<string,{tail:Promise<unknown>;pending:Map<JobKind,Promise<TranscriptSnap>>}>();
 function transcriptJob(id:string,kind:JobKind,load:()=>Promise<TranscriptSnap>):Promise<TranscriptSnap>{
  const scope=key(id),version=connectionVersion();
@@ -134,10 +177,10 @@ function transcriptJob(id:string,kind:JobKind,load:()=>Promise<TranscriptSnap>):
  }).finally(()=>{owner.pending.delete(kind);if(!owner.pending.size)jobs.delete(scope);});
  owner.tail=result;owner.pending.set(kind,result);return result;
 }
-export function refreshTranscript(id:string):Promise<TranscriptSnap>{
+export function refreshTranscript(id:string, mutableReply = false, reconcileConversation = false):Promise<TranscriptSnap>{
  const scope=key(id),initial=jobs.get(scope)?.pending.get('initial');
  if(initial&&!peekReadyTranscript(id))return initial;
- return transcriptJob(id,'refresh',()=>fetchTranscript(id));
+ return transcriptJob(id,mutableReply||reconcileConversation?'revalidate':'refresh',()=>fetchTranscript(id,mutableReply,reconcileConversation));
 }
 export function loadTranscript(id:string):Promise<TranscriptSnap>{
  const cached=peekReadyTranscript(id);return cached?Promise.resolve(cached):transcriptJob(id,'initial',()=>fetchTranscript(id));

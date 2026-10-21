@@ -302,9 +302,12 @@ export function LaunchStatus(p: { destination: string; mission?: Mission | null;
 /** Failures belong after the prompt/output, using the shared red notice. */
 export function MissionFailure(p: { mission?: Mission | null; error?: string; active?: boolean; failureInTranscript?: boolean; onResume?: () => void }) {
   const phase = () => missionPhase(p.mission ?? null, false);
-  const message = () => p.error || (phase().detail === "client runner"
-    ? "The local run could not be completed. Retry on the computer that started it."
-    : phase().detail || "The mission stopped before completion.");
+  const message = () => {
+    const detail = p.error || phase().detail;
+    return ["client_runner", "client runner"].includes(detail)
+      ? "The local run stopped without a recorded error. Resume on the computer that started it."
+      : detail || "The mission stopped before completion.";
+  };
   const resumable = () => !!p.onResume && phase().label !== "Cancelled";
   return <Show when={!p.active && !p.failureInTranscript && (p.error || phase().failed)}><ErrorNotice title={phase().failed && !["Failed", "Interrupted", "Cancelled"].includes(phase().label) ? phase().label : phase().label === "Cancelled" ? "Mission cancelled" : phase().label === "Interrupted" && !p.error ? "Mission interrupted" : "Mission failed"} error={message()}>
     <Show when={resumable()}><button type="button" class="error-notice-link" title="Continue from where the work stopped" onClick={() => p.onResume?.()}>Resume</button></Show>

@@ -241,3 +241,32 @@ it('allows dismissing a failed side question turn',async()=>{
 
 
 
+
+it.each(['status?', 'Eta and status', 'TLDR', 'how is it going?'])('keeps %s in the main chat for steering, without opening a side agent',async text=>{
+ const send=vi.fn(()=>true),stop=vi.fn(),ask=vi.fn(),pending=vi.fn();
+ render(()=><Composer placeholder="Follow-up" busy onSend={send} onStop={stop} onBtw={ask} onPending={pending}/>);
+ const input=screen.getByPlaceholderText('Follow-up');
+ fireEvent.input(input,{target:{value:text}});
+ expect(screen.getByTitle('Send follow-up')).toBeTruthy();
+ fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(send).toHaveBeenCalledWith(text,[]));
+ expect(ask).not.toHaveBeenCalled();expect(stop).not.toHaveBeenCalled();
+ expect(pending).toHaveBeenCalledWith(expect.objectContaining({text}));
+});
+it('sends status to the main conversation when idle and keeps mixed action requests there',async()=>{
+ const [busy,setBusy]=createSignal(false);const send=vi.fn(()=>true),ask=vi.fn();
+ render(()=><Composer placeholder="Follow-up" busy={busy()} onSend={send} onBtw={ask}/>);
+ const input=screen.getByPlaceholderText('Follow-up');
+ fireEvent.input(input,{target:{value:'status?'}});fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(send).toHaveBeenCalledWith('status?',[]));
+ setBusy(true);fireEvent.input(input,{target:{value:'status and fix the remaining bugs'}});fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(send).toHaveBeenCalledWith('status and fix the remaining bugs',[]));expect(ask).not.toHaveBeenCalled();
+});
+
+it('editing a queued status message keeps the queue-edit route',async()=>{
+ const send=vi.fn(()=>true),ask=vi.fn();
+ render(()=><Composer placeholder="Follow-up" busy editingQueued={{onCancel:()=>{}}} onSend={send} onBtw={ask}/>);
+ const input=screen.getByPlaceholderText('Follow-up');
+ fireEvent.input(input,{target:{value:'status?'}});fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(send).toHaveBeenCalledWith('status?',[]));expect(ask).not.toHaveBeenCalled();
+});

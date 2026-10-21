@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@solidjs/testing-library";
+import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { afterEach, expect, it, vi } from "vitest";
 import { Composer } from "../src/App";
 import { readComposerDraft, saveComposerDraft } from "../src/composerDrafts";
@@ -45,3 +45,53 @@ it("cancels a pending debounced draft save when a message is sent quickly so rem
   }
 });
 
+
+it("ignores held Enter so it cannot send a draft repeatedly or dispatch the queue", async () => {
+  vi.mocked(readComposerDraft).mockResolvedValue(undefined);
+  const send=vi.fn().mockResolvedValue(true), empty=vi.fn();
+  render(()=><Composer scope="m:repeat" placeholder="Reply" busy={false} onSend={send} onEmptySubmit={empty}/>);
+  const input=screen.getByPlaceholderText("Reply");
+  fireEvent.input(input,{target:{value:"A single message"}});
+  fireEvent.keyDown(input,{key:"Enter",repeat:true});
+  expect(send).not.toHaveBeenCalled(); expect(empty).not.toHaveBeenCalled();
+  expect((input as HTMLTextAreaElement).value).toBe("A single message");
+  fireEvent.input(input,{target:{value:""}});
+  fireEvent.keyDown(input,{key:"Enter",repeat:true});
+  expect(empty).not.toHaveBeenCalled();
+});
+
+
+it("empty Enter invokes the explicit steer action after queueing a followup", async () => {
+  vi.mocked(readComposerDraft).mockResolvedValue(undefined);
+  const send=vi.fn().mockResolvedValue(true), steer=vi.fn();
+  render(()=><Composer scope="m:no-interrupt" placeholder="Reply" busy={true} onSend={send} onEmptySubmit={steer}/>);
+  const input=screen.getByPlaceholderText("Reply");
+  fireEvent.input(input,{target:{value:"Please check progress"}});
+  fireEvent.keyDown(input,{key:"Enter"});
+  await waitFor(()=>expect(send).toHaveBeenCalledTimes(1));
+  await waitFor(()=>expect((input as HTMLTextAreaElement).value).toBe(""));
+  fireEvent.keyDown(input,{key:"Enter"});
+  expect(steer).toHaveBeenCalledTimes(1);
+  expect(send).toHaveBeenCalledTimes(1);
+});
+
+for (const busy of [false, true]) it(`keeps IME confirmation and Shift+Enter out of sending and steering (${busy ? "running" : "idle"})`, async () => {
+  vi.mocked(readComposerDraft).mockResolvedValue(undefined);
+  const send = vi.fn().mockResolvedValue(true), steer = vi.fn();
+  render(() => <Composer scope={`m:ime-${busy}`} placeholder="Reply" busy={busy} onSend={send} onEmptySubmit={steer} />);
+  const input = screen.getByPlaceholderText("Reply") as HTMLTextAreaElement;
+  fireEvent.input(input, {target: {value: "進捗は？"}});
+  fireEvent.keyDown(input, {key: "Enter", isComposing: true});
+  fireEvent.keyDown(input, {key: "Enter", keyCode: 229});
+  fireEvent.keyDown(input, {key: "Enter", shiftKey: true});
+  expect(input.value).toBe("進捗は？");
+  expect(send).not.toHaveBeenCalled();
+  fireEvent.input(input, {target: {value: ""}});
+  fireEvent.keyDown(input, {key: "Enter", keyCode: 229});
+  fireEvent.keyDown(input, {key: "Enter", isComposing: true});
+  fireEvent.keyDown(input, {key: "Enter", shiftKey: true});
+  expect(steer).not.toHaveBeenCalled();
+  fireEvent.input(input, {target: {value: "進捗は？"}});
+  fireEvent.keyDown(input, {key: "Enter"});
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+});

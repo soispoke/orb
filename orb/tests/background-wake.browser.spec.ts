@@ -5,7 +5,7 @@ const MISSION = "9f2a91c4-8b7d-4e21-9a0c-5d6e7f801236";
 const answer = Array.from({length:10},(_,i)=>`${i+1}. **Question ${i+1}:** ${"Should we keep the current proof or change its scope before delivery? ".repeat(3)}`).join("\n");
 
 async function setup(page: Page) {
-  const mission = { id: MISSION, title: "Pareto audit", status: "awaiting_user", history: [], backend: "codex", created_at: "", updated_at: "" };
+  const mission = { id: MISSION, project: "test", title: "Pareto audit", status: "awaiting_user", history: [], backend: "codex", created_at: "", updated_at: "" };
   const wake = "Background task `bjikajbtt` (`until timeout 20 ssh th0rgal@100.77.4.93 'test -f ~/work/pareto/exit.json'; do sleep 60; done; tail -3 build.log`) finished. Output:\n\n```\n\n\n[killed]\n```\n\nContinue from here.";
   const events = [
     { id:"u1", event_id:"u1", sequence:1, event_type:"user_message", content:"please review and merge the prs", timestamp:"" },

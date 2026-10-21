@@ -1,3 +1,5 @@
+#[path = "../../../shared/claude_stream_scope.rs"]
+mod claude_stream_scope;
 use anyhow::{anyhow, Result};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -190,6 +192,13 @@ impl ClaudeCodeClient {
                     continue;
                 }
 
+                // A nested result must not terminate the coordinator stream.
+                // Child task reporting uses its own lifecycle path.
+                if serde_json::from_str::<serde_json::Value>(&line)
+                    .is_ok_and(|event| claude_stream_scope::is_child_message(&event))
+                {
+                    continue;
+                }
                 match serde_json::from_str::<ClaudeEvent>(&line) {
                     Ok(event) => {
                         debug!("Claude event: {:?}", event);

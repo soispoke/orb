@@ -1,5 +1,4 @@
 import { For, Show, createEffect, createSignal, onCleanup, untrack } from "solid-js";
-import { ErrorToast } from "./toast";
 import { messagePresentation } from "./messagePresentation";
 import { api, connectionVersion, listQueuedMessages, type QueuedMessage } from "./api";
 import * as Ic from "./icons";
@@ -16,6 +15,7 @@ export type PendingRemoteQueueItem = { id: string; content: string; attached?: b
 /** The server inbox remains authoritative across a stop, reconnect or restart. */
 export function RemoteQueue(p: {
   mission: string;
+  hiddenIds?: ReadonlySet<string>;
   confirmed?: (QueuedMessage & {attached?:boolean})[];
   pending?: PendingRemoteQueueItem | PendingRemoteQueueItem[];
   editing?: string;
@@ -25,7 +25,13 @@ export function RemoteQueue(p: {
   onCancel: (id: string) => void;
   ref?: (handle: RemoteQueueHandle) => void;
 }) {
-  let revision = 0, destroyed = false;
+  let revision = 0, epoch = 0, destroyed = false;
+  // Mission IDs alone cannot distinguish leaving a chat and returning to it.
+  // Completions belong to the exact visit and connection that started them.
+  const currentVisit = () => {
+    const visit = epoch, mission = p.mission, version = connectionVersion();
+    return () => !destroyed && epoch === visit && p.mission === mission && connectionVersion() === version;
+  };
   const deletedIds = new Set<string>();
   onCleanup(() => { destroyed = true; });
   const [rows, setRows] = createSignal<QueuedMessage[]>([]);
@@ -55,35 +61,46 @@ export function RemoteQueue(p: {
       if (confirmed) out.push({ ...confirmed, sending: false });
       else out.push({ id: item.id, content: item.content, attached: item.attached, sending: true });
     }
-    return out;
+    return out.filter(row => !p.hiddenIds?.has(row.id));
   };
   const [error, setError] = createSignal("");
+  let deliveryErrorId: string | undefined;
   const [cancelling, setCancelling] = createSignal<string>();
   const [working, setWorking] = createSignal(false);
   const [collapsed, setCollapsed] = createSignal(false);
   createEffect(() => {
     const mission = p.mission, version = connectionVersion();
-    deletedIds.clear();
-    untrack(() => { setRows([]); setError(""); p.onRows([]); });
+    epoch++; revision++;
+    deletedIds.clear(); deliveryErrorId = undefined;
+    untrack(() => { setRows([]); setError(""); setWorking(false); setCancelling(undefined); p.onRows([]); });
     let disposed = false, loading = false;
     const refresh = async () => {
-      if (loading || !mission) return;
+      if (loading || !mission || working() || cancelling()) return;
       loading = true;
       const started = revision;
+      // Only reconcile receipts that existed before this read. A new send may
+      // be accepted while the snapshot request is still in flight.
+      const captured = untrack(() => new Set([...(p.confirmed ?? []).map(row => row.id), ...rows().map(row => row.id)]));
       try {
         const pending = (await listQueuedMessages(mission)).filter(row => !row.inflight && !deletedIds.has(row.id) && (row.source === "remote-queue" || row.source?.startsWith("host-queue:api:")));
         if (disposed || started !== revision || version !== connectionVersion()) return;
+        const present = new Set(pending.map(row => row.id));
+        if (deliveryErrorId && captured.has(deliveryErrorId) && !present.has(deliveryErrorId)) {
+          deliveryErrorId = undefined; setError("");
+        }
+        for (const id of captured) if (!present.has(id)) { deletedIds.add(id); p.onCancel(id); }
         setRows(pending); p.onRows(pending.map(row => row.id));
       } catch { /* Keep the last confirmed inbox during a network interruption. */ }
       finally { loading = false; }
     };
-    void refresh();
+    untrack(() => void refresh());
     const timer = setInterval(() => void refresh(), 3000);
     onCleanup(() => { disposed = true; clearInterval(timer); });
   });
   const cancel = async (id: string) => {
+    if (working() || cancelling()) return;
+    const current = currentVisit();
     setError("");
-    const version = connectionVersion(), mission = p.mission;
     const snapshot = rows();
     // Optimistically remove immediately so the queue updates in < 16ms
     revision++;
@@ -93,41 +110,42 @@ export function RemoteQueue(p: {
     setCancelling(id);
     try {
       await api(`/api/control/queue/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
+      if (!current()) return;
       p.onRows(rows().map(row => row.id));
       p.onCancel(id);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (/\b404\b/.test(msg)) {
-        if (!destroyed && version === connectionVersion() && mission === p.mission) {
+        if (current()) {
           p.onRows(rows().map(row => row.id));
           p.onCancel(id);
         }
         return;
       }
-      // Roll back optimistic delete if the network request failed
-      deletedIds.delete(id);
-      if (!destroyed && version === connectionVersion() && mission === p.mission) {
+      // A stale request must never roll another visit back to its old snapshot.
+      if (current()) {
+        deletedIds.delete(id);
         revision++;
         setRows(snapshot);
         p.onRows(snapshot.map(row => row.id));
         setError(msg);
       }
     } finally {
-      setCancelling(undefined);
+      if (current()) setCancelling(undefined);
     }
   };
   const sendNow = async (targetId?: string) => {
-    if (working() || p.editing) return;
-    const list = visibleRows();
+    if (working() || cancelling() || p.editing) return;
+    const list = visibleRows().filter(row => !p.hiddenIds?.has(row.id));
     const target = targetId ? list.find(r => r.id === targetId) : list[0];
     if (!target) return;
-    setWorking(true); setError("");
-    const version = connectionVersion(), mission = p.mission;
+    const current = currentVisit();
+    revision++;
+    setWorking(true); setError(""); deliveryErrorId = target.id;
     try {
-      const live = await api<{ ok?: boolean; delivered?: boolean }>(`/api/control/queue/${encodeURIComponent(target.id)}/send-now`, { method: "POST" }).catch(() => ({ delivered: false }));
+      const live = await api<{ ok?: boolean; delivered?: boolean }>(`/api/control/queue/${encodeURIComponent(target.id)}/send-now`, { method: "POST" });
       if (live?.delivered) {
-        if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
+        if (!current()) return;
         revision++;
         deletedIds.add(target.id);
         setRows(previous => previous.filter(row => row.id !== target.id));
@@ -136,25 +154,30 @@ export function RemoteQueue(p: {
         await p.onSendImmediate?.([], [{ id: target.id, content: messagePresentation(target.content).text, attached: target.attached || messagePresentation(target.content).attached || undefined }]);
         return;
       }
-      const ordered = [target, ...list.filter(r => r.id !== target.id)];
-      const payload = ordered.map(r => {
-        const presented = messagePresentation(r.content);
-        return { id: r.id, content: presented.text, attached: r.attached || presented.attached || undefined };
-      });
-      await Promise.allSettled(ordered.map(r => api(`/api/control/queue/${encodeURIComponent(r.id)}`, { method: "DELETE" })));
-      if (destroyed || version !== connectionVersion() || mission !== p.mission) return;
-      revision++;
-      for (const r of ordered) deletedIds.add(r.id);
-      setRows([]); p.onRows([]);
-      for (const r of ordered) p.onCancel(r.id);
-      await p.onSendImmediate?.(payload);
+      if (!current()) return;
+      setError("This run cannot accept a live message right now. Your message is still queued; it will be sent when the run is ready.");
     } catch (e) {
-      if (version === connectionVersion() && mission === p.mission) setError(e instanceof Error ? e.message : String(e));
+      if (!current()) return;
+      const message = e instanceof Error ? e.message : String(e);
+      if (/^404\b/.test(message)) {
+        // The consumer won the race. Absence does not prove delivery, and must
+        // never trigger a second send with a fresh identity.
+        revision++; deletedIds.add(target.id);
+        setRows(previous => previous.filter(row => row.id !== target.id));
+        p.onRows(rows().map(row => row.id)); p.onCancel(target.id);
+        setError('');
+      } else if (deletedIds.has(target.id)) {
+        deliveryErrorId = undefined; setError('');
+      } else setError(/abort|timed? ?out/i.test(message)
+        ? "Delivery wasn’t confirmed. Checking the queue; this message won’t be resent automatically."
+        : message);
     } finally {
-      setWorking(false);
+      if (current()) setWorking(false);
     }
   };
   const replaceEdited: RemoteQueueHandle["replaceEdited"] = async (id, sendReplaced, replayAfter) => {
+    if (working() || cancelling()) return false;
+    const current = currentVisit();
     const list = visibleRows();
     const idx = list.findIndex(r => r.id === id);
     if (idx < 0) {
@@ -163,11 +186,14 @@ export function RemoteQueue(p: {
     }
     const tail = list.slice(idx);
     const after = tail.slice(1);
+    revision++;
     setWorking(true); setError("");
     try {
       await api(`/api/control/queue/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!current()) return false;
       for (const r of after) {
         await api(`/api/control/queue/${encodeURIComponent(r.id)}`, { method: "DELETE" }).catch(() => {});
+        if (!current()) return false;
       }
       revision++;
       for (const r of tail) deletedIds.add(r.id);
@@ -175,25 +201,25 @@ export function RemoteQueue(p: {
       p.onRows(rows().map(row => row.id));
       for (const r of tail) p.onCancel(r.id);
       const ok = await sendReplaced();
-      if (!ok) return false;
+      if (!ok || !current()) return false;
       if (after.length && replayAfter) await replayAfter(after.map(r => {
         const presented = messagePresentation(r.content);
         return { content: presented.text, attached: r.attached || presented.attached || undefined };
       }));
       return true;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (current()) setError(e instanceof Error ? e.message : String(e));
       return false;
     } finally {
-      setWorking(false);
+      if (current()) setWorking(false);
     }
   };
   p.ref?.({
     sendNow,
     replaceEdited,
     editFirst: () => {
-      const first = visibleRows()[0];
-      if (first && p.onEdit && !p.editing && !working()) {
+      const first = visibleRows().find(row => !p.hiddenIds?.has(row.id));
+      if (first && p.onEdit && !p.editing && !working() && !cancelling()) {
         p.onEdit({ id: first.id, text: messagePresentation(first.content).text, remote: true });
       }
     },
@@ -202,8 +228,8 @@ export function RemoteQueue(p: {
   return <Show when={displayRows().length || error()}>
     <section class="followup-queue" classList={{collapsed:collapsed()}} aria-label="Queued messages" aria-live="polite">
       <header>
-        <span class="queue-count">{visibleRows().length ? `${displayRows().length} Queued` : `${displayRows().length} Sending…`}</span>
-        <Show when={visibleRows().length > 0 && !p.editing}><span class="queue-hint"><Ic.ReturnIcon size={13}/> to Send</span></Show>
+        <span class="queue-count">{visibleRows().length ? `${displayRows().length} Queued` : displayRows().length ? `${displayRows().length} Sending…` : "Queue update failed"}</span>
+        <Show when={visibleRows().length > 0 && !p.editing}><span class="queue-hint">Work continues while messages wait</span></Show>
         <Show when={displayRows().length > 0}>
           <div class="queue-options">
             <button type="button" class="queue-collapse" aria-label={collapsed()?"Show queued messages":"Hide queued messages"} aria-expanded={!collapsed()} onClick={()=>setCollapsed(!collapsed())}><Ic.ChevronDown size={14}/></button>
@@ -218,16 +244,16 @@ export function RemoteQueue(p: {
             <div class="queue-text" title={text()}><span>{text()}</span><Show when={attached()}><small class="user-context">Attached context</small></Show></div>
             <Show when={!row.sending} fallback={<span class="queue-editing" role="status">Sending…</span>}>
               <Show when={p.editing===row.id} fallback={<span class="queue-row-actions">
-                <button type="button" class="queue-action-btn" aria-label={`Edit queued message: ${text()}`} disabled={working()||!!p.editing||cancelling()===row.id} onClick={()=>p.onEdit?.({id:row.id,text:text(),remote:true})}><Ic.PencilIcon size={14}/><span class="queue-tooltip" aria-hidden="true"><span>Edit</span><kbd>→</kbd></span></button>
-                <button type="button" class="queue-action-btn" aria-label={`Send now: ${text()}`} disabled={working()||!!p.editing||cancelling()===row.id} onClick={()=>void sendNow(row.id)}><Ic.ArrowUpIcon size={14}/><span class="queue-tooltip" aria-hidden="true"><span>Send now</span><kbd>↵</kbd></span></button>
-                <button type="button" class="queue-action-btn" aria-label={`Remove queued message: ${text()}`} disabled={working()||cancelling()===row.id||p.editing===row.id} onClick={()=>void cancel(row.id)}><Ic.TrashIcon size={14}/><span class="queue-tooltip" aria-hidden="true"><span>Delete</span></span></button>
+                <button type="button" class="queue-action-btn" aria-label={`Edit queued message: ${text()}`} disabled={working()||!!p.editing||!!cancelling()} onClick={()=>p.onEdit?.({id:row.id,text:text(),remote:true})}><Ic.PencilIcon size={14}/><span class="queue-tooltip" aria-hidden="true"><span>Edit</span><kbd>→</kbd></span></button>
+                <button type="button" class="queue-action-btn" aria-label={`Send now: ${text()}`} disabled={working()||!!p.editing||!!cancelling()} onClick={()=>void sendNow(row.id)}><Ic.ArrowUpIcon size={14}/><span class="queue-tooltip" aria-hidden="true"><span>Send now</span><kbd>↵</kbd></span></button>
+                <button type="button" class="queue-action-btn" aria-label={`Remove queued message: ${text()}`} disabled={working()||!!cancelling()||p.editing===row.id} onClick={()=>void cancel(row.id)}><Ic.TrashIcon size={14}/><span class="queue-tooltip" aria-hidden="true"><span>Delete</span></span></button>
               </span>}><span class="queue-editing">Editing</span></Show>
             </Show>
           </div>
           <Show when={row.queue_error}><small title={row.queue_error ?? undefined}>Delivery paused · {row.queue_error}</small></Show>
         </li>;
       }}</For></ol></Show>
-      <ErrorToast error={error()} onDismiss={() => setError("")} />
+      <Show when={error()}><p role="alert">{error()}</p></Show>
     </section>
   </Show>;
 }

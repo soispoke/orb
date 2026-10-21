@@ -1,16 +1,20 @@
+import {sessionEndAgent, sessionEndTool, UNCONFIRMED_AGENT} from './agentSessionStatus';
 import type { DraftImage } from "./imageAttachments";
 import { deferredMessages } from "./deferredMessages";
 import { isGeneratedRemoteJobStatus, type StreamEvent } from "./stream";
 
 export type StreamItem =
-  | { kind: "user"; key: string; text: string; images?: DraftImage[]; messageId?: string; source?: string; queued?: boolean; attached?: boolean; receipt?: boolean }
+  | { kind: "user"; key: string; text: string; images?: DraftImage[]; messageId?: string; source?: string; queued?: boolean; attached?: boolean; receipt?: boolean; continuityRetry?: boolean }
+  | { kind: "subagent"; key: string; text: string; agent: import("./Subagents").Subagent }
   | { kind: "think"; key: string; text: string; done: boolean }
-  | { kind: "text"; key: string; text: string; live: boolean }
-  | { kind: "error"; key: string; text: string; terminal?: boolean; cancelled?: boolean }
+  | { kind: "text"; key: string; text: string; live: boolean; sourceEventId?: string }
+  | { kind: "error"; key: string; text: string; terminal?: boolean; cancelled?: boolean; cancelling?: boolean }
   | {
       kind: "tool";
       key: string;
       callId: string;
+      startedAt?: number;
+      finishedAt?: number;
       name: string;
       args: unknown;
       result?: unknown;
@@ -30,6 +34,9 @@ export class TranscriptReducer {
   private users = new Map<string, number>();
   private tools = new Map<string, number>();
   private bubbles = new Map<string, number>();
+  // Producer offsets remain relative to its full response, even when a user
+  // question splits that response into two chronological display segments.
+  private segments = new Map<string, {prefix: string; full: string}>();
   private seen = new Set<string>();
   private seq = new Map<string, number>();
   private revisions = new Map<string, number>();
@@ -38,9 +45,20 @@ export class TranscriptReducer {
   private identity:string|undefined;
   private key(kind: string) { return this.identity ? `${kind}:${this.identity}:${++this.nextForEvent}` : `${kind}-${++this.next}`; }
   private nextForEvent=0;
+  private response=0;
+  private textKey(bubble:string,fallback:string):string {
+    let user: Extract<StreamItem,{kind:'user'}>|undefined;
+    for(let i=this.items.length-1;i>=0;i--){const item=this.items[i];if(item.kind==='user'&&!item.queued){user=item;break;}}
+    // Transport IDs change between live operations, persisted snapshots, and
+    // canonical rows. Keep the display segment tied to its delivered question.
+    if(bubble.startsWith('codex:'))return `text:${JSON.stringify([bubble,user?.key??'initial'])}`;
+    if(bubble==='text_delta_latest'&&user)return `text:${JSON.stringify([bubble,user.key,this.response])}`;
+    return fallback;
+  }
   private put(index: number, item: StreamItem) { this.items[index] = item; }
   private placeText(bubble:string,item:Extract<StreamItem,{kind:'text'}>):number {
     let index=this.items.length;
+    item={...item,key:this.textKey(bubble,item.key)};
     if(bubble.startsWith('antigravity:')) {
       const [,conversation,,step]=bubble.split(':');
       const lastUser=this.items.reduce((last,item,i)=>item.kind==='user'&&!item.queued?i:last,-1);
@@ -55,6 +73,21 @@ export class TranscriptReducer {
     return index;
   }
 
+  removeQueued(ids: ReadonlySet<string>) {
+    const positions = new Map<number, number>();
+    const next = this.items.filter((item, index) => {
+      if (item.kind === 'user' && item.queued && item.messageId && ids.has(item.messageId)) return false;
+      positions.set(index, positions.size); return true;
+    });
+    if (next.length === this.items.length) return;
+    for (const map of [this.users, this.tools, this.bubbles]) for (const [key, index] of map) {
+      const position = positions.get(index);
+      if (position === undefined) map.delete(key); else map.set(key, position);
+    }
+    if (this.lastFinal !== undefined) this.lastFinal = positions.get(this.lastFinal);
+    this.items = next;
+  }
+
   private close() {
     for (const index of this.bubbles.values()) {
       const item = this.items[index];
@@ -66,6 +99,24 @@ export class TranscriptReducer {
       if(item.kind==='think'&&!item.done)this.put(i,{...item,done:true});
     }
     this.bubbles.clear();
+    this.segments.clear();
+    this.response++;
+  }
+  private beginUserTurn() {
+    this.response=0;
+    // Freeze what the reader already saw above the question. Further text
+    // belongs below it, without repeating a cumulative snapshot's old prefix.
+    // This is presentation only: running tools remain running.
+    for (const [bubble, index] of this.bubbles) {
+      const item = this.items[index];
+      if (item?.kind === "text" && item.live) {
+        const full=this.segments.get(bubble)?.full ?? item.text;
+        this.segments.set(bubble,{prefix:full,full});
+        this.put(index,{...item,live:false});
+      } else this.segments.delete(bubble);
+    }
+    this.bubbles.clear();
+    this.lastFinal = undefined;
   }
   apply(ev: StreamEvent) {
     this.identity=ev.eventId??(ev.storedId!==undefined?`stored:${ev.storedId}`:ev.sequence!==undefined?`seq:${ev.sequence}`:undefined);this.nextForEvent=0;
@@ -100,7 +151,7 @@ export class TranscriptReducer {
           if (previous.receipt && d.receipt !== true) this.put(index, { ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, receipt: false });
           return;
         }
-        this.close(); this.lastFinal = undefined;
+        this.beginUserTurn();
         // A queued row may precede text that arrived while it was waiting.
         // Delivery places it after that response without changing its identity.
         this.items.splice(index, 1);
@@ -111,7 +162,7 @@ export class TranscriptReducer {
         this.items.push({ ...previous, source: source ?? previous.source, text: str(d.content) || previous.text, queued: false, receipt: d.receipt === true });
         return;
       }
-      if (!queued) { this.close(); this.lastFinal = undefined; }
+      if (!queued) { this.beginUserTurn(); }
       if (messageId) this.users.set(messageId, this.items.length);
       this.items.push({ kind: "user", key: messageId ? `user:${messageId}` : this.key("user"), text: str(d.content), messageId, source, queued, attached: d.attached === true, receipt: d.receipt === true });
       return;
@@ -121,18 +172,37 @@ export class TranscriptReducer {
     if (identity && this.seen.has(identity)) return;
     if (identity) this.seen.add(identity);
     const bubble = str(d.bubble_id) || "text_delta_latest";
-    const channel = `${ev.type}:${bubble}`;
+    const channel = ev.type === "subagent_update" ? `subagent_update:${str((d.agent as {id?: unknown} | undefined)?.id)}` : `${ev.type}:${bubble}`;
     if (ev.sequence != null) {
       if (ev.sequence < (this.seq.get(channel) ?? -1)) return;
       this.seq.set(channel, ev.sequence);
     }
     const last = this.items.at(-1);
     switch (ev.type) {
+      case "subagent_update": {
+        const incoming = d.agent as import("./Subagents").Subagent;
+        const stale = incoming?.status === 'failed' && sessionEndAgent(incoming.detail);
+        const agent = stale ? {...incoming, status: 'unknown', detail: UNCONFIRMED_AGENT, finishedAt: undefined} : incoming;
+        if (!agent || typeof agent.id !== "string" || typeof agent.description !== "string") break;
+        const index = this.items.findIndex(i => i.kind === "subagent" && i.agent.id === agent.id);
+        const previous = index < 0 ? undefined : this.items[index];
+        const old = previous?.kind === "subagent" ? previous.agent : undefined;
+        if (stale && old && old.status !== 'unknown') break;
+        if (old && ["completed", "finished", "failed", "stopped"].includes(old.status) && ["running", "waiting", "queued", "unknown"].includes(agent.status)) break;
+        const parsed = Date.parse(ev.timestamp ?? "");
+        const time = Number.isFinite(parsed) ? parsed : undefined;
+        const terminal = ["completed", "finished", "failed", "stopped"].includes(agent.status);
+        const enriched = {...agent, startedAt: old?.startedAt ?? agent.startedAt ?? (agent.status === "running" ? time : undefined), finishedAt: old?.finishedAt ?? agent.finishedAt ?? (terminal ? time : undefined)};
+        const item: StreamItem = {kind: "subagent", key: `subagent:${agent.id}`, text: agent.description, agent: enriched};
+        if (index < 0) this.items.push(item); else this.put(index, item);
+        break;
+      }
       case "text_delta":
       case "text_op": {
         let index = this.bubbles.get(bubble);
         const previous = index == null ? undefined : this.items[index];
-        let text = previous?.kind === "text" ? previous.text : "";
+        const segment=this.segments.get(bubble);
+        let text = segment?.full ?? (previous?.kind === "text" ? previous.text : "");
         let live = previous?.kind === "text" ? previous.live : true;
         let snapshot: string | undefined;
         if (ev.type === "text_delta") {
@@ -177,6 +247,11 @@ export class TranscriptReducer {
             } else if (op.type === "finalize") live = false;
           }
         }
+        if(segment) {
+          if(text.startsWith(segment.prefix)){segment.full=text;text=text.slice(segment.prefix.length);}
+          else if(segment.prefix.startsWith(text))return; // late unchanged prefix
+          else {segment.prefix="";segment.full=text;} // a new producer response
+        }
         if (index == null && bubble === "text_delta_latest" && this.lastFinal != null) {
           const finalized = this.items[this.lastFinal];
           if (finalized?.kind === "text" && !finalized.live && snapshot != null && finalized.text.startsWith(snapshot)) {
@@ -188,13 +263,15 @@ export class TranscriptReducer {
         }
         if (index == null) {
           if (!text) return;
-          index=this.placeText(bubble,{kind:"text",key:this.key("text"),text,live});
+          index=this.placeText(bubble,{kind:"text",key:this.key("text"),text,live,sourceEventId:ev.eventId});
         } else if (previous?.kind === "text" && (previous.text !== text || previous.live !== live)) this.put(index,{...previous,text,live});
         return;
       }
       case "assistant_message": {
-        const text=str(d.content);
         const finalBubble=str(d.bubble_id)||"text_delta_latest";
+        const full=str(d.content),segment=this.segments.get(finalBubble);
+        const text=segment&&full.startsWith(segment.prefix)?full.slice(segment.prefix.length):full;
+        if(segment)segment.full=full;
         if(d.canonical===true){
           if(typeof d.revision === 'number') {
             if(d.revision < (this.revisions.get(finalBubble) ?? -1)) return;
@@ -204,20 +281,29 @@ export class TranscriptReducer {
           // must remain distinct. Keep it available for the turn's final event.
           const index=this.bubbles.get(finalBubble) ?? (finalBubble==="text_delta_latest" ? this.lastFinal : undefined);
           const previous=index==null ? undefined : this.items[index];
-          if(previous?.kind==="text"&&index!=null){this.put(index,{...previous,text:text||previous.text,live:false});this.bubbles.set(finalBubble,index);}
-          else if(text){this.placeText(finalBubble,{kind:"text",key:this.key("text"),text,live:false});}
+          if(previous?.kind==="text"&&index!=null){this.put(index,{...previous,text:text||previous.text,live:false,sourceEventId:ev.eventId??previous.sourceEventId});this.bubbles.set(finalBubble,index);}
+          else if(text){this.placeText(finalBubble,{kind:"text",key:this.key("text"),text,live:false,sourceEventId:ev.eventId});}
           return;
         }
         const index=this.bubbles.get(finalBubble);
         const previous=index == null ? undefined : this.items[index];
-        const native = [...this.bubbles].filter(([id])=>id.startsWith('antigravity:')).sort((a,b)=>a[1]-b[1]).map(([,i])=>this.items[i]).filter((i):i is Extract<StreamItem,{kind:'text'}>=>i?.kind==='text');
+        const native = [...this.bubbles].filter(([id])=>id.startsWith('antigravity:') || id.startsWith('codex:')).sort((a,b)=>a[1]-b[1]).map(([,i])=>this.items[i]).filter((i):i is Extract<StreamItem,{kind:'text'}>=>i?.kind==='text');
         const trimmed = text.trim();
         const isNativeReceipt = native.length > 0 && (trimmed === native.map(i=>i.text).join('').trim() || trimmed === native.at(-1)!.text.trim());
+        const finalKey=this.textKey(finalBubble,this.key("text"));
         this.close();
-        if(d.success===false){this.items.push({kind:"error",key:this.key("error"),text:text||"Mission failed",terminal:true,cancelled:text.trim().toLowerCase()==="cancelled"});return;}
+        if (d.success === false) {
+          const cancelled = text.trim().toLowerCase() === "cancelled";
+          const failure: Extract<StreamItem, {kind:"error"}> = {kind:"error",key:this.key("error"),text:text||"Mission failed",terminal:true,cancelled};
+          const previous = this.items.at(-1);
+          if (previous?.kind === "error" && (previous.cancelling && cancelled || /^unknown error$/i.test(previous.text.trim()) || previous.text === failure.text)) {
+            this.put(this.items.length - 1, {...failure, key: previous.key});
+          } else this.items.push(failure);
+          return;
+        }
         if(isNativeReceipt) return;
-        if(previous?.kind === "text" && index != null){this.put(index,{...previous,text:text||previous.text,live:false});this.lastFinal=index;}
- else if(text){this.lastFinal=this.items.length;this.items.push({kind:"text",key:this.key("text"),text,live:false});}
+        if(previous?.kind === "text" && index != null){this.put(index,{...previous,text:text||previous.text,live:false,sourceEventId:ev.eventId??previous.sourceEventId});this.lastFinal=index;}
+ else if(text){this.lastFinal=this.items.length;this.items.push({kind:"text",key:finalKey,text,live:false,sourceEventId:ev.eventId});}
         return;
       }
       case "thinking": {
@@ -229,20 +315,42 @@ export class TranscriptReducer {
       case "tool_call":
       case "tool_result": {
         const callId=str(d.tool_call_id), index=this.tools.get(callId);
+        const parsedTime = Date.parse(ev.timestamp ?? "");
+        const time = Number.isFinite(parsedTime) ? parsedTime : undefined;
+        const previous = index == null ? undefined : this.items[index];
+        const recovery = sessionEndTool(str(d.name) || (previous?.kind === 'tool' ? previous.name : ''), d.result);
+        const result = recovery ? {status: 'unknown', message: UNCONFIRMED_AGENT} : d.result;
         if(index!=null){
           const old=this.items[index];
-          if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result:d.result,done:true,unresolved:false});
-          else if(old.kind==="tool"&&ev.type==="tool_call")this.put(index,{...old,name:str(d.name)||old.name,args:d.args??old.args});
+          if(old.kind==="tool"&&ev.type==="tool_result")this.put(index,{...old,result,done:true,unresolved:!!recovery,finishedAt:recovery ? undefined : old.finishedAt ?? time});
+          else if(old.kind==="tool"&&ev.type==="tool_call")this.put(index,{...old,name:str(d.name)||old.name,args:d.args??old.args,startedAt:old.startedAt ?? time});
           return;
         }
         this.tools.set(callId,this.items.length);
-        this.items.push({kind:"tool",key:`tool:${callId}`,callId,name:str(d.name)||"tool",args:d.args??null,...(ev.type==="tool_result"?{result:d.result}:{}),done:ev.type==="tool_result"});return;
+        this.items.push({kind:"tool",key:`tool:${callId}`,callId,...(ev.type==="tool_call"?{startedAt:time}:{finishedAt:time}),name:str(d.name)||"tool",args:d.args??null,...(ev.type==="tool_result"?{result,unresolved:!!recovery}:{}),done:ev.type==="tool_result"});return;
       }
-      case "error": this.close(); this.items.push({kind:"error",key:this.key("error"),text:str(d.message)});return;
+      case "error": {
+        const message = str(d.message);
+        const cancelling = /^Parallel mission [0-9a-f-]+ cancellation requested$/i.test(message);
+        const previous = this.items.at(-1);
+        if (cancelling && previous?.kind === "error" && (previous.cancelling || previous.cancelled)) return;
+        // A late generic transport notice must not hide the concrete final failure.
+        if (previous?.kind === "error" && (previous.text === message || previous.terminal && /^unknown error$/i.test(message.trim()))) return;
+        if (!cancelling) this.close();
+        this.items.push({kind:"error",key:this.key("error"),text:cancelling ? "Cancellation requested" : message,...(cancelling ? {cancelling:true,terminal:true} : {})});
+        return;
+      }
       case "mission_status_changed": {
         const status = str(d.status).toLowerCase();
         if (["completed", "failed", "not_feasible", "interrupted", "cancelled", "canceled"].includes(status)) {
           this.close();
+        }
+        if (["failed", "not_feasible", "interrupted", "cancelled", "canceled", "paused"].includes(status)) {
+          for (let i = 0; i < this.items.length; i++) {
+            const item = this.items[i];
+            if (item.kind === "subagent" && ["running", "waiting", "queued"].includes(item.agent.status))
+              this.put(i, {...item, agent: {...item.agent, status: "unknown"}});
+          }
         }
         const summary = str(d.summary ?? d.content).trim();
         if (["failed", "not_feasible"].includes(status) && summary) {
@@ -306,6 +414,37 @@ export function withoutFiller(items: StreamItem[]): StreamItem[] {
   return keep.length === items.length ? items : keep;
 }
 
+type UserItem = Extract<StreamItem, {kind: "user"}>;
+const continuityRetries = new WeakMap<UserItem, UserItem>();
+
+/** Keep the original prompt visible when continuity recovery immediately retries
+ * it. Require the native failure and a whole-prompt match, not merely similar
+ * text. Any intervening work, changed source or undelivered input breaks the
+ * relationship. The stored messages and reducer items remain untouched. */
+function presentContinuityRetries(items: StreamItem[]): StreamItem[] {
+  let prompt: UserItem | undefined;
+  let continuityFailed = false;
+  return items.map(item => {
+    if (item.kind === "error" && item.terminal && item.text.includes("codex_continuity_unresolved_tools:")) {
+      continuityFailed = true;
+      return item;
+    }
+    const retry = item.kind === "user" && !item.queued && !item.attached && !item.images?.length
+      && continuityFailed && prompt && prompt.text.length > 0 && item.source === prompt.source
+      && (item.text === prompt.text || item.text.startsWith(prompt.text + "\n\nContinuity reconciliation:"));
+    prompt = item.kind === "user" && !item.queued && !item.attached && !item.images?.length ? item : undefined;
+    continuityFailed = false;
+    if (!retry || item.kind !== "user") return item;
+    // Preserve identity across stream updates so expanded details stay open.
+    let projected = continuityRetries.get(item);
+    if (!projected) {
+      projected = {...item, continuityRetry: true};
+      continuityRetries.set(item, projected);
+    }
+    return projected;
+  });
+}
+
 /** A delivered follow-up supersedes the previous attempt's terminal notice.
  * Keep the raw history intact, and do not dismiss failures for queued input. */
 export function visibleTranscript(items: StreamItem[]): StreamItem[] {
@@ -317,7 +456,7 @@ export function visibleTranscript(items: StreamItem[]): StreamItem[] {
       break;
     }
   }
-  return withoutFiller(items.filter((item, index) =>
+  return withoutFiller(presentContinuityRetries(items).filter((item, index) =>
     !(item.kind === "error" && item.terminal && index < lastDelivered),
   ));
 }
@@ -347,5 +486,16 @@ export function applyStreamEvents(items: StreamItem[], events: StreamEvent[]): S
   // array identity: a new one would re-run every memo and the turn list.
   if(reducer.items.length===items.length&&reducer.items.every((item,index)=>item===items[index])){reducer.items=items;states.set(items,reducer);return items;}
   states.set(reducer.items,reducer);
+  return reducer.items;
+}
+
+/** Queue reconciliation must preserve reducer identity and every live index. */
+export function removeQueuedMessages(items: StreamItem[], ids: ReadonlySet<string>): StreamItem[] {
+  if (!ids.size || !items.length) return items;
+  const reducer = states.get(items);
+  if (!reducer) throw new Error("Transcript must originate from buildTranscript");
+  reducer.items = items;
+  reducer.removeQueued(ids);
+  states.set(reducer.items, reducer);
   return reducer.items;
 }

@@ -88,7 +88,10 @@ pub fn start(voice: crate::voice::VoiceState) {
             if let Ok(snapshot) = collect(
                 voice.worker_pid(),
                 voice.worker_shared(),
-                crate::local_agents::active_pids(),
+                {
+                    #[cfg(unix)] { crate::local_runtime::active_pids() }
+                    #[cfg(not(unix))] { crate::local_agents::active_pids() }
+                },
             ) {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

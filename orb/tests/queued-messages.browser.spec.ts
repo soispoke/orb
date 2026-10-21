@@ -1,5 +1,8 @@
 import {test,expect} from '@playwright/test';
 test.use({browserName:'webkit'});
+test.beforeEach(async({page})=>{
+ await page.route('**/api/control/missions/queue-fixture',route=>route.fulfill({json:{id:'queue-fixture',status:'active',tags:['placement:client']}}));
+});
 // The fixture loads the full composer and its lazy application modules.
 test.setTimeout(90000);
 test('queue matches the composer width and accepts and removes messages',async({page})=>{

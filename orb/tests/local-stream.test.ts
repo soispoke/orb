@@ -103,3 +103,26 @@ it("recovers native activity after reload and preserves it when a new start is r
   await reconcileLocalRun('recovered');expect(localRunActive('recovered')).toBe(false);
  } finally {vi.unstubAllGlobals();}
 });
+
+it('restores a completed native failure after UI reconnect and clears it only on a successful receipt',async()=>{
+ const {reconcileLocalRun,localFailure,localRunActive,localLiveText}=await import('../src/localAgents');
+ const error='Codex stream closed before the turn completed';
+ const invoke=vi.fn(async(command:string)=>{
+  if(command==='local_agents_poll')return {text:'Partial answer',done:true,resumed:false,exit_code:0,error};
+  throw new Error(`Unexpected mutation: ${command}`);
+ });
+ vi.stubGlobal('__TAURI__',{core:{invoke}});
+ try {
+  await reconcileLocalRun('failed-reconnect');
+  expect(localRunActive('failed-reconnect')).toBe(false);
+  expect(localFailure('failed-reconnect')).toBe(error);
+  expect(localLiveText('failed-reconnect')).toBe('Partial answer');
+  invoke.mockRejectedValueOnce(new Error('Transport unavailable'));
+  await reconcileLocalRun('failed-reconnect');
+  expect(localFailure('failed-reconnect')).toBe(error);
+  invoke.mockResolvedValueOnce({text:'Finished',done:true,resumed:false,exit_code:0,error:null} as any);
+  await reconcileLocalRun('failed-reconnect');
+  expect(localFailure('failed-reconnect')).toBeUndefined();
+  expect(invoke.mock.calls.every(([command])=>command==='local_agents_poll')).toBe(true);
+ } finally {vi.unstubAllGlobals();}
+});

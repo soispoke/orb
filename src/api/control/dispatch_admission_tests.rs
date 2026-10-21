@@ -6,6 +6,10 @@ use crate::api::{
 use serde_json::{json, Value};
 
 type AdmissionHooks = std::sync::Mutex<HashMap<(Uuid, &'static str), oneshot::Sender<()>>>;
+
+#[path = "fork_observation_tests.rs"]
+mod fork_observation_tests;
+
 static HOOKS: std::sync::LazyLock<AdmissionHooks> = std::sync::LazyLock::new(Default::default);
 pub(crate) fn notify_wait(id: Uuid, kind: &'static str) {
     if let Some(tx) = HOOKS.lock().unwrap().remove(&(id, kind)) {
@@ -12603,4 +12607,91 @@ async fn cyber_settings_refuse_incompatible_remote_model_before_persistence() {
         .unwrap();
     assert_eq!(stored.model_override.as_deref(), Some("gpt-6-sol"));
     assert_eq!(stored.session_id, m.session_id);
+}
+
+#[tokio::test]
+async fn fork_control_dispatch_rejects_missing_source_instead_of_creating_empty_workspace() {
+    if isolated_vibe_control_test(
+        "fork_control_dispatch_rejects_missing_source_instead_of_creating_empty_workspace",
+    ) {
+        return;
+    }
+    let h = Harness::new().await;
+    for backend in ["claudecode", "codex", "opencode", "grok"] {
+        let source = h._dir.path().join(format!("missing-source-{backend}"));
+        let mission = h
+            .control
+            .mission_store
+            .create_mission_with_parent(
+                Some("Fork cwd regression"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(backend),
+                None,
+                None,
+                Some(source.to_str().unwrap()),
+            )
+            .await
+            .unwrap();
+        h.control
+            .mission_store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    tags: Some(vec![
+                        format!("fork-workspace:{}", Uuid::new_v4()),
+                        crate::api::mission_runner::HOST_STATE_TAG.into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let result = Box::pin(super::run_single_control_turn(
+            h.control.mission_store.clone(),
+            h.state.config.clone(),
+            h.state.root_agent.clone(),
+            h.state.mcp.clone(),
+            h.state.workspaces.clone(),
+            h.state.library.clone(),
+            h.control.events_tx.clone(),
+            h.control.tool_hub.clone(),
+            h.control.status.clone(),
+            CancellationToken::new(),
+            vec![],
+            "Do not launch a model: the fork source is missing".into(),
+            None,
+            h.control.current_tree.clone(),
+            h.control.progress.clone(),
+            Some(mission.id),
+            Some(mission.workspace_id),
+            Some(backend.into()),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Some(h.user.clone()),
+            false,
+        ))
+        .await;
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains("explicit working_directory is invalid"),
+            "{backend}: {}",
+            result.output
+        );
+        assert!(
+            !source.exists(),
+            "a missing fork source must not be recreated"
+        );
+    }
 }

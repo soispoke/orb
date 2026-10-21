@@ -1,0 +1,47 @@
+import {afterEach, expect, it, vi} from 'vitest';
+import {liveReplyMirror} from '../src/localReply';
+afterEach(() => vi.useRealTimers());
+it('mirrors an answer before background work ends and serializes newer prefixes', async () => {
+  vi.useFakeTimers();
+  let finish!: () => void;
+  const write = vi.fn().mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; })).mockResolvedValue(undefined);
+  const mirror = liveReplyMirror(write);
+  mirror.update('Status: building');
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(write).toHaveBeenCalledExactlyOnceWith('Status: building');
+  mirror.update('Status: building. Two agents finished.');
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(write).toHaveBeenCalledTimes(1);
+  finish();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(write).toHaveBeenLastCalledWith('Status: building. Two agents finished.');
+  await mirror.close();
+});
+it('retries failed mirrors without losing the answer or starting another agent', async () => {
+  vi.useFakeTimers();
+  const write = vi.fn().mockRejectedValueOnce(Error('offline')).mockResolvedValue(undefined);
+  const mirror = liveReplyMirror(write);
+  mirror.update('Saved answer');
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(write).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(write).toHaveBeenCalledTimes(2);
+  await mirror.close();
+});
+it('drains an in-flight write and discards scheduled prefixes before the final save', async () => {
+  vi.useFakeTimers();
+  let finish!: () => void;
+  const write = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+  const mirror = liveReplyMirror(write);
+  mirror.update('Prefix');
+  await vi.advanceTimersByTimeAsync(1000);
+  mirror.update('Final');
+  let closed = false;
+  const close = mirror.close().then(() => { closed = true; });
+  await Promise.resolve();
+  expect(closed).toBe(false);
+  finish(); await close;
+  mirror.update('Late');
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(write).toHaveBeenCalledTimes(1);
+});

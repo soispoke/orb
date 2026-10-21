@@ -1,5 +1,4 @@
 import { AntigravityProvider } from "./AntigravityProvider";
-import { ErrorToast } from "./toast";
 import {CloudProviders} from './CloudProviders';
 import {ProviderUsageMeter} from './ProviderUsageMeter';
 import { Dynamic } from "solid-js/web";
@@ -436,7 +435,7 @@ function LiveProviders(p: { list: AIProvider[]; onRefresh: () => void; loading?:
       <Show when={p.loadError}>{error => <ErrorNotice title="Could not refresh providers" error={error()}>
         <button class="s-btn" onClick={p.onRefresh}>Try again</button>
       </ErrorNotice>}</Show>
-      <ErrorToast error={toggleError()} title="Couldn’t update the provider" onDismiss={() => setToggleError(null)} />
+      <Show when={toggleError()}><p class="s-row-desc c-red" role="alert">{toggleError()}</p></Show>
 
       <section class="s-sec">
         <div class="section-row"><h3>Subscriptions</h3><button class="s-btn sm quiet" disabled={!loginOptions()?.available} onClick={() => { setAddType(loginOptions()?.providers[0]?.id ?? ""); setAdding(true); }}><Ic.PlusIcon size={12}/> Add subscription account</button></div>
@@ -663,7 +662,7 @@ function ApiKeyDialog(p: {provider?: AIProvider; onClose: () => void; onDone: ()
       </div>
     </div>
     <p class="s-row-desc p-key-foot-note">{p.provider ? "Enter a replacement key. The saved key is never displayed." : "Encrypted at rest on the connected backend and never shown again."}</p>
-    <Show when={error()}><p role="alert" class="inline-error">{error()}</p></Show>
+    <Show when={error()}><p role="alert" class="c-red">{error()}</p></Show>
   </Dialog>;
 }
 
@@ -690,7 +689,7 @@ function UsageSummary(p: { usage: ProviderUsage }) {
           {(w) => (
             <span class="p-usage-chip" title={`${w.label} window: ${Math.round(w.used * 100)}% used`}>
               <span class="p-usage-label">{w.label === "7d" ? "Weekly" : w.label}</span>
-              <span class="p-usage-pct">{Math.round(w.used * 100)}%</span>
+              <span class="p-usage-pct">{Math.round(w.used * 100)}% used</span>
             </span>
           )}
         </For>
@@ -704,6 +703,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
   const polledLogin = cliProxyReconnectable(p.provider) || p.provider.provider_type === "mistral";
   let disposed = false;
   let completed = false;
+  const [sessionEnded, setSessionEnded] = createSignal(false);
   const [resetting, setResetting] = createSignal(false);
   let pollGeneration = 0;
   const [phase, setPhase] = createSignal<"starting" | "awaiting" | "finishing" | "failed">("starting");
@@ -731,6 +731,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
             p.onDone();
           } else if (st.status === "failed") {
             stopPolling();
+            setSessionEnded(true);
             setError(st.message ?? "login failed");
             setPhase("failed");
           }
@@ -745,7 +746,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
   };
 
   const beginLogin = () => {
-    setPhase("starting"); setError(null); setPaste("");
+    setPhase("starting"); setError(null); setPaste(""); setSessionEnded(false);
     const start = polledLogin
       ? startSubscriptionLogin(p.provider.provider_type, /^[0-9a-f-]{36}$/i.test(p.provider.id) ? p.provider.id : undefined).then(s => ({ id: s.session_id, url: s.auth_url, flow: s.flow, instructions: s.instructions }))
       : startProviderOAuth(p.provider.id).then(s => ({ id: p.provider.id, url: s.url, flow: s.method, instructions: s.instructions }));
@@ -785,7 +786,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
   const submitPaste = () => {
     const s = session();
     const url = paste().trim();
-    if (!s || !url || phase() === "finishing") return;
+    if (!s || !url || phase() === "finishing" || sessionEnded()) return;
     setPhase("finishing");
     setError(null);
     const submit = polledLogin ? submitCliProxyLoginCallback(s.id, url)
@@ -794,6 +795,8 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
         if (disposed) return;
         if (st.status === "completed") { stopPolling(); completed = true; p.onDone(); return; }
         if (st.status === "failed") {
+          stopPolling();
+          setSessionEnded(true);
           setError(st.message ?? "callback rejected");
           setPhase("failed");
         } else {
@@ -817,7 +820,7 @@ function ReAuthDialog(p: { provider: AIProvider; onClose: () => void; onDone: ()
           <DialogButton disabled={phase() === "finishing" || closing()} onClick={requestClose}>
             {phase() === "failed" ? "Close" : "Cancel"}
           </DialogButton>
-          <Show when={(phase() === "awaiting" || phase() === "finishing" || phase() === "failed") && !!session() && session()?.flow !== "device"}>
+          <Show when={(phase() === "awaiting" || phase() === "finishing" || phase() === "failed") && !!session() && !sessionEnded() && session()?.flow !== "device"}>
             <DialogButton variant="primary" disabled={phase() === "finishing" || closing() || !paste().trim()} onClick={submitPaste}>
               {phase() === "finishing" ? "Submitting…" : "Submit callback"}
             </DialogButton>
@@ -897,7 +900,7 @@ function UsageDetail(p: { usage: ProviderUsage; headerEmail?: string; planInHead
   const type = () => u().provider_type;
   return (
     <div class="p-detail">
-      <Show when={u().status === "needs_reauth"}><p class="s-row-desc inline-error">Reconnect this account to check its quota and use it for new requests.</p></Show>
+      <Show when={u().status === "needs_reauth"}><p class="s-row-desc c-red">Reconnect this account to check its quota and use it for new requests.</p></Show>
       <div class="p-detail-meta">
         <Show when={u().account_email && u().account_email !== p.headerEmail}><span>{u().account_email}</span></Show>
         <Show when={u().account_name}><span>{u().account_name}</span></Show>
@@ -965,7 +968,7 @@ function UsageDetail(p: { usage: ProviderUsage; headerEmail?: string; planInHead
 
       <Show when={u().usage_note}><p class="s-row-desc">{u().usage_note}</p></Show>
       <Show when={u().error}>
-        <p class="s-row-desc inline-error">{u().error?.replace(/\s*—\s*/g, ". ")}</p>
+        <p class="s-row-desc c-red">{u().error?.replace(/\s*—\s*/g, ". ")}</p>
       </Show>
     </div>
   );
@@ -1031,7 +1034,7 @@ function LiveRow(p: { a: AIProvider; usage?: ProviderUsage; onReconnect: () => v
           <Show when={hasProviderUsageDetails(p.usage)}>
             <UsageDetail usage={p.usage!} headerEmail={a.account_email ?? (p.usage?.account_email && a.name.includes(p.usage.account_email) ? p.usage.account_email : undefined)} planInHeader />
           </Show>
-          <Show when={!p.usage?.error && (a.status.reason || a.status.message)}><p class="s-row-desc inline-error">{(a.status.reason || a.status.message)?.replace(/\s*—\s*/g, ". ")}</p></Show>
+          <Show when={!p.usage?.error && (a.status.reason || a.status.message)}><p class="s-row-desc c-red">{(a.status.reason || a.status.message)?.replace(/\s*—\s*/g, ". ")}</p></Show>
           <Show when={p.onEditKey}><div class="p-acc-actions"><button class="s-btn" onClick={p.onEditKey}>Edit API key</button></div></Show>
           <Show when={canReconnect() && needsAuth()}>
             <div class="p-acc-actions">

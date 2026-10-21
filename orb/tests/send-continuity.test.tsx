@@ -1,12 +1,60 @@
 import {afterEach,beforeEach,expect,it,vi} from 'vitest';
+it.each(['before','after'] as const)('honors acceptance arriving %s a failed HTTP response without a stale Retry notice',async timing=>{
+ const {sendMissionMessage,getMission}=await import('../src/api');
+ vi.mocked(sendMissionMessage).mockClear();
+ const mission={id:`receipt-${timing}`,status:'awaiting_user',history:[],created_at:'',updated_at:''};
+ vi.mocked(getMission).mockResolvedValue(mission);
+ vi.stubGlobal('fetch',vi.fn(async()=>Response.json([],{headers:{'X-Orb-Events-Protocol':'1','X-Has-More':'false','X-Max-Sequence':'0'}})));
+ let reject!:(error:Error)=>void;
+ let messageId='';
+ vi.mocked(sendMissionMessage).mockImplementationOnce((_mission,_text,_attachments,id)=>{
+  messageId=id!;
+  return new Promise((_resolve,fail)=>{reject=fail;});
+ });
+ render(()=><NativeMissionView id={mission.id} initial={mission}/>);
+ const {fireEvent}=await import('@solidjs/testing-library');
+ const input=screen.getByPlaceholderText('Send follow-up') as HTMLTextAreaElement;
+ fireEvent.input(input,{target:{value:'Continue the hunt'}});fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(reject).toBeTypeOf('function'));
+ const confirm=()=>state.event!({type:'user_message',data:{id:messageId,content:'Continue the hunt',queued:false}});
+ if(timing==='before')confirm();
+ reject(new Error('Request timed out'));
+ if(timing==='after'){
+  await screen.findByRole('button',{name:'Retry'});
+  confirm();
+ }
+ await waitFor(()=>expect(input.readOnly).toBe(false));
+ await waitFor(()=>expect(screen.queryByRole('alert')).toBeNull());
+ expect(screen.queryByRole('button',{name:'Retry'})).toBeNull();
+ expect(screen.getAllByText('Continue the hunt')).toHaveLength(1);
+ expect(sendMissionMessage).toHaveBeenCalledTimes(1);
+});
+
 import {render,screen,waitFor} from '@solidjs/testing-library';
 import {createSignal} from 'solid-js';
 import {NativeMissionView} from '../src/App';
 import type {Mission} from '../src/api';
-beforeEach(()=>{Object.defineProperty(HTMLElement.prototype,'scrollTo',{configurable:true,value:vi.fn()});});
+it('rechecks Core ownership before sending from an obsolete local journal without a binding',async()=>{
+ const {sendMissionMessage,getMission}=await import('../src/api');
+ const local={id:'moved-send',status:'awaiting_user',history:[],tags:['placement:client'],created_at:'',updated_at:''};
+ const remote={...local,tags:[],backend:'codex',model_override:'gpt-6-astra'};
+ let confirmed=false;
+ vi.mocked(getMission).mockImplementation(async(_id,requireCore)=>{confirmed ||= !!requireCore;return confirmed?remote:local;});
+ vi.mocked(sendMissionMessage).mockImplementationOnce(async(_id,_text,_attachments,id)=>({id:id!,queued:false}));
+ vi.stubGlobal('fetch',vi.fn(async()=>Response.json([],{headers:{'X-Orb-Events-Protocol':'1','X-Has-More':'false','X-Max-Sequence':'0'}})));
+ render(()=><NativeMissionView id={local.id} initial={local}/>);
+ const {fireEvent}=await import('@solidjs/testing-library');
+ const input=screen.getByPlaceholderText('Send follow-up');
+ fireEvent.input(input,{target:{value:'Keep going on Core'}});fireEvent.keyDown(input,{key:'Enter'});
+ await waitFor(()=>expect(sendMissionMessage).toHaveBeenCalledTimes(1));
+ expect(getMission).toHaveBeenCalledWith(local.id,true);
+ expect(screen.queryByRole('alert')).toBeNull();
+ await waitFor(()=>expect(screen.getAllByText('Keep going on Core')).toHaveLength(1));
+});
+beforeEach(()=>{vi.clearAllMocks();Object.defineProperty(HTMLElement.prototype,'scrollTo',{configurable:true,value:vi.fn()});});
 const state=vi.hoisted(()=>({event:undefined as undefined|((event:any)=>void)}));
 vi.mock('../src/stream',async()=>({...await vi.importActual('../src/stream'),streamMission:(_id:string,receive:(event:any)=>void)=>{state.event=receive;return ()=>{};}}));
-vi.mock('../src/api',async()=>({...await vi.importActual('../src/api'),sendMissionMessage:vi.fn(),getMission:vi.fn(async()=>({id:'accepted',status:'active',history:[],created_at:'',updated_at:''}))}));
+vi.mock('../src/api',async()=>({...await vi.importActual('../src/api'),sendMissionMessage:vi.fn(),sendQueuedMessageNow:vi.fn(async()=>false),getMission:vi.fn(async()=>({id:'accepted',status:'active',history:[],created_at:'',updated_at:''}))}));
 afterEach(()=>{vi.unstubAllGlobals();state.event=undefined;});
 it('keeps the initial bubble mounted across native identity allocation and canonical receipt',async()=>{
  vi.stubGlobal('fetch',vi.fn(async()=>Response.json([])));
@@ -46,6 +94,8 @@ it('keeps a follow-up visible through a failed request and retries with the same
  reject(new Error('Network unavailable'));
  await waitFor(()=>expect(screen.getByRole('button',{name:'Retry'})).toBeDefined());
  expect(view.container.querySelector('.user')).toBe(node);expect(input.value).toBe('');
+ const {readComposerDraft}=await import('../src/composerDrafts');
+ await waitFor(async()=>expect((await readComposerDraft('m:followup'))?.text).toBe('Keep my follow-up'));
  await waitFor(()=>expect(input.readOnly).toBe(false));
  fireEvent.click(screen.getByRole('button',{name:'Retry'}));
  await waitFor(()=>expect(sendMissionMessage).toHaveBeenCalledTimes(2));
@@ -136,7 +186,7 @@ it('replaces an edited remote queued message without leaving a duplicate Sending
   expect(screen.getAllByText('Edited queued text')).toHaveLength(1);
   expect(screen.queryByText('Sending…')).toBeNull();
  });
- expect(screen.queryByText('Original queued text')).toBeNull();
+ await waitFor(()=>expect(screen.queryByText('Original queued text')).toBeNull());
 });
 
 it('allows rapidly stacking multiple follow-up messages while earlier sends are still in flight',async()=>{
@@ -163,9 +213,9 @@ it('allows rapidly stacking multiple follow-up messages while earlier sends are 
   fireEvent.keyDown(input,{key:'Enter'});
   expect(input.value).toBe('');
  }
- // All 3 appear immediately in the queue in chronological order
- await screen.findByText('3 Sending…');
- const texts=Array.from(document.querySelectorAll('.queue-text')).map(el=>el.textContent);
+ // All 3 appear in the conversation before any network receipt.
+ expect(screen.queryByRole('region',{name:'Queued messages'})).toBeNull();
+ const texts=Array.from(document.querySelectorAll('.user')).map(el=>el.textContent);
  expect(texts).toEqual(['First rapid message','Second rapid message','Third rapid message']);
  // Drain serialized sends one by one
  await waitFor(()=>expect(resolvers).toHaveLength(1));
@@ -191,18 +241,18 @@ it('never leaks an in-flight Send now retry to another mission when the selected
   updated_at:'',
  }));
  const sentTargets:string[]=[];
- let releaseCancelPoll!:()=>void;
- const cancelPollGate=new Promise<void>(r=>{releaseCancelPoll=r;});
+ let finishSendNow!:(response:Response)=>void;
+ const sendNowGate=new Promise<Response>(resolve=>{finishSendNow=resolve;});
+ const cancelRequests:string[]=[];
  vi.mocked(sendMissionMessage).mockImplementation(async(id,_text,_attachments,clientMessageId)=>{
   sentTargets.push(id);
   return {id:clientMessageId??'msg',queued:true};
  });
  vi.stubGlobal('fetch',vi.fn(async(url,options)=>{
   const u=String(url);
-  if(u.endsWith('/send-now')&&options?.method==='POST')return Response.json({ok:true,delivered:false});
+  if(u.endsWith('/send-now')&&options?.method==='POST')return sendNowGate;
   if(u.endsWith('/cancel')&&options?.method==='POST'){
-   setMissionId('mission-unrelated');
-   releaseCancelPoll();
+   cancelRequests.push(u);
    return Response.json({ok:true});
   }
   if(options?.method==='DELETE')return Response.json({ok:true});
@@ -213,11 +263,62 @@ it('never leaks an in-flight Send now retry to another mission when the selected
  await screen.findByText('Do not leak this prompt');
  const {fireEvent}=await import('@solidjs/testing-library');
  await fireEvent.click(screen.getByRole('button',{name:'Send now: Do not leak this prompt'}));
- await cancelPollGate;
+ await waitFor(()=>expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/send-now'),expect.anything()));
+ setMissionId('mission-unrelated');
+ finishSendNow(Response.json({ok:true,delivered:false}));
  await new Promise(r=>setTimeout(r,50));
+ expect(cancelRequests).toEqual([]);
  expect(sentTargets).not.toContain('mission-unrelated');
  expect(sentTargets).toEqual([]);
 });
 
 
 
+
+it('opens at the latest message despite initial layout scroll events, then respects manual scrolling', async () => {
+ const {fireEvent}=await import('@solidjs/testing-library');
+ vi.stubGlobal('fetch',vi.fn(async()=>Response.json([])));
+ const view=render(()=><NativeMissionView id="" launch={{messageKey:'scroll:open',prompt:'Latest message',nodeId:'core',destination:'Core'}}/>);
+ const scroller=view.container.querySelector('.scroll') as HTMLElement;
+ Object.defineProperties(scroller,{scrollHeight:{configurable:true,value:4000},clientHeight:{configurable:true,value:600}});
+ fireEvent.scroll(scroller);
+ await waitFor(()=>expect(scroller.scrollTo).toHaveBeenCalledWith({top:4000}));
+ vi.mocked(scroller.scrollTo).mockClear();
+ fireEvent.wheel(scroller,{deltaY:-200});fireEvent.scroll(scroller);
+ await new Promise(resolve=>setTimeout(resolve,40));
+ expect(scroller.scrollTo).not.toHaveBeenCalled();
+});
+
+it('first Enter displays the follow-up and steers in the background while the next draft survives',async()=>{
+ const {getMission,sendMissionMessage,sendQueuedMessageNow}=await import('../src/api');
+ vi.mocked(getMission).mockResolvedValue({id:'live-question',status:'active',history:[],created_at:'',updated_at:''});
+ vi.stubGlobal('fetch',vi.fn(async()=>Response.json([],{headers:{'X-Orb-Events-Protocol':'1','X-Has-More':'false','X-Max-Sequence':'0'}})));
+ vi.mocked(sendMissionMessage).mockImplementationOnce(async(_id,_text,_attachments,id)=>({id:id!,queued:true}));
+ let delivered!:(value:boolean)=>void;
+ vi.mocked(sendQueuedMessageNow).mockImplementationOnce(()=>new Promise(resolve=>{delivered=resolve;}));
+ const view=render(()=><NativeMissionView id="live-question" initial={{id:'live-question',status:'active',history:[],created_at:'',updated_at:''}}/>);
+ const input=screen.getByPlaceholderText('Send follow-up') as HTMLTextAreaElement;
+ const {fireEvent}=await import('@solidjs/testing-library');
+ fireEvent.input(input,{target:{value:'Continue checking the layout'}});fireEvent.keyDown(input,{key:'Enter'});
+ expect(view.container.querySelector('.user')?.textContent).toContain('Continue checking the layout');
+ expect(screen.queryByRole('region',{name:'Queued messages'})).toBeNull();
+ await waitFor(()=>expect(delivered).toBeTypeOf('function'));
+ fireEvent.input(input,{target:{value:'eta'}});
+ expect(screen.getByText(/Sending to the running session/)).toBeTruthy();
+ delivered(true);
+ await waitFor(()=>expect(screen.getByText(/Sent to the running session/)).toBeTruthy());
+ expect(input.value).toBe('eta');
+ expect(view.container.querySelectorAll('.user').length).toBeGreaterThan(0);
+ view.unmount();
+});
+
+it('empty Enter with no queued follow-up never resumes an idle chat',async()=>{
+ const {getMission,sendMissionMessage,sendQueuedMessageNow}=await import('../src/api');
+ vi.mocked(sendMissionMessage).mockClear();vi.mocked(sendQueuedMessageNow).mockClear();
+ vi.mocked(getMission).mockResolvedValue({id:'empty-idle',status:'awaiting_user',history:[],created_at:'',updated_at:''});
+ vi.stubGlobal('fetch',vi.fn(async()=>Response.json([])));
+ render(()=><NativeMissionView id="empty-idle" initial={{id:'empty-idle',status:'awaiting_user',history:[],created_at:'',updated_at:''}}/>);
+ const {fireEvent}=await import('@solidjs/testing-library');
+ fireEvent.keyDown(screen.getByPlaceholderText('Send follow-up'),{key:'Enter'});
+ await Promise.resolve();expect(sendMissionMessage).not.toHaveBeenCalled();expect(sendQueuedMessageNow).not.toHaveBeenCalled();
+});

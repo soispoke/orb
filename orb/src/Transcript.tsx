@@ -1,5 +1,7 @@
+import {DisclosureState, disclosure, TranscriptDetails} from "./TranscriptDetails";
+import {transcriptActivityOrder} from "./transcriptActivityOrder";
+import {ElapsedTime} from "./ElapsedTime";
 import {AutomaticReminder, reminderMessages} from "./AutomaticReminder";
-import { ErrorToast } from "./toast";
 import {PromptEditor} from "./PromptEditor";
 import {VirtualTurns} from "./VirtualTurns";
 import type { JSX } from "solid-js";
@@ -13,7 +15,7 @@ import { remoteLog } from "./remoteLog";
 import { ErrorNotice } from "./ErrorNotice";
 import { forkContext } from "./forkContext";
 import { backgroundWake, type BackgroundWake } from "./backgroundWake";
-import { For, Show, createSignal, createEffect, createMemo, createContext, useContext, onCleanup } from "solid-js";
+import { For, Show, createSignal, createEffect, createMemo, useContext, onCleanup } from "solid-js";
 import * as Ic from "./icons";
 import { markdownText, MdView } from "./Markdown";
 import { createStore, reconcile } from "solid-js/store";
@@ -25,14 +27,6 @@ import { visibleTranscript, type StreamItem } from "./transcriptModel";
 export { buildTranscript, applyStreamEvent } from "./transcriptModel";
 export type { StreamItem } from "./transcriptModel";
 
-const DisclosureState=createContext<Map<string,boolean>>();
-function disclosure(key:string,initial=false){
- const state=useContext(DisclosureState);
- const [open,setOpen]=createSignal(state?.get(key)??initial);
- const [explicit,setExplicit]=createSignal(state?.has(key)??false);
- return [open,(value:boolean)=>{state?.set(key,value);setExplicit(true);setOpen(value);},explicit] as const;
-}
-
 const dismissedChecklists = new Set<string>();
 
 /** Inline code and bold spans inside thought summaries, so raw backticks don't clutter the transcript. */
@@ -40,10 +34,15 @@ function thinkInline(text: string): JSX.Element[] {
   const out: JSX.Element[] = [];
   const re = /`([^`\n]+)`|\*\*([^*\n]+)\*\*/g;
   let last = 0;
+  let previousBold = false;
   for (let m = re.exec(text); m; m = re.exec(text)) {
     if (m.index > last) out.push(text.slice(last, m.index));
+    // Some producers join independently bolded summary headings without a
+    // separator. Keep the source intact but render their boundary legibly.
+    if (previousBold && m[2] !== undefined && m.index === last) out.push("\n\n");
     if (m[1] !== undefined) out.push(<code>{m[1]}</code>);
     else if (m[2] !== undefined) out.push(<strong>{m[2]}</strong>);
+    previousBold = m[2] !== undefined;
     last = m.index + m[0].length;
   }
   if (last < text.length) out.push(text.slice(last));
@@ -222,15 +221,14 @@ const AUTOMATIC_SOURCES = new Set(["background-task", "scheduler", "idle-worker-
 
 /** The coordinator resumed the agent after a background shell ended. It is
  * not something the user wrote, so it is not shown as their message. */
-function BackgroundWakeRow(p: { wake: BackgroundWake }) {
+function BackgroundWakeRow(p: { wake: BackgroundWake; disclosureKey?: string }) {
   const status = () => p.wake.killed ? "was stopped" : "finished";
   return (
-    <details class="background-wake">
-      <summary title="Sent automatically by the agent coordinator to resume the agent">
+    <TranscriptDetails class="background-wake" stateKey={p.disclosureKey} title="Sent automatically by the agent coordinator to resume the agent" summary={<>
         <Ic.CmdIcon size={12} />
         <span>Background task {status()} · agent resumed</span>
         <code>{p.wake.command.split("\n")[0]}</code>
-      </summary>
+      </>}>
       <div class="background-wake-body">
         <pre>{p.wake.command}</pre>
         <Show when={p.wake.output && !p.wake.killed} fallback={<p>{p.wake.killed ? "The shell was killed before it finished, so there is no output." : "No output was captured."}</p>}>
@@ -238,11 +236,11 @@ function BackgroundWakeRow(p: { wake: BackgroundWake }) {
         </Show>
         <Show when={p.wake.note}><p>{p.wake.note}</p></Show>
       </div>
-    </details>
+    </TranscriptDetails>
   );
 }
 
-export function UserTurn(p: { text: string; images?: DraftImage[]; source?: string; attached?: boolean; pending?: boolean; onSend?: (text: string) => boolean | Promise<boolean> }) {
+export function UserTurn(p: { disclosureKey?: string; text: string; images?: DraftImage[]; source?: string; attached?: boolean; continuityRetry?: boolean; pending?: boolean; onSend?: (text: string) => boolean | Promise<boolean> }) {
   const fork = createMemo(() => forkContext(p.text));
   const presentation = createMemo(() => messagePresentation(p.text));
   const images = createMemo(() => messageImages(presentation().text));
@@ -283,7 +281,7 @@ export function UserTurn(p: { text: string; images?: DraftImage[]; source?: stri
     });
   };
   return (
-    <Show when={isAutomaticRecovery(p.text) || isResumePrompt(p.text)} fallback={
+    <Show when={p.continuityRetry || isAutomaticRecovery(p.text) || isResumePrompt(p.text)} fallback={
     <div ref={bubble} onDblClick={() => { if (!editing()) edit(); }} class={`user ${editing() ? "editing" : ""} ${goal().kind === "goal" ? "goal" : ""} ${plan() !== null ? "plan" : ""} ${p.pending ? "pending" : ""}`}>
       <Show when={thumbnails().length}><div class="message-images"><For each={thumbnails()}>{(image,i)=><MessageImage path={image.path} index={image.reference} onUrl={url=>setImageUrls(prev=>({...prev,[image.path]:url}))} onOpen={()=>setViewing(i())}/>}</For></div></Show>
       <Show when={viewing()!==null}><Lightbox items={thumbnails().map(image=>({src:imageUrls()[image.path]??null,label:`Image #${image.reference}`}))} index={viewing()!} onClose={()=>setViewing(null)}/></Show>
@@ -306,13 +304,12 @@ export function UserTurn(p: { text: string; images?: DraftImage[]; source?: stri
           <span role="status">{copyState()}</span>
           <Show when={p.onSend}><button class="send" aria-label={sending() ? "Sending follow-up" : "Send again"} title="Adds a new message at the end of this conversation (⌘/Ctrl+Enter)" disabled={sending() || !draft().trim()} onClick={() => void submit()}><Ic.ArrowUpIcon size={14}/></button></Show>
         </div>
-        <ErrorToast error={sendError()} title="Couldn’t send your message" onDismiss={() => setSendError("")} />
+        <Show when={sendError()}><ErrorNotice error={sendError()} /></Show>
       </Show>
     </div>
-    }><details class="background-wake">
-      <summary><Ic.CmdIcon size={12}/><span>{isResumePrompt(p.text) ? "Resumed after interruption" : "Agent resumed automatically"}</span></summary>
+    }><TranscriptDetails class="background-wake" stateKey={p.disclosureKey} summary={<><Ic.CmdIcon size={12}/><span>{p.continuityRetry ? "Retried after interruption" : isResumePrompt(p.text) ? "Resumed after interruption" : "Agent resumed automatically"}</span></>}>
       <div class="background-wake-body"><p>{p.text}</p></div>
-    </details></Show>
+    </TranscriptDetails></Show>
   );
 }
 
@@ -365,22 +362,6 @@ function ToolRow(p: { item: Extract<StreamItem, { kind: "tool" }> }) {
   };
   return (
     <div class={`st-tool ${open() ? "open" : ""} ${failed() ? "is-failed" : ""}`} data-kind={workKind(p.item.name)}>
-      <Show when={open()}>
-        <Show when={checklist()?.length} fallback={
-          <div class="st-tool-detail-wrap">
-            <button type="button" class="icon-btn st-tool-copy" aria-label={copied() ? "Copied" : "Copy tool output"} title={copied() ? "Copied" : "Copy"} onClick={(e) => { e.stopPropagation(); copyDetail(); }}>
-              <Show when={copied()} fallback={<Ic.CopyIcon size={12} />}><Ic.CheckIcon size={12} /></Show>
-            </button>
-            <Show when={isCommand() && commandText()} fallback={<pre class="st-tool-detail">{detail() || "(no details)"}</pre>}>
-              <pre class="st-tool-detail st-tool-bash"><span class="st-bash-cmd">$ {commandText()}</span><Show when={outputOnly()}>{"\n\n"}{outputOnly()}</Show><Show when={p.item.unresolved}>{"\n\n"}This turn ended without a recorded result for this action.</Show></pre>
-            </Show>
-          </div>
-        }>
-          <div class="st-tool-detail st-tool-checklist">
-            <ol><For each={checklist()!}>{task => <li data-status={task.status}><span class="task-state">{task.status === "completed" ? "✓" : task.status === "cancelled" ? "−" : task.status === "in_progress" ? "◉" : "○"}</span><span>{task.text}</span></li>}</For></ol>
-          </div>
-        </Show>
-      </Show>
       <button class="st-tool-head" ref={toggle} aria-expanded={open()} onClick={() => anchored(toggle,()=>setOpen(!open()))}>
         <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
         <ToolGlyph name={p.item.name} />
@@ -397,12 +378,30 @@ function ToolRow(p: { item: Extract<StreamItem, { kind: "tool" }> }) {
         <Show when={diff()}>
           {d => <DiffBadges stats={d()} />}
         </Show>
+        <ElapsedTime startedAt={p.item.startedAt} finishedAt={p.item.unresolved ? undefined : p.item.finishedAt} running={!p.item.done} />
         <span class="st-tool-state">
           <Show when={p.item.done} fallback={<Ic.Spinner size={12} />}>
             <span class="st-tool-check" classList={{"is-failed":failed()}} title={p.item.unresolved?"No result recorded":failed()?"Failed":undefined}>{p.item.unresolved?"—":failed()?"!":"✓"}</span>
           </Show>
         </span>
       </button>
+      <Show when={open()}>
+        <Show when={checklist()?.length} fallback={
+          <div class="st-tool-detail-wrap">
+            <button type="button" class="icon-btn st-tool-copy" aria-label={copied() ? "Copied" : "Copy tool output"} title={copied() ? "Copied" : "Copy"} onClick={(e) => { e.stopPropagation(); copyDetail(); }}>
+              <Show when={copied()} fallback={<Ic.CopyIcon size={12} />}><Ic.CheckIcon size={12} /></Show>
+            </button>
+            <Show when={isCommand() && commandText()} fallback={<pre class="st-tool-detail">{detail() || "(no details)"}</pre>}>
+              <pre class="st-tool-detail st-tool-bash"><span class="st-bash-cmd">$ {commandText()}</span><Show when={outputOnly()}>{"\n\n"}{outputOnly()}</Show><Show when={p.item.unresolved}>{"\n\n"}This turn ended without a recorded result for this action.</Show></pre>
+            </Show>
+          </div>
+        }>
+          <div class="st-tool-detail st-tool-checklist">
+            <ol><For each={checklist()!}>{task => <li data-status={task.status}><span class="task-state">{task.status === "completed" ? "✓" : task.status === "cancelled" ? "−" : task.status === "in_progress" ? "◉" : "○"}</span><span>{task.text}</span></li>}</For></ol>
+          </div>
+        </Show>
+      </Show>
+
 
     </div>
   );
@@ -438,7 +437,7 @@ function groupWork(input: StreamItem[], previous: Grouped[] = []): Grouped[] {
   const out: Grouped[] = [];
   // Dropping a filler bubble also rejoins the work around it, so one stretch of
   // tool calls reads as one fold instead of being split in two by a stray ".".
-  const items = visibleTranscript(input);
+  const items = transcriptActivityOrder(visibleTranscript(input));
   for (const it of items) {
     const last = out[out.length - 1];
     if (it.kind === "tool" || it.kind === "think") {
@@ -467,6 +466,10 @@ function WorkFold(p: { items: WorkItem[] }) {
     return `${cur.name} ${toolTarget(cur.name, cur.args) ?? ""}`.trim();
   };
   const summary = createMemo(() => workSummary(p.items));
+  const runningSince = createMemo(() => {
+    const starts = p.items.flatMap(t => t.kind === "tool" && !t.done && t.startedAt !== undefined ? [t.startedAt] : []);
+    return starts.length ? Math.min(...starts) : undefined;
+  });
   const totalDiff = createMemo<DiffStats | null>(() => {
     let additions = 0, deletions = 0, has = false;
     for (const t of p.items) {
@@ -478,6 +481,16 @@ function WorkFold(p: { items: WorkItem[] }) {
   });
   return (
     <div class={`st-work ${open() ? "open" : ""}`}>
+      <button class="st-work-head" ref={toggle} aria-expanded={open()} onClick={() => anchored(toggle,()=>setOpen(!open()))}>
+        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
+        <Show when={running()} fallback={<span class="st-work-label">{summary()}</span>}>
+          <span class="st-work-label shimmer">{current()}</span>
+        </Show>
+        <ElapsedTime startedAt={runningSince()} running={running()} />
+        <Show when={!running() && totalDiff()}>
+          {d => <DiffBadges stats={d()} />}
+        </Show>
+      </button>
       <Show when={open()}>
         <div class="st-work-body">
           <For each={p.items}>
@@ -487,15 +500,7 @@ function WorkFold(p: { items: WorkItem[] }) {
           </For>
         </div>
       </Show>
-      <button class="st-work-head" ref={toggle} aria-expanded={open()} onClick={() => anchored(toggle,()=>setOpen(!open()))}>
-        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
-        <Show when={running()} fallback={<span class="st-work-label">{summary()}</span>}>
-          <span class="st-work-label shimmer">{current()}</span>
-        </Show>
-        <Show when={!running() && totalDiff()}>
-          {d => <DiffBadges stats={d()} />}
-        </Show>
-      </button>
+
 
     </div>
   );
@@ -508,15 +513,16 @@ function ThinkFold(p: { items: Array<Extract<StreamItem, { kind: "think" }>> }) 
   const label = () => `${p.items.length} ${p.items.length === 1 ? "thought" : "thoughts"}`;
   return (
     <div class={`st-work st-think-fold ${open() ? "open" : ""}`}>
+      <button class="st-work-head" ref={toggle} aria-expanded={open()} onClick={() => anchored(toggle, () => setOpen(!open()))}>
+        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
+        <span class="st-work-label">{label()}</span>
+      </button>
       <Show when={open()}>
         <div class="st-work-body">
           <For each={p.items}>{(t) => <ThinkBlock item={t} />}</For>
         </div>
       </Show>
-      <button class="st-work-head" ref={toggle} aria-expanded={open()} onClick={() => anchored(toggle, () => setOpen(!open()))}>
-        <Ic.ChevronRight size={12} class={`chev ${open() ? "open" : ""}`} />
-        <span class="st-work-label">{label()}</span>
-      </button>
+
     </div>
   );
 }
@@ -592,7 +598,7 @@ export function Transcript(p: { prepareSearch?:(signal:AbortSignal)=>Promise<voi
   const disclosures=new Map<string,boolean>();
   const reminders = createMemo(() => reminderMessages(p.items));
   const checklist = createMemo(() => latestChecklist(p.items));
-  const groups = createMemo<Grouped[]>((previous) => groupWork(p.items.filter(item => item.kind !== "user" || !item.queued), previous), []);
+  const groups = createMemo<Grouped[]>((previous) => groupWork(p.items.filter(item => item.kind !== "subagent" && (item.kind !== "user" || !item.queued)), previous), []);
   /** Key of the last user turn, when nothing follows it yet. Compared by key
    * rather than identity: `reconcile` hands the loop store proxies, not the
    * original objects. */
@@ -632,8 +638,8 @@ export function Transcript(p: { prepareSearch?:(signal:AbortSignal)=>Promise<voi
             case "user":
               // Only the turn still waiting for a reply animates: once anything
               // has been said or done after it, the work is visible on its own.
-              return <Show when={backgroundWake(item.text, item.source)} fallback={<Show when={reminders().get(item.key)} fallback={<UserTurn text={item.text} images={item.images} source={item.source} attached={item.attached} onSend={p.onSend} pending={p.pending && item.key === lastUserKey()} />}>{reminder => <AutomaticReminder text={item.text} reminder={reminder()} />}</Show>}>
-                {wake => <BackgroundWakeRow wake={wake()} />}
+              return <Show when={backgroundWake(item.text, item.source)} fallback={<Show when={reminders().get(item.key)} fallback={<UserTurn disclosureKey={`notice:${item.key}`} text={item.text} images={item.images} source={item.source} attached={item.attached} continuityRetry={item.continuityRetry} onSend={p.onSend} pending={p.pending && item.key === lastUserKey()} />}>{reminder => <AutomaticReminder disclosureKey={`notice:${item.key}`} text={item.text} reminder={reminder()} />}</Show>}>
+                {wake => <BackgroundWakeRow disclosureKey={`notice:${item.key}`} wake={wake()} />}
               </Show>;
             case "think":
               return <ThinkBlock item={item} />;
@@ -646,8 +652,8 @@ export function Transcript(p: { prepareSearch?:(signal:AbortSignal)=>Promise<voi
             case "tool":
               return <ToolRow item={item} />;
             case "error":
-              return <ErrorNotice error={item.text} title={item.cancelled ? "Mission cancelled" : "Mission failed"}>
-                <Show when={!item.cancelled && p.onResume && item.key === lastErrorKey()}><button type="button" class="error-notice-link" title="Continue from where the work stopped" onClick={() => p.onResume?.()}>Resume</button></Show>
+              return <ErrorNotice error={item.text} title={item.cancelling ? "Stopping mission" : item.cancelled ? "Mission cancelled" : "Mission failed"}>
+                <Show when={!item.cancelled && !item.cancelling && p.onResume && item.key === lastErrorKey()}><button type="button" class="error-notice-link" title="Continue from where the work stopped" onClick={() => p.onResume?.()}>Resume</button></Show>
               </ErrorNotice>;
           }
         }}
@@ -661,6 +667,9 @@ export function Transcript(p: { prepareSearch?:(signal:AbortSignal)=>Promise<voi
 
 function AssistantText(p: { text: string; live?: boolean }) {
   const references = useContext(FileReferenceContext);
+  // Finalization must not replace the Markdown tree (selection, code blocks,
+  // and text all belong to the same reply). Defer only the file lookups.
+  const resolver = references ? {...references, enabled: () => !p.live && (references.enabled?.() ?? true)} : undefined;
   const content = createMemo(() => remoteLog(p.text));
   const [copied, setCopied] = createSignal(false);
   const [copyError, setCopyError] = createSignal("");
@@ -679,9 +688,7 @@ function AssistantText(p: { text: string; live?: boolean }) {
     }
   };
   return <>
-    <Show when={!p.live} fallback={<FileReferenceContext.Provider value={undefined}><MdView text={content().text} compact /></FileReferenceContext.Provider>}>
-      <FileReferenceContext.Provider value={references}><MdView text={content().text} compact /></FileReferenceContext.Provider>
-    </Show>
+    <FileReferenceContext.Provider value={resolver}><MdView text={content().text} compact /></FileReferenceContext.Provider>
     <Show when={content().details}><details class="legacy-log"><summary>Original execution log</summary><pre>{content().details}</pre></details></Show>
     <Show when={content().text.trim()}>
       <div class="response-actions">

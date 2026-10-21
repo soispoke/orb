@@ -1,5 +1,4 @@
 import { hasOverlay } from "./overlayLayer";
-import { nativeInvoke } from "./clientRuns";
 import * as TreeIcon from "./sidebarIcons";
 import {
   lazy,
@@ -19,6 +18,7 @@ import {
 } from "solid-js";
 import {
   createFileClient,
+  checkedFileChunk,
   fileScopeKey,
   parseFileTarget,
   relativeFilePath,
@@ -124,6 +124,7 @@ export function FilePanelProvider(p: {
       Record<string, FileEntry[]>
     >({}),
     [content, setContent] = createSignal<FileRead>(),
+    [directoryErrors, setDirectoryErrors] = createSignal<Record<string, string>>({}),
     [error, setError] = createSignal<string>(),
     [loading, setLoading] = createSignal(false),
     [placeholder, setPlaceholder] = createSignal(false);
@@ -144,6 +145,7 @@ export function FilePanelProvider(p: {
     batchTimer: ReturnType<typeof setTimeout> | undefined,
     rootPromise: Promise<FileSource[]> | undefined,
     readGeneration = 0;
+  let directoryRequests = new Map<string, Promise<void>>();
   let layoutMarker: HTMLSpanElement | undefined;
   const [layout, setLayout] = createSignal<HTMLElement>();
   onMount(() => {
@@ -217,6 +219,8 @@ export function FilePanelProvider(p: {
       setExpanded(saved.expanded);
       setOpened(saved.open);
       setDirectories({});
+      setDirectoryErrors({});
+      directoryRequests = new Map();
       setSources([]);
       setContent(undefined);
       setError(undefined);
@@ -273,26 +277,39 @@ export function FilePanelProvider(p: {
       setHistoryIndex(next.length - 1);
     }
   }
-  async function list(source: string, path: string) {
+  function list(source: string, path: string): Promise<void> {
     const g = generation,
-      key = `${source}:${path}`;
-    if (directories()[key]) return;
-    try {
-      await ensureRoots();
-      const r = await client.call(source, { action: "list", path });
-      if (g === generation) {
-        setDirectories((d) => ({ ...d, [key]: r.entries ?? [] }));
-        if (r.truncated)
-          setNotice("Some entries are omitted; narrow the search.");
+      key = `${source}:${path}`, c = client, requests = directoryRequests;
+    if (untrack(() => directories()[key] || directoryErrors()[key])) return Promise.resolve();
+    const pending = requests.get(key);
+    if (pending) return pending;
+    const request = (async () => {
+      try {
+        const roots = await ensureRoots();
+        // Saved expansions can outlive optional sources. They are navigation
+        // state, not a failed read of the selected file.
+        if (g !== generation || !roots.some(root => root.id === source && root.available)) return;
+        const r = await c.call(source, { action: "list", path });
+        if (g === generation) {
+          setDirectories((d) => ({ ...d, [key]: r.entries ?? [] }));
+          if (r.truncated)
+            setNotice("Some entries are omitted; narrow the search.");
+        }
+      } catch (e) {
+        if (g === generation) setDirectoryErrors(d => ({ ...d, [key]: (e as Error).message }));
+      } finally {
+        requests.delete(key);
       }
-    } catch (e) {
-      if (g === generation) setError((e as Error).message);
-    }
+    })();
+    requests.set(key, request);
+    return request;
   }
   createEffect(() => {
+    const g = generation;
     if (opened())
       void ensureRoots()
         .then((roots) => {
+          if (g !== generation) return;
           for (const root of roots) if (root.available) void list(root.id, "");
         })
         .catch(() => {});
@@ -308,18 +325,24 @@ export function FilePanelProvider(p: {
     if(refreshingFiles())return;
     setRefreshingFiles(true);
     rememberScroll();
+    const g = ++generation;
+    readGeneration++;
     try {
-      cache.clear();rootPromise=undefined;setDirectories({});
+      cache.clear();rootPromise=undefined;directoryRequests=new Map();setDirectoryErrors({});setDirectories({});
       const roots=await ensureRoots();
+      if(g!==generation)return;
       await Promise.all(roots.filter(root=>root.available).map(root=>list(root.id,"")));
+      if(g!==generation)return;
       await Promise.all(expanded().map(key=>{const split=key.indexOf(":");return list(key.slice(0,split),key.slice(split+1));}));
+      if(g!==generation)return;
       await readSelected();
-    } catch(error){setError(String(error));}
+    } catch(error){if(g===generation)setError(String(error));}
     finally{setRefreshingFiles(false);}
   }
   async function readSelected() {
     const ref = selected();
     if (!ref) return;
+    const c = client;
     const g = ++readGeneration;
     setLoading(true);
     setPlaceholder(false);
@@ -330,7 +353,8 @@ export function FilePanelProvider(p: {
     }, 300);
     try {
       await ensureRoots();
-      const r = await client.call(ref.source, {
+      if (g !== readGeneration) return;
+      const r = await c.call(ref.source, {
         action: "read",
         path: ref.path,
       });
@@ -628,6 +652,17 @@ export function FilePanelProvider(p: {
   function Rows(q: { source: string; path: string; depth: number }) {
     const key = () => `${q.source}:${q.path}`;
     return (
+      <>
+      <Show when={directoryErrors()[key()]}>
+        {message => <ErrorNotice error={message()} title="Couldn’t open folder">
+          <button aria-label="Retry folder" onClick={() => {
+            setDirectoryErrors(errors => {
+              const next = { ...errors }; delete next[key()]; return next;
+            });
+            void list(q.source, q.path);
+          }}>Retry</button>
+        </ErrorNotice>}
+      </Show>
       <For each={directories()[key()] ?? []}>
         {(entry) => {
           const ref = { ...entry, source: q.source };
@@ -676,6 +711,7 @@ export function FilePanelProvider(p: {
           );
         }}
       </For>
+      </>
     );
   }
   const [showImage, setShowImage] = createSignal(true);
@@ -716,11 +752,16 @@ export function FilePanelProvider(p: {
   const [downloads, setDownloads] = createSignal<
     Record<string, { received: number; total: number; abort: AbortController }>
   >({});
-  // Files saved this session, keyed by identity + size + mtime so a changed
-  // file can be downloaded again. A second click reveals the saved copy.
-  const [downloaded, setDownloaded] = createSignal<Record<string, true>>({});
-  const downloadKey = (ref: NonNullable<ReturnType<typeof selected>>) => `${identity(ref)}:${content()?.size ?? ""}:${content()?.modified ?? ""}`;
+  const [downloadedKey, setDownloadedKey] = createSignal<string>();
+  const downloadKey = (ref: FileRef) => `${connectionVersion()}:${scopeKey()}:${identity(ref)}`;
+  let downloadedTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(on(connectionVersion, () => {
+    for (const item of Object.values(downloads())) item.abort.abort();
+    setDownloads({});
+    setDownloadedKey(undefined);
+  }, {defer: true}));
   onCleanup(() => {
+    if (downloadedTimer) clearTimeout(downloadedTimer);
     for (const item of Object.values(downloads())) item.abort.abort();
   });
   const formatBytesShort = (bytes: number) =>
@@ -731,22 +772,16 @@ export function FilePanelProvider(p: {
         : `${(bytes / 1048576).toFixed(1)} MB`;
   const activeDownload = createMemo(() => {
     const ref = selected();
-    return ref ? downloads()[identity(ref)] : undefined;
+    return ref ? downloads()[downloadKey(ref)] : undefined;
   });
   const isDownloaded = createMemo(() => {
     const ref = selected();
-    return !!ref && !!downloaded()[downloadKey(ref)];
+    return !!ref && downloadedKey() === downloadKey(ref);
   });
   async function download() {
     const ref = selected();
     if (!ref) return;
-    const invoke = nativeInvoke();
-    if (isDownloaded() && invoke) {
-      try { await invoke("reveal_download", { name: ref.name }); }
-      catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-      return;
-    }
-    const key = identity(ref);
+    const key = downloadKey(ref), c = client;
     const existing = downloads()[key];
     if (existing) {
       existing.abort.abort();
@@ -766,26 +801,25 @@ export function FilePanelProvider(p: {
     }));
     try {
       const chunks: Uint8Array[] = [];
-      let offset = 0,
-        total = Math.max(1, initialTotal);
-      while (offset < total) {
+      let offset = 0, total: number | undefined;
+      do {
         abort.signal.throwIfAborted();
-        const r = await client.call(ref.source, {
+        const reply = await c.call(ref.source, {
           action: "download",
           path: ref.path,
           offset,
         });
         abort.signal.throwIfAborted();
-        if (!r.bytes?.length) break;
-        chunks.push(new Uint8Array(r.bytes));
-        offset = r.next!;
-        total = r.size!;
+        const r = checkedFileChunk(reply, offset, total);
+        chunks.push(r.bytes);
+        offset = r.next;
+        total = r.size;
         setDownloads((prev) =>
           prev[key]
-            ? { ...prev, [key]: { ...prev[key], received: offset, total } }
+            ? { ...prev, [key]: { ...prev[key], received: offset, total: r.size } }
             : prev,
         );
-      }
+      } while (offset < total);
       abort.signal.throwIfAborted();
       const url = URL.createObjectURL(new Blob(chunks as BlobPart[]));
       const a = document.createElement("a");
@@ -793,9 +827,13 @@ export function FilePanelProvider(p: {
       a.download = ref.name;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setDownloaded((prev) => ({ ...prev, [downloadKey(ref)]: true }));
+      setDownloadedKey(key);
+      if (downloadedTimer) clearTimeout(downloadedTimer);
+      downloadedTimer = setTimeout(() => {
+        setDownloadedKey((curr) => (curr === key ? undefined : curr));
+      }, 1800);
     } catch (e) {
-      if (!abort.signal.aborted) {
+      if (!abort.signal.aborted && selected() && downloadKey(selected()!) === key) {
         setError((e as Error).message);
       }
     } finally {
@@ -1094,7 +1132,7 @@ export function FilePanelProvider(p: {
                               : activeDownload()
                                 ? `Downloading ${Math.min(100, Math.round((activeDownload()!.received / Math.max(1, activeDownload()!.total)) * 100))}% · ${formatBytesShort(activeDownload()!.received)} / ${formatBytesShort(activeDownload()!.total)}`
                                 : isDownloaded()
-                                  ? nativeInvoke() ? "Downloaded ✓ · Show in Finder" : "Downloaded ✓"
+                                  ? "Downloaded ✓"
                                   : "Download full file"}
                           </button>
                         </p>
@@ -1133,7 +1171,7 @@ export function FilePanelProvider(p: {
                                   : activeDownload()
                                     ? `Downloading ${Math.min(100, Math.round((activeDownload()!.received / Math.max(1, activeDownload()!.total)) * 100))}% · ${formatBytesShort(activeDownload()!.received)} / ${formatBytesShort(activeDownload()!.total)}`
                                     : isDownloaded()
-                                      ? nativeInvoke() ? "Downloaded ✓ · Show in Finder" : "Downloaded ✓"
+                                      ? "Downloaded ✓"
                                       : "Download file"}
                               </span>
                             </button>

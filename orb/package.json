@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "tauri": "tauri",
     "test": "vitest run",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "build:desktop": "tauri build --bundles app -- --jobs 1"
   },
   "dependencies": {
     "katex": "^0.18.9",

@@ -115,3 +115,69 @@ it("shows one card when a harness failure is followed by the node's generic stat
   expect(errors).toHaveLength(1);
   expect(errors[0].kind === "error" && errors[0].text).toContain("Argument list too long");
 });
+
+it("collapses cancellation acknowledgements live and on replay without reporting failure", () => {
+  const request: StreamEvent = {type:"error",data:{message:"Parallel mission e0770656-1358-4fd9-b745-fdc9dd33d08a cancellation requested"}};
+  const events = [resume("cancel-test"), request, request, request];
+  const pending = buildTranscript(events);
+  const view = render(() => <Transcript items={pending} />);
+  expect(view.container.textContent).toContain("Stopping mission");
+  expect(view.container.textContent).not.toContain("Mission failed");
+  expect(pending.filter(item => item.kind === "error")).toHaveLength(1);
+  const final = applyStreamEvent(pending, cancelled(100));
+  expect(final).toEqual(buildTranscript([...events, cancelled(100)]));
+  const errors = final.filter(item => item.kind === "error");
+  expect(errors).toHaveLength(1);
+  expect(errors[0]).toMatchObject({text:"Cancelled",cancelled:true});
+});
+
+it("replaces an unknown error with the provider's concrete final failure", () => {
+  const items = buildTranscript([
+    resume("provider-test"),
+    {type:"error",data:{message:"Unknown error"}},
+    {type:"assistant_message",data:{success:false,content:"All providers in chain 'personal-argon' are currently in cooldown or unconfigured"}},
+  ]);
+  const errors = items.filter(item => item.kind === "error");
+  expect(errors).toHaveLength(1);
+  expect(errors[0].text).toContain("cooldown");
+});
+
+it("never renders a client_runner marker as the user-facing failure", async () => {
+  const {MissionFailure} = await import("../src/missionLaunch");
+  for (const props of [
+    {mission: {status: "failed", terminal_reason: "client_runner"}},
+    {mission: {status: "failed", status_message: "client_runner"}},
+    {mission: {status: "failed"}, error: "client_runner"},
+  ]) {
+    const {container, unmount} = render(() => <MissionFailure {...props as any} />);
+    expect(container.textContent).toContain("The local run stopped without a recorded error");
+    expect(container.textContent).not.toContain("client_runner");
+    unmount();
+  }
+});
+
+it("explains legacy client_runner errors restored in the transcript", () => {
+ const {container}=render(() => <Transcript items={[{kind:"error",key:"legacy",text:"client_runner"}]} />);
+ expect(container.querySelector('.error-notice-body > p')?.textContent).toContain('The local run stopped without a recorded error');
+});
+
+
+it("keeps one concrete provider failure when a generic error arrives late", () => {
+  const failure = "All 1 providers in chain 'personal-argon' are unavailable (server/network errors)";
+  const events: StreamEvent[] = [
+    resume("provider-late-test"),
+    {type:"error",data:{message:"Unknown error"}},
+    {type:"assistant_message",data:{success:false,content:failure}},
+    {type:"mission_status_changed",data:{status:"failed",summary:failure}},
+    {type:"error",data:{message:"Unknown error"}},
+  ];
+  let live = buildTranscript([]);
+  for (const event of events) live = applyStreamEvent(live, event);
+  expect(live).toEqual(buildTranscript(events));
+  expect(live.filter(item => item.kind === "error")).toHaveLength(1);
+  const {container} = render(() => <Transcript items={live} onResume={() => {}} />);
+  expect(container.querySelectorAll('.error-notice')).toHaveLength(1);
+  expect(container.textContent).toContain("The model provider is unavailable");
+  expect(container.textContent).not.toContain("Unknown error");
+  expect(container.textContent).toContain("Resume");
+});

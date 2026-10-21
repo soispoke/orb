@@ -15,6 +15,7 @@ import {
   type FileRef,
 } from "./fileResources";
 export interface ReferenceResolver {
+  enabled?: () => boolean;
   loadImage?: (path: string) => Promise<string | null>;
   resolve: (raw: string) => Promise<FileRef[]>;
   open: (refs: FileRef[]) => void;
@@ -47,7 +48,7 @@ export function FileReference(p: { raw: string; children?: JSX.Element }) {
   createEffect(() => {
     const raw = p.raw;
     setMatches([]);
-    if (!resolver || !visible() || !target()) return;
+    if (!resolver || resolver.enabled?.() === false || !visible() || !target()) return;
     let cancelled = false;
     void resolver
       .resolve(raw)

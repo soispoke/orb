@@ -1327,6 +1327,7 @@ struct AppServerEventTranslator {
     /// repeated `item/agentMessage/delta` events don't duplicate text into
     /// the mission stream beyond what each delta carries.
     delta_buffers: std::collections::HashMap<String, String>,
+    completed_text_items: std::collections::HashSet<String>,
     /// True once we've emitted a synthetic Usage event for the current turn,
     /// so we don't double-count when codex sends both turn-level and
     /// thread-level token deltas.
@@ -1425,12 +1426,14 @@ impl AppServerEventTranslator {
         }
         let id = item.get("id")?.as_str()?;
         let text = item.get("text")?.as_str()?;
-        if text.is_empty() || self.delta_buffers.get(id).is_some_and(|old| old == text) {
+        if text.is_empty() || !self.completed_text_items.insert(id.to_string()) {
             return None;
         }
         self.delta_buffers.insert(id.to_string(), text.to_string());
-        Some(ExecutionEvent::TextDelta {
+        Some(ExecutionEvent::TextSnapshot {
+            item_id: id.to_string(),
             content: text.to_string(),
+            done: true,
         })
     }
 
@@ -1521,11 +1524,16 @@ impl AppServerEventTranslator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("__anon")
                         .to_string();
-                    let entry = self.delta_buffers.entry(item_id).or_default();
+                    if self.completed_text_items.contains(&item_id) {
+                        return TranslateOutcome { events, terminal };
+                    }
+                    let entry = self.delta_buffers.entry(item_id.clone()).or_default();
                     // Agent-message deltas are incremental tokens.
                     fold_delta_into(entry, delta);
-                    events.push(ExecutionEvent::TextDelta {
+                    events.push(ExecutionEvent::TextSnapshot {
+                        item_id,
                         content: entry.clone(),
+                        done: false,
                     });
                 }
             }
@@ -1774,20 +1782,13 @@ impl AppServerEventTranslator {
             // ----- Turn lifecycle -----
             "turn/completed" => {
                 if let Some(turn) = params.get("turn") {
-                    // Only the last assistant item can supply the closing
-                    // response. Older partial snapshots must not replace a
-                    // final message that was already streamed.
-                    if let Some(item) =
-                        turn.get("items")
-                            .and_then(|v| v.as_array())
-                            .and_then(|items| {
-                                items.iter().rev().find(|item| {
-                                    item.get("type").and_then(|v| v.as_str())
-                                        == Some("agentMessage")
-                                })
-                            })
-                    {
-                        events.extend(self.completed_agent_message(item));
+                    // Finalize each identified item, including missing completion
+                    // notifications. Independent bubbles cannot overwrite each
+                    // other; native order still leaves the final answer last.
+                    if let Some(items) = turn.get("items").and_then(|v| v.as_array()) {
+                        for item in items {
+                            events.extend(self.completed_agent_message(item));
+                        }
                     }
                     let turn_id = turn
                         .get("id")
@@ -2288,7 +2289,7 @@ mod tests {
             assert!(end.terminal);
             events.extend(end.events);
             assert!(
-                matches!(events.as_slice(), [ExecutionEvent::TextDelta {content}] if content == "Final blocker evidence")
+                matches!(events.as_slice(), [ExecutionEvent::TextSnapshot {content, ..}] if content == "Final blocker evidence")
             );
         }
     }
@@ -2315,9 +2316,51 @@ mod tests {
             true,
         );
         assert!(
-            out.events.is_empty(),
-            "old commentary must not overwrite already streamed final text"
+            matches!(out.events.last(), Some(ExecutionEvent::TextSnapshot { item_id, content, done: true }) if item_id == "final" && content == "Final blocker evidence"),
+            "independent commentary must not replace the closing answer"
         );
+    }
+
+    #[test]
+    fn mixed_model_children_cannot_overwrite_or_complete_coordinator() {
+        for child_model in ["claude-opus", "gpt-6-sol", "gpt-6-astra", "unknown-model"] {
+            let mut translator = AppServerEventTranslator {
+                native_thread_id: Some("coordinator".into()),
+                ..Default::default()
+            };
+            for method in [
+                "item/agentMessage/delta",
+                "item/completed",
+                "turn/completed",
+                "error",
+                "thread/goal/updated",
+            ] {
+                let output = translator.handle_notification(
+                    method,
+                    &json!({
+                        "threadId":"child", "model":child_model,
+                        "itemId":"reply", "delta":"Child reply",
+                        "item":{"id":"reply","type":"agentMessage","text":"Child reply"},
+                        "turn":{"status":"completed"},
+                        "goal":{"status":"blocked","objective":"child only"},
+                        "error":{"message":"Child failure"}
+                    }),
+                    true,
+                );
+                assert!(output.events.is_empty(), "{child_model}: {method}");
+                assert!(!output.terminal, "{child_model}: {method}");
+            }
+            let parent = translator.handle_notification(
+                "item/agentMessage/delta",
+                &json!({
+                    "threadId":"coordinator", "itemId":"reply", "delta":"Coordinator status"
+                }),
+                true,
+            );
+            assert!(parent.events.iter().any(|event| matches!(event,
+                ExecutionEvent::TextSnapshot { content, .. } if content == "Coordinator status")));
+            assert!(!parent.terminal);
+        }
     }
 
     #[test]
@@ -2376,7 +2419,7 @@ mod tests {
                 );
                 assert!(!text.terminal);
                 assert!(
-                    matches!(text.events.as_slice(), [ExecutionEvent::TextDelta {content}] if content == "blocked evidence")
+                    matches!(text.events.as_slice(), [ExecutionEvent::TextSnapshot {content, ..}] if content == "blocked evidence")
                 );
                 let end = t.handle_notification(
                     "turn/completed",
@@ -2494,7 +2537,7 @@ mod tests {
         assert!(!text.terminal);
         assert!(text.events.iter().any(|event| matches!(
             event,
-            ExecutionEvent::TextDelta { content } if content == "FINAL_RESPONSE_DEBUG_OK"
+            ExecutionEvent::TextSnapshot { content, .. } if content == "FINAL_RESPONSE_DEBUG_OK"
         )));
 
         let turn_completed = translator.handle_notification(
@@ -2883,5 +2926,27 @@ mod native_plan_integration {
         outcome.unwrap();
         assert!(approved && questions > 0 && completed);
         assert!(dir.join("hello.txt").exists());
+    }
+    #[test]
+    fn native_text_completion_is_not_lost_when_final_matches_last_delta() {
+        use serde_json::json;
+        let mut t = AppServerEventTranslator::default();
+        let delta = t.handle_notification(
+            "item/agentMessage/delta",
+            &json!({"itemId":"a", "delta":"Exact reply"}),
+            false,
+        );
+        assert!(
+            matches!(&delta.events[0], ExecutionEvent::TextSnapshot {item_id, done:false, ..} if item_id == "a")
+        );
+        let item = json!({"id":"a", "type":"agentMessage", "text":"Exact reply"});
+        let final_event = t.completed_agent_message(&item).unwrap();
+        assert!(matches!(
+            final_event,
+            ExecutionEvent::TextSnapshot { done: true, .. }
+        ));
+        assert!(t.completed_agent_message(&item).is_none());
+        let other = json!({"id":"b", "type":"agentMessage", "text":"Exact reply"});
+        assert!(t.completed_agent_message(&other).is_some());
     }
 }

@@ -6,6 +6,9 @@
 //! OpenCode: `opencode run --format json`, `--session ses_*` or `--continue`.
 //! Grok: `grok -p --output-format streaming-json`, with native `--resume`.
 
+#[path = "../../../shared/claude_stream_scope.rs"]
+mod claude_stream_scope;
+
 use crate::local_stream::{Event as OutputEvent, Output};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,20 @@ const HARNESSES: &[(&str, &str)] = &[
     ("antigravity", "agy"),
     ("vibe", "vibe-acp"),
 ];
+
+#[cfg_attr(not(unix), tauri::command)]
+pub fn local_agents_input_status(id: String) -> Value {
+    json!({"token":crate::live_input::token(&id)})
+}
+#[cfg_attr(not(unix), tauri::command)]
+pub fn local_agents_steer(
+    id: String,
+    token: String,
+    message_id: String,
+    text: String,
+) -> Result<crate::live_input::Receipt, String> {
+    crate::live_input::deliver(&id, &token, &message_id, &text)
+}
 
 #[tauri::command]
 pub fn local_agents_cyber_capabilities() -> u32 {
@@ -326,6 +343,16 @@ pub(crate) fn start_with_env_fenced(
     env: &[(String, String)],
     expected_stop: Option<u64>,
 ) -> Result<(), String> {
+    let bindings = crate::local_bindings(None, None)?;
+    start_with_bindings(request, env, expected_stop, &bindings)
+}
+
+fn start_with_bindings(
+    request: StartRequest,
+    env: &[(String, String)],
+    expected_stop: Option<u64>,
+    bindings: &Value,
+) -> Result<(), String> {
     let fence = launch_fence(&request.id);
     let generation = fence.lock().map_err(|e| e.to_string())?;
     if expected_stop.is_some_and(|expected| expected != *generation) {
@@ -353,6 +380,7 @@ pub(crate) fn start_with_env_fenced(
     }
     let software_execution =
         crate::agent_software::begin(&request.id, &request.harness, Some(&bin))?;
+    let share_folder = crate::local_workspaces::binding_shares(&bindings[&request.id], &cwd);
     let mut map = runs().lock().map_err(|e| e.to_string())?;
     if let Some(previous) = map.get(&request.id) {
         if !previous.done.load(Ordering::SeqCst) {
@@ -365,14 +393,17 @@ pub(crate) fn start_with_env_fenced(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if map.iter().any(|(id, run)| {
-        id != &request.id
-            && shared_parent != Some(id.as_str())
-            && run.shared_cwd_with.as_deref() != Some(request.id.as_str())
-            && (shared_parent.is_none() || run.shared_cwd_with.as_deref() != shared_parent)
-            && !run.done.load(Ordering::SeqCst)
-            && run.cwd.canonicalize().ok().as_ref() == Some(&canonical_cwd)
-    }) {
+    if !share_folder
+        && map.iter().any(|(id, run)| {
+            !crate::local_workspaces::binding_shares(&bindings[id], &canonical_cwd)
+                && id != &request.id
+                && shared_parent != Some(id.as_str())
+                && run.shared_cwd_with.as_deref() != Some(request.id.as_str())
+                && (shared_parent.is_none() || run.shared_cwd_with.as_deref() != shared_parent)
+                && !run.done.load(Ordering::SeqCst)
+                && run.cwd.canonicalize().ok().as_ref() == Some(&canonical_cwd)
+        })
+    {
         return Err(DIRECTORY_BUSY.into());
     }
     // Completed handles are retained for reconnect snapshots until the next turn.
@@ -417,7 +448,7 @@ pub(crate) fn start_with_env_fenced(
         software_execution,
         interaction,
         run.clone(),
-        request.harness == "antigravity",
+        &request.harness,
     );
     map.insert(request.id, run);
     Ok(())
@@ -427,8 +458,18 @@ fn watch_exit(
     software_execution: crate::agent_software::Execution,
     mission_id: crate::interactions::Session,
     run: Run,
-    strict_terminal: bool,
+    harness: &str,
 ) {
+    let strict_terminal = harness == "antigravity";
+    let label = match harness {
+        "claudecode" => "Claude",
+        "grok" => "Grok",
+        "opencode" => "OpenCode",
+        "codex" => "Codex",
+        "antigravity" => "Antigravity",
+        "vibe" => "Vibe",
+        _ => "Agent",
+    };
     let Run {
         child,
         done,
@@ -476,6 +517,18 @@ fn watch_exit(
             *slot = status.and_then(|status| status.code());
         }
         output.wait_drained(None);
+        // stderr is diagnostic, not an outcome. Claude emits informational
+        // gateway/connector notices here even after a successful native result.
+        if *exit_code.lock().unwrap() != Some(0) {
+            if let Some(diagnostic) = output.diagnostic() {
+                let mut slot = error.lock().unwrap();
+                if slot.is_none()
+                    || slot.as_deref() == Some("Claude stopped without a final result")
+                {
+                    *slot = Some(format!("{label} process failed: {diagnostic}"));
+                }
+            }
+        }
         if strict_terminal {
             let failed = error.lock().is_ok_and(|error| error.is_some());
             if let Ok(mut slot) = exit_code.lock() {
@@ -501,7 +554,7 @@ fn watch_exit(
     });
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_agents_poll(id: String) -> Result<PollState, String> {
     poll_generation(&id, None)
 }
@@ -533,8 +586,17 @@ pub fn poll_generation(id: &str, expected: Option<&str>) -> Result<PollState, St
     Ok(snapshot)
 }
 
+/// Read-only diagnostic sampling. Never attach a process or clone its transcript.
+pub fn agent_observation_snapshot(id: &str, generation: &str) -> Result<(bool, Vec<crate::local_origin_wire::AgentStatus>, usize), String> {
+    let map = runs().lock().map_err(|e| e.to_string())?;
+    let run = map.get(id).ok_or("No local run")?;
+    if run.generation != generation { return Err("Local execution generation changed".into()); }
+    let (agents, omitted) = run.text.observe_activities(crate::agent_observation::summarize);
+    Ok((run.done.load(Ordering::SeqCst), agents, omitted))
+}
+
 /// Subscribe atomically with the snapshot so startup text cannot be missed.
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_agents_subscribe(
     id: String,
     on_event: tauri::ipc::Channel<OutputEvent>,
@@ -552,7 +614,7 @@ pub fn local_agents_subscribe(
     run.text.subscribe(on_event)
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_agents_unsubscribe(id: String, token: u64) -> Result<(), String> {
     if let Some(run) = runs().lock().map_err(|e| e.to_string())?.get(&id) {
         run.text.unsubscribe(token);
@@ -560,7 +622,7 @@ pub fn local_agents_unsubscribe(id: String, token: u64) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(unix), tauri::command)]
 pub fn local_agents_stop(id: String) -> Result<(), String> {
     let fence = launch_fence(&id);
     let mut generation = fence.lock().map_err(|e| e.to_string())?;
@@ -966,15 +1028,16 @@ fn spawn_harness(
             session_id,
             env,
         ),
-        "opencode" => spawn_piped(
-            request,
-            opencode_args(request),
-            text,
-            error,
-            true,
-            session_id,
-            env,
-        ),
+        "opencode" => {
+            let version = crate::agent_software::version(Path::new(&request.bin));
+            let mut args = opencode_args(request);
+            if opencode_needs_standalone(version.as_deref()) {
+                // The shared 2.x service does not inherit this mission's routing
+                // credentials/configuration. Keep its server in our process group.
+                args.insert(1, "--standalone".into());
+            }
+            spawn_piped(request, args, text, error, true, session_id, env)
+        }
         other => Err(format!("unknown local harness {other}")),
     }
 }
@@ -1292,14 +1355,16 @@ fn grok_args(request: &StartRequest) -> Vec<String> {
     args
 }
 
+fn opencode_needs_standalone(version: Option<&str>) -> bool {
+    version
+        .and_then(crate::agent_software::numeric_version)
+        .and_then(|v| v.split('.').next()?.parse::<u64>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
 fn opencode_args(request: &StartRequest) -> Vec<String> {
-    let mut args = vec![
-        "run".into(),
-        "--format".into(),
-        "json".into(),
-        "--dir".into(),
-        request.cwd.clone(),
-    ];
+    // spawn_piped sets the process cwd. OpenCode 2.x does not accept --dir.
+    let mut args = vec!["run".into(), "--format".into(), "json".into()];
     if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
         args.push("--model".into());
         // Backend aliases need their configured OpenCode provider namespace.
@@ -1391,6 +1456,23 @@ fn mission_command(request: &StartRequest, env: &[(String, String)]) -> Command 
     } else {
         harness_command(&request.bin)
     };
+    if request.harness == "claudecode"
+        && env
+            .iter()
+            .any(|(key, value)| key == "ORB_CLAUDE_CORE_ROUTING" && value == "1")
+    {
+        // Explicit routing must win over credentials/cloud selectors inherited
+        // from the desktop's shell. Never edit the user's stored CLI login.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            command.env_remove(name);
+        }
+    }
     command.envs(env.iter().map(|(key, value)| (key, value)));
     command
 }
@@ -1423,6 +1505,9 @@ fn spawn_claude(
     cmd.args([
         "--input-format",
         "stream-json",
+        "--replay-user-messages",
+        "--append-system-prompt",
+        crate::live_input::claude_followup::INSTRUCTIONS,
         "--permission-prompt-tool",
         "stdio",
     ]);
@@ -1439,6 +1524,12 @@ fn spawn_claude(
             "--verbose",
             "--include-partial-messages",
         ]);
+    if let Some(effort) = request.effort.as_deref().filter(|e| !e.is_empty()) {
+        cmd.arg("--effort").arg(effort);
+    }
+    // Explicitly clear workflows when moving back to a normal effort level.
+    cmd.arg("--settings")
+        .arg(json!({"ultracode": request.effort.as_deref() == Some("ultracode")}).to_string());
     if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
         let bare = model.strip_prefix("anthropic/").unwrap_or(model);
         cmd.arg("--model").arg(bare);
@@ -1460,9 +1551,9 @@ fn spawn_claude(
         .spawn()
         .map_err(|e| format!("failed to start Claude Code: {e}"))?;
     {
-        let stdin = Arc::new(Mutex::new(
+        let stdin = Arc::new(Mutex::new(crate::live_input::SharedWriter::new(
             child.stdin.take().ok_or("Claude stdin missing")?,
-        ));
+        )));
         let stdout = child.stdout.take().ok_or("Claude stdout missing")?;
         let recheck = Arc::new(Recheck::default());
         {
@@ -1471,6 +1562,7 @@ fn spawn_claude(
             let delays = recheck_delays(&request.id);
             thread::spawn(move || recheck.run(&stdin, &delays));
         }
+        let quota_id = request.id.clone();
         let mission_id = crate::interactions::session(&request.id);
         let resumed = request.session_id.as_deref().is_some_and(|s| !s.is_empty());
         let wakeup_command = crate::local_wakeups::command(&request.id);
@@ -1496,11 +1588,17 @@ fn spawn_claude(
                     json!({"type":"control_request","request_id":"orb-init","request":{"subtype":"initialize"}}),
                 )?;
                 say(&prompt)?;
+                let live = Arc::new(crate::live_input::ClaudeInput::default());
+                let _live = crate::live_input::register(
+                    &quota_id,
+                    live.sender(stdin.lock().unwrap().clone()),
+                );
                 let mut implement_after_result = false;
                 let mut claude_text = ClaudeText::default();
                 let mut background = ClaudeBackground::default();
                 let mut request_started = false;
                 let mut stale_result_skipped = false;
+                let mut completed = false;
                 // The turn gave its result and only background tasks remain.
                 let mut answered = false;
                 let mut wakeups: HashMap<String, Value> = HashMap::new();
@@ -1509,6 +1607,14 @@ fn spawn_claude(
                     let Ok(event) = serde_json::from_str::<Value>(&line) else {
                         continue;
                     };
+                    // Activity has its own task IDs; a nested reply must not
+                    // alter the coordinator's text, waiting or result state.
+                    if claude_stream_scope::is_child_message(&event) {
+                        output.claude_activity(&event);
+                        output.publish_activities();
+                        continue;
+                    }
+                    live.consume(&event);
                     if let Some(blocks) = event["message"]["content"].as_array() {
                         for block in blocks {
                             if event["type"] == "assistant"
@@ -1646,15 +1752,32 @@ fn spawn_claude(
                             stale_result_skipped = true;
                             continue;
                         }
-                        if let Some(piece) = claude_text.consume(&event) {
-                            output.append(&piece);
+                        if let Some(message) = claude_quota_result(&event) {
+                            if let Some((delay, label)) =
+                                claude_quota_delay(&message, chrono::Utc::now())
+                            {
+                                output.waiting_on_background(false);
+                                output.claude_quota_wait(Some(&label));
+                                recheck.quota(quota_wait_delay(&quota_id, delay));
+                                continue;
+                            }
                         }
-                        if event["is_error"] == true {
+                        if event["is_error"] == true || event["subtype"] == "error" {
                             return Err(event["result"]
                                 .as_str()
                                 .unwrap_or("Claude ended with an error")
                                 .to_owned());
                         }
+                        if let Some(piece) = claude_text.consume(&event) {
+                            output.append(&piece);
+                        }
+                        // A background notification may finish while quota is
+                        // exhausted; it must not cancel the pending continuation.
+                        if recheck.quota_pending() {
+                            continue;
+                        }
+                        output.claude_quota_wait(None);
+                        live.result();
                         // A result ends one turn, not the session: background agents
                         // can trigger more turns and permission requests afterwards.
                         if background.running() {
@@ -1676,12 +1799,20 @@ fn spawn_claude(
                             say("Implement the approved plan.")?;
                             continue;
                         }
+                        if !live.close_if_idle() {
+                            continue;
+                        }
+                        completed = true;
                         break;
                     } else if let Some(piece) = claude_text.consume(&event) {
                         output.append(&piece);
                     }
                 }
-                Ok(())
+                if completed {
+                    Ok(())
+                } else {
+                    Err("Claude stopped without a final result".into())
+                }
             })();
             recheck.close();
             crate::interactions::finish(&mission_id);
@@ -1689,7 +1820,19 @@ fn spawn_claude(
                 *failures.lock().unwrap() = Some(e);
             }
         });
-        pipe_output(None, child.stderr.take(), text, error, true, None, None);
+        if let Some(stderr) = child.stderr.take() {
+            let output = Arc::clone(text);
+            let guard = output.reader();
+            thread::spawn(move || {
+                let _guard = guard;
+                // Drain the entire pipe, retaining only a bounded prefix. Never
+                // publish diagnostic text as an assistant reply or a live error.
+                let clean = drain_diagnostic(BufReader::new(stderr));
+                if !clean.trim().is_empty() {
+                    output.set_diagnostic(clean.trim().chars().take(1000).collect());
+                }
+            });
+        }
         return Ok(child);
     }
 }
@@ -1712,6 +1855,23 @@ fn spawn_piped(
     if request.harness == "opencode" {
         command.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
     }
+    if request.harness == "claudecode"
+        && env
+            .iter()
+            .any(|(key, value)| key == "ORB_CLAUDE_CORE_ROUTING" && value == "1")
+    {
+        // Explicit routing must win over credentials/cloud selectors inherited
+        // from the desktop's shell. Never edit the user's stored CLI login.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            command.env_remove(name);
+        }
+    }
     command.envs(env.iter().map(|(key, value)| (key, value)));
     if request.harness == "opencode" {
         if let Some(wake_command) = crate::local_wakeups::command(&request.id) {
@@ -1729,6 +1889,8 @@ fn spawn_piped(
         }
     }
     command.env("NO_COLOR", "1");
+    // OpenCode 2 uses PWD to select its workspace; current_dir alone is insufficient.
+    command.env("PWD", &request.cwd);
     let mut child = command
         .current_dir(&request.cwd)
         .args(&args)
@@ -1800,6 +1962,20 @@ fn strip_terminal_codes(text: &str) -> String {
     result
 }
 
+const DIAGNOSTIC_PREFIX_BYTES: u64 = 16 * 1024;
+
+/// Retain only a diagnostic prefix, but consume the whole pipe so a verbose
+/// child can still finish. In particular, never hold its lifetime stderr in RAM.
+fn drain_diagnostic(mut reader: impl Read) -> String {
+    let mut prefix = Vec::new();
+    let _ = reader
+        .by_ref()
+        .take(DIAGNOSTIC_PREFIX_BYTES)
+        .read_to_end(&mut prefix);
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    strip_terminal_codes(&String::from_utf8_lossy(&prefix))
+}
+
 fn opencode_final_answer(value: &Value) -> Option<String> {
     let messages = value["messages"].as_array()?;
     let start = messages.iter().rposition(|m| m["info"]["role"] == "user")?;
@@ -1827,7 +2003,6 @@ fn pipe_output(
     recovery: Option<(String, String)>,
 ) {
     let text_out = Arc::clone(text);
-    let error_out = Arc::clone(error);
     let protocol_error = Arc::clone(error);
     if let Some(stdout) = stdout {
         let guard = text.reader();
@@ -1920,19 +2095,16 @@ fn pipe_output(
         });
     }
     if let Some(stderr) = stderr {
+        let output = Arc::clone(text);
         let guard = text.reader();
         thread::spawn(move || {
             let _guard = guard;
-            let mut buf = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut buf);
-            let clean = strip_terminal_codes(&buf);
+            let clean = drain_diagnostic(BufReader::new(stderr));
             let trimmed = clean.trim();
             if !trimmed.is_empty() {
-                if let Ok(mut slot) = error_out.lock() {
-                    if slot.is_none() {
-                        *slot = Some(trimmed.chars().take(500).collect());
-                    }
-                }
+                // Native retries can log errors before a successful result.
+                // Only the exit watcher may promote diagnostics to a failure.
+                output.set_diagnostic(trimmed.chars().take(1000).collect());
             }
         });
     }
@@ -1989,7 +2161,8 @@ fn spawn_codex(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start Codex: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("codex stdin missing")?;
+    let mut stdin =
+        crate::live_input::SharedWriter::new(child.stdin.take().ok_or("codex stdin missing")?);
     let stdout = child.stdout.take().ok_or("codex stdout missing")?;
     let stderr = child.stderr.take();
     let prompt = request.prompt.clone();
@@ -2017,7 +2190,9 @@ fn spawn_codex(
     thread::spawn(move || {
         let _guard = guard;
         let mut reader = BufReader::new(stdout);
-        let result = drive_codex(
+        let live_writer = stdin.clone();
+        let result = drive_codex_live(
+            Some(live_writer),
             &mut stdin,
             &mut reader,
             &prompt,
@@ -2078,6 +2253,38 @@ fn codex_goal_objective(objective: &str, cwd: &str) -> Result<String, String> {
 }
 
 fn drive_codex(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    prompt: &str,
+    image_paths: &[String],
+    model: Option<&str>,
+    cyber_access: crate::cyber_access::Mode,
+    service_tier: crate::codex_speed::Tier,
+    cwd: &str,
+    resume: Option<&str>,
+    text: &Output,
+    session_out: &Mutex<Option<String>>,
+    mission_id: &crate::interactions::Session,
+) -> Result<(), String> {
+    drive_codex_live(
+        None,
+        stdin,
+        reader,
+        prompt,
+        image_paths,
+        model,
+        cyber_access,
+        service_tier,
+        cwd,
+        resume,
+        text,
+        session_out,
+        mission_id,
+    )
+}
+
+fn drive_codex_live(
+    live_writer: Option<crate::live_input::SharedWriter>,
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
     prompt: &str,
@@ -2195,6 +2402,7 @@ fn drive_codex(
             .map(|path| json!({"type":"localImage", "path":path})),
     );
     let mut pending = Vec::new();
+    let mut initial_turn = None;
     if let Some(objective) = goal_objective {
         if !image_paths.is_empty() {
             return Err("Goal launches with images are not supported yet; include file paths in the objective.".into());
@@ -2221,7 +2429,7 @@ fn drive_codex(
                 return Err("unsupported_access_program: choose Automatic explicitly to resume a native goal.".into());
             }
         }
-        let _ = rpc_collect(
+        let started_turn = rpc_collect(
             stdin,
             reader,
             "turn/start",
@@ -2234,7 +2442,19 @@ fn drive_codex(
             }),
             &mut pending,
         )?;
+        initial_turn = started_turn
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
+    let live = Arc::new(crate::live_input::CodexInput::default());
+    *live.turn.lock().unwrap() = initial_turn;
+    let _registration = live_writer.map(|writer| {
+        crate::live_input::register(
+            &mission_id.mission,
+            live.sender(writer, thread_id.to_string()),
+        )
+    });
     let mut pending: std::collections::VecDeque<Value> = pending.into();
     let mut items = crate::local_stream::CodexText::default();
     let mut line = String::new();
@@ -2260,6 +2480,9 @@ fn drive_codex(
             .and_then(Value::as_str)
             .is_some_and(|id| id != thread_id)
         {
+            continue;
+        }
+        if live.consume(&value) {
             continue;
         }
         if let Some(message) = value
@@ -2415,10 +2638,10 @@ fn rpc_collect(
 }
 
 fn write_line(stdin: &mut impl Write, line: &str) -> Result<(), String> {
+    let frame = format!("{line}\n");
     stdin
-        .write_all(line.as_bytes())
+        .write_all(frame.as_bytes())
         .map_err(|e| e.to_string())?;
-    stdin.write_all(b"\n").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())
 }
 
@@ -2570,6 +2793,12 @@ impl ClaudeBackground {
                     self.tasks = tasks
                         .iter()
                         .filter(|t| t["ambient"] != true)
+                        .filter(|t| {
+                            !matches!(
+                                t["status"].as_str(),
+                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
+                            )
+                        })
                         .filter_map(|t| {
                             let id = t["task_id"].as_str()?;
                             Some((id.into(), BackgroundTask::new(id, t, self.tasks.get(id))))
@@ -2586,7 +2815,12 @@ impl ClaudeBackground {
                     }
                 }
             }
-            Some("task_notification") if !self.has_snapshot => {
+            Some("task_notification")
+                if !self.has_snapshot
+                    && !event["summary"].as_str().is_some_and(|s| {
+                        crate::local_stream::claude_task_status::session_end_notice(s).is_some()
+                    }) =>
+            {
                 if let Some(id) = event["task_id"].as_str() {
                     self.tasks.remove(id);
                 }
@@ -2643,12 +2877,69 @@ fn background_question(title: &str, tasks: &[BackgroundTask]) -> String {
     let list: Vec<_> = tasks.iter().map(BackgroundTask::describe).collect();
     format!(
         "[Automatic check from Orb, not a message from the user]\n{title}\n{}\n\n\
-         The conversation stays busy until every one of them exits. Keep a task only if you \
-         wait for its result and it can still finish: you are woken when it exits. Stop with \
-         TaskStop each task that is stuck, that loops without a way to end, or whose result \
-         you no longer need. Do not start new work. Reply in one short sentence.",
+         Check status and saved results without changing task execution. A quiet, stopped, \
+         memory-paused or long-running task is not evidence of failure. Do not stop, kill, \
+         restart or resume any task because of this automatic check. Do not start new work. \
+         Report uncertainty honestly. Reply in one short sentence.",
         list.join("\n")
     )
+}
+
+// Claude sometimes reports a quota notice as a successful result. Only
+// recognize a standalone provider notice there, not prose quoting an error.
+fn claude_quota_result(event: &Value) -> Option<String> {
+    if event["type"] != "result" {
+        return None;
+    }
+    let message = event["result"].as_str().map(str::to_owned).or_else(|| {
+        event["errors"].as_array().map(|errors| {
+            errors
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    })?;
+    let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
+    let explicit = event["is_error"] == true
+        || event["subtype"] == "error"
+        || [
+            "you've hit your ",
+            "you have hit your ",
+            "you're out of ",
+            "you are out of ",
+            "api error:",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    (explicit && crate::account_limits::is_usage_limit_message(&message)).then_some(message)
+}
+
+fn quota_wait_delay(_id: &str, delay: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(delay) = tests::quota_delays().lock().unwrap().get(_id) {
+        return *delay;
+    }
+    delay
+}
+
+/// Only provider usage exhaustion is retried here, never authentication or
+/// safeguard failures. A stale/reset-less reply gets a bounded backoff.
+fn claude_quota_delay(
+    message: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(Duration, String)> {
+    if !crate::account_limits::is_usage_limit_message(message) {
+        return None;
+    }
+    let zone = crate::account_limits::Zone::system();
+    let reset = crate::account_limits::limit_reset(message, now, zone);
+    let seconds = (reset.at - now).num_seconds().saturating_add(5).max(60);
+    let at = now + chrono::Duration::seconds(seconds);
+    Some((
+        Duration::from_secs(seconds as u64),
+        crate::account_limits::format_reset(at, zone),
+    ))
 }
 
 /// Asks the agent again about background tasks it has waited on for long.
@@ -2659,10 +2950,23 @@ struct RecheckState {
     waiting: Option<(Instant, Vec<BackgroundTask>)>,
     asked: usize,
     closed: bool,
+    quota: Option<Instant>,
 }
 impl Recheck {
+    fn quota(&self, delay: Duration) {
+        let mut state = self.0.lock().unwrap();
+        state.waiting = None;
+        state.quota = Some(Instant::now() + delay);
+        self.1.notify_all();
+    }
+    fn quota_pending(&self) -> bool {
+        self.0.lock().unwrap().quota.is_some()
+    }
     fn waiting(&self, tasks: Option<Vec<BackgroundTask>>) {
         let mut state = self.0.lock().unwrap();
+        if state.quota.is_some() {
+            return;
+        }
         let since = state.waiting.as_ref().map(|(since, _)| *since);
         if tasks.is_none() && since.is_none() {
             return;
@@ -2686,9 +2990,25 @@ impl Recheck {
         self.0.lock().unwrap().closed = true;
         self.1.notify_all();
     }
-    fn run(&self, stdin: &Mutex<std::process::ChildStdin>, delays: &[Duration]) {
+    fn run(&self, stdin: &Mutex<impl Write>, delays: &[Duration]) {
         let mut state = self.0.lock().unwrap();
         while !state.closed {
+            if let Some(until) = state.quota {
+                let left = until.saturating_duration_since(Instant::now());
+                if !left.is_zero() {
+                    state = self.1.wait_timeout(state, left).unwrap().0;
+                    continue;
+                }
+                state.quota = None;
+                drop(state);
+                let line = json!({"type":"user","message":{"role":"user","content":
+                    "[Automatic continuation after the Claude quota wait] Continue the existing task from its saved state. Check running tasks and saved results first; do not restart builds or redo completed work."}});
+                if write_line(&mut *stdin.lock().unwrap(), &line.to_string()).is_err() {
+                    return;
+                }
+                state = self.0.lock().unwrap();
+                continue;
+            }
             let Some((since, _)) = &state.waiting else {
                 state = self.1.wait(state).unwrap();
                 continue;
@@ -2724,10 +3044,22 @@ struct ClaudeText {
     boundary: bool,
     message_emitted: bool,
     message_id: Option<String>,
+    // A proxy may give the stream and its final snapshot different IDs.
+    // Reconcile only within this protocol message, never deduplicate prose
+    // across separate messages (where repetition can be intentional).
+    streamed_text: String,
+    snapshot_pending: bool,
 }
 
 impl ClaudeText {
     fn consume(&mut self, value: &Value) -> Option<String> {
+        // Nested agents share stdout but are not the parent reply. Filter before
+        // touching message boundaries or snapshot state, otherwise a child's
+        // message_start can splice its prose into an unfinished parent sentence.
+        // Their activity still flows through the separate activity tracker.
+        if claude_stream_scope::is_child_message(value) {
+            return None;
+        }
         if value["type"] == "result" && value["is_error"] != true && !self.emitted {
             let text = value["result"]
                 .as_str()
@@ -2740,6 +3072,32 @@ impl ClaudeText {
         } else {
             value["event"]["message"]["id"].as_str()
         };
+        let snapshot = (value["type"] == "assistant").then(|| {
+            value["message"]["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|block| block["type"] == "text")
+                        .filter_map(|block| block["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default()
+        });
+        if let Some(snapshot) = snapshot
+            .as_deref()
+            .filter(|_| self.snapshot_pending && !self.streamed_text.is_empty())
+        {
+            if let Some(tail) = snapshot.strip_prefix(&self.streamed_text) {
+                let tail = tail.to_owned();
+                self.snapshot_pending = false;
+                self.message_id = id.map(str::to_owned);
+                self.message_emitted = true;
+                self.boundary = false;
+                return (!tail.is_empty()).then_some(tail);
+            }
+        }
         if let Some(id) = id {
             if self.message_id.as_deref() != Some(id) {
                 self.message_id = Some(id.to_owned());
@@ -2747,13 +3105,7 @@ impl ClaudeText {
             }
         }
         if value["type"] == "assistant" && !self.message_emitted {
-            let text = value["message"]["content"]
-                .as_array()?
-                .iter()
-                .filter(|block| block["type"] == "text")
-                .filter_map(|block| block["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let text = snapshot?;
             if text.is_empty() {
                 return None;
             }
@@ -2775,6 +3127,8 @@ impl ClaudeText {
             Some("message_start") => {
                 self.boundary = self.emitted;
                 self.message_emitted = false;
+                self.streamed_text.clear();
+                self.snapshot_pending = true;
             }
             Some("content_block_start") if event["content_block"]["type"] == "text" => {
                 self.boundary = self.emitted;
@@ -2788,6 +3142,11 @@ impl ClaudeText {
         if text.is_empty() {
             return None;
         }
+        if self.boundary && !self.streamed_text.is_empty() {
+            self.streamed_text.push_str("\n\n");
+        }
+        self.streamed_text.push_str(text);
+        self.snapshot_pending = true;
         let result = if self.boundary {
             format!("\n\n{text}")
         } else {
@@ -3025,6 +3384,63 @@ pub(crate) fn is_secret_path(rel: &str) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn diagnostic_capture_is_bounded_and_drains_invalid_utf8() {
+        use super::*;
+        let mut input = std::io::Cursor::new(b"\x1b[31mfailed\x1b[0m\xff".to_vec())
+            .chain(std::io::repeat(b'x').take(32 * 1024 * 1024));
+        let diagnostic = drain_diagnostic(&mut input);
+        assert!(diagnostic.starts_with("failed\u{fffd}"));
+        assert!(diagnostic.len() <= DIAGNOSTIC_PREFIX_BYTES as usize + 2);
+        assert_eq!(
+            input.read(&mut [0]).unwrap(),
+            0,
+            "must drain beyond the retained prefix"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_capture_releases_verbose_child_without_stopping_it() {
+        use super::*;
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "printf 'diagnostic\\n' >&2; head -c 2097152 /dev/zero >&2; printf 'finished'",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let reader = thread::spawn(move || drain_diagnostic(stderr));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("diagnostic reader blocked its own fixture child");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+        let captured = reader.join().unwrap();
+        assert!(captured.starts_with("diagnostic\n"));
+        assert_eq!(captured.len(), DIAGNOSTIC_PREFIX_BYTES as usize);
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(stdout, "finished");
+    }
+
+    #[test]
     fn codex_speed_requires_account_capability_and_an_unambiguous_plan() {
         use serde_json::json;
         let catalog = json!({"data":[{"id":"gpt-6.1-sol","serviceTiers":[{"id":"priority"},{"id":"ultrafast"}]}]});
@@ -3234,6 +3650,72 @@ mod tests {
     }
 
     #[test]
+    fn claude_child_stream_cannot_splice_or_reset_parent_reply() {
+        let mut text = ClaudeText::default();
+        let mut output = String::new();
+        for event in [
+            json!({"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"parent"}}}),
+            json!({"type":"stream_event","parent_tool_use_id":null,"event":{"delta":{"type":"text_delta","text":"The lower"}}}),
+            json!({"type":"stream_event","parent_tool_use_id":"child-task","event":{"type":"message_start","message":{"id":"child"}}}),
+            json!({"type":"stream_event","parent_tool_use_id":"child-task","event":{"delta":{"type":"text_delta","text":"I will edit a different file."}}}),
+            json!({"type":"assistant","parent_tool_use_id":"child-task","message":{"id":"child-final","content":[{"type":"text","text":"I will edit a different file."}]}}),
+            json!({"type":"stream_event","event":{"delta":{"type":"text_delta","text":"-family helper is running."}}}),
+            json!({"type":"assistant","message":{"id":"parent-final","content":[{"type":"text","text":"The lower-family helper is running."}]}}),
+        ] {
+            if let Some(piece) = text.consume(&event) {
+                output.push_str(&piece);
+            }
+        }
+        assert_eq!(output, "The lower-family helper is running.");
+        // A child's final result cannot become the fallback parent answer either.
+        let mut empty = ClaudeText::default();
+        assert!(empty
+            .consume(
+                &json!({"type":"result","parent_tool_use_id":"child-task","result":"Child result"})
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn claude_stream_snapshot_id_change_does_not_repeat_the_reply() {
+        let mut text = ClaudeText::default();
+        let mut output = String::new();
+        for event in [
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"transport-id"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"}}}),
+            json!({"type":"stream_event","event":{"delta":{"type":"text_delta","text":"Status paragraph."}}}),
+            json!({"type":"assistant","message":{"id":"persisted-id","content":[{"type":"text","text":"Status paragraph."}]}}),
+        ] {
+            if let Some(piece) = text.consume(&event) {
+                output.push_str(&piece);
+            }
+        }
+        assert_eq!(output, "Status paragraph.");
+        // Identical prose in a genuinely new message must still be retained.
+        text.consume(&json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"next"}}}));
+        assert_eq!(text.consume(&json!({"type":"assistant","message":{"id":"next","content":[{"type":"text","text":"Status paragraph."}]}})).as_deref(), Some("\n\nStatus paragraph."));
+    }
+
+    #[test]
+    fn claude_stream_snapshot_recovers_only_missing_suffix_across_text_blocks() {
+        let mut text = ClaudeText::default();
+        let mut output = String::new();
+        for event in [
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"transport"}}}),
+            json!({"type":"stream_event","event":{"delta":{"type":"text_delta","text":"First"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"}}}),
+            json!({"type":"stream_event","event":{"delta":{"type":"text_delta","text":"Sec"}}}),
+            json!({"type":"assistant","message":{"id":"stored","content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}}),
+            json!({"type":"assistant","message":{"id":"stored","content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}}),
+        ] {
+            if let Some(piece) = text.consume(&event) {
+                output.push_str(&piece);
+            }
+        }
+        assert_eq!(output, "First\n\nSecond");
+    }
+
+    #[test]
     fn claude_snapshot_without_deltas_is_not_lost() {
         let mut text = ClaudeText::default();
         let event = json!({"type":"assistant","message":{"id":"a","content":[{"type":"text","text":"Final answer"}]}});
@@ -3309,6 +3791,56 @@ mod tests {
     }
 
     #[test]
+    fn opencode_v2_launch_uses_private_server_and_workspace_pwd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode-fixture");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'opencode v2.0.25'; exit 0; fi
+printf '%s\n' "$@" > args.txt
+printf '%s' "$PWD" > pwd.txt
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let request = StartRequest {
+            harness: "opencode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "test".into(),
+            ..Default::default()
+        };
+        let mut child = spawn_harness(
+            &request,
+            &Arc::new(Output::default()),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(AtomicBool::new(false)),
+            &[],
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let args = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert!(args.starts_with("run\n--standalone\n"));
+        assert!(!args.contains("--dir"));
+        let pwd = std::fs::read_to_string(dir.path().join("pwd.txt")).unwrap();
+        assert_eq!(
+            Path::new(&pwd).canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn opencode_shared_server_requires_private_execution() {
+        assert!(opencode_needs_standalone(Some("opencode v2.0.25")));
+        assert!(opencode_needs_standalone(Some("2.1.0")));
+        assert!(!opencode_needs_standalone(Some("1.2.10")));
+        assert!(!opencode_needs_standalone(None));
+    }
+
+    #[test]
     fn grok_and_opencode_args_match_the_pinned_flags() {
         let fresh = StartRequest {
             service_tier: None,
@@ -3358,7 +3890,7 @@ mod tests {
         );
         assert_eq!(
             opencode_args(&fresh),
-            vec!["run", "--format", "json", "--dir", "/tmp", "--model", "xai/grok", "hi"]
+            vec!["run", "--format", "json", "--model", "xai/grok", "hi"]
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
@@ -3777,6 +4309,40 @@ printf '%s\n' '{"type":"result"}'
     }
 
     #[test]
+    fn session_loss_notice_does_not_end_the_live_background_wait() {
+        let mut state = ClaudeBackground::default();
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a"}));
+        state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Background agent \"Proof check\" didn't finish before the previous session ended"}));
+        assert!(state.running());
+        state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Build failed"}));
+        assert!(!state.running());
+    }
+
+    #[test]
+    fn claude_background_terminal_snapshot_does_not_keep_a_turn_running() {
+        let mut state = ClaudeBackground::default();
+        for status in ["completed", "failed", "stopped", "cancelled", "canceled"] {
+            state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"done","status":status},{"task_id":"live","status":"running"}]}));
+            assert_eq!(state.list().len(), 1);
+            assert_eq!(state.list()[0].id, "live");
+            state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"done","status":status}]}));
+            assert!(!state.running());
+        }
+        for status in ["paused", "stopped_by_memory_guard", "unknown"] {
+            state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"pending","status":status}]}));
+            assert!(state.running());
+        }
+    }
+
+    #[test]
+    fn automatic_background_check_never_authorizes_cancellation() {
+        let question = background_question("Status", &[]);
+        assert!(question.contains("Do not stop, kill"));
+        assert!(question.contains("memory-paused"));
+        assert!(!question.contains("Stop with TaskStop"));
+    }
+
+    #[test]
     fn claude_background_snapshots_replace_edges_and_ignore_ambient_tasks() {
         let mut state = ClaudeBackground::default();
         state.consume(&json!({"type":"system","subtype":"task_started","task_id":"old"}));
@@ -3788,6 +4354,410 @@ printf '%s\n' '{"type":"result"}'
         assert!(!state.running());
         state.consume(&json!({"type":"system","subtype":"task_started","task_id":"stale"}));
         assert!(!state.running());
+    }
+
+    pub(super) fn quota_delays() -> &'static Mutex<HashMap<String, Duration>> {
+        static DELAYS: OnceLock<Mutex<HashMap<String, Duration>>> = OnceLock::new();
+        DELAYS.get_or_init(Default::default)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_diagnostic_warning_does_not_fail_success_and_real_failures_remain_visible() {
+        use std::os::unix::fs::PermissionsExt;
+        let warning = "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set and takes precedence over your claude.ai login · Unset it to load your organization's connectors";
+        for (name, result, code, expected) in [
+            (
+                "warning-success",
+                r#"{"type":"result","is_error":false,"result":"Finished the task."}"#,
+                0,
+                None,
+            ),
+            (
+                "protocol-error",
+                r#"{"type":"result","is_error":true,"result":"Authentication failed"}"#,
+                0,
+                Some("Authentication failed"),
+            ),
+            (
+                "process-failure",
+                r#"{"type":"result","is_error":false,"result":"Partial work."}"#,
+                9,
+                Some("Claude process failed"),
+            ),
+            (
+                "missing-result",
+                "",
+                0,
+                Some("Claude stopped without a final result"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("claude-fixture");
+            let warning = warning.replace('\'', "'\\''");
+            let script = format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.295 (Claude Code)'; exit; fi\nread -r init\nread -r prompt\nprintf '%s\\n' '{warning}' >&2\nprintf '%s\\n' '{result}'\nexit {code}\n");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let id = format!("claude-diagnostic-{name}-{}", uuid_like());
+            local_agents_start(StartRequest {
+                id: id.clone(),
+                harness: "claudecode".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Continue".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state = local_agents_poll(id.clone()).unwrap();
+                if state.done {
+                    assert_eq!(state.exit_code, Some(code));
+                    match expected {
+                        Some(message) => assert!(
+                            state.error.as_deref().unwrap_or("").contains(message),
+                            "{name}: {:?}",
+                            state.error
+                        ),
+                        None => {
+                            assert!(state.error.is_none(), "{:?}", state.error);
+                            assert_eq!(state.text, "Finished the task.");
+                        }
+                    }
+                    assert!(!state.text.contains("connectors are disabled"));
+                    break;
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(5));
+            }
+            runs().lock().unwrap().remove(&id);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_diagnostics_preserve_success_and_report_real_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        for (name, event, code, expected) in [
+            (
+                "recovered-warning",
+                r#"{"type":"text","text":"Finished"}"#,
+                0,
+                None,
+            ),
+            (
+                "protocol-error",
+                r#"{"type":"error","message":"Authentication failed"}"#,
+                0,
+                Some("Authentication failed"),
+            ),
+            (
+                "process-error",
+                "",
+                7,
+                Some("Grok process failed: transient retry warning"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("grok-fixture");
+            let script = format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'grok 1.0.52'; exit; fi\nprintf 'transient retry warning\\n' >&2\nhead -c 2097152 /dev/zero >&2\nprintf '%s\\n' '{event}'\nexit {code}\n");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let id = format!("piped-diagnostic-{name}-{}", uuid_like());
+            local_agents_start(StartRequest {
+                id: id.clone(),
+                harness: "grok".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Fixture".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let state = local_agents_poll(id.clone()).unwrap();
+                if state.done {
+                    assert_eq!(state.exit_code, Some(code));
+                    match expected {
+                        Some(message) => assert!(
+                            state.error.as_deref().unwrap_or("").contains(message),
+                            "{name}: {:?}",
+                            state.error
+                        ),
+                        None => assert!(state.error.is_none(), "{name}: {:?}", state.error),
+                    }
+                    let run = runs().lock().unwrap().remove(&id).unwrap();
+                    assert!(run.child.lock().unwrap().try_wait().unwrap().is_some());
+                    assert!(run.text.drained());
+                    assert!(!state.text.contains("transient retry warning"));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    local_agents_stop(id.clone()).unwrap();
+                    panic!("fixture failed to finish");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Opt in with a short-lived Core proxy key, never the desktop owner token.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires installed Claude and an explicitly supplied ephemeral Core key"]
+    fn claude_core_warning_canary_uses_native_orb_lifecycle() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::var("ORB_CANARY_BASE_URL").expect("supply Core URL");
+        assert!(base.starts_with("https://"));
+        let key = std::env::var("ORB_CANARY_PROXY_KEY").expect("supply ephemeral proxy key");
+        let cli = std::env::var("ORB_CANARY_CLAUDE_BIN").expect("supply installed Claude path");
+        let model = std::env::var("ORB_CANARY_MODEL").expect("supply model");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-canary");
+        let cli = cli.replace('\'', "'\\''");
+        std::fs::write(&bin, format!("#!/bin/sh\nexec '{cli}' \"$@\" --tools '' --no-session-persistence --strict-mcp-config --mcp-config '{{\"mcpServers\":{{}}}}'\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-warning-canary-{}", uuid_like());
+        start_with_env(
+            StartRequest {
+                id: id.clone(),
+                harness: "claudecode".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Reply with exactly OK. Do not use tools.".into(),
+                model: Some(model),
+                ..Default::default()
+            },
+            &[
+                ("ORB_CLAUDE_CORE_ROUTING".into(), "1".into()),
+                ("ANTHROPIC_BASE_URL".into(), base),
+                ("ANTHROPIC_AUTH_TOKEN".into(), key),
+            ],
+        )
+        .expect("native canary should start");
+        let until = Instant::now() + Duration::from_secs(90);
+        loop {
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                assert_eq!(state.exit_code, Some(0));
+                assert!(state.error.is_none(), "native lifecycle reported an error");
+                assert_eq!(state.text.trim(), "OK");
+                let run = runs().lock().unwrap().remove(&id).unwrap();
+                assert!(
+                    run.text
+                        .diagnostic()
+                        .is_some_and(|text| text.contains("connectors are disabled")),
+                    "canary must exercise the real connector warning"
+                );
+                break;
+            }
+            if Instant::now() >= until {
+                let _ = local_agents_stop(id.clone());
+                panic!("native canary timed out");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn claude_core_routing_removes_competing_auth_only_for_the_routed_process() {
+        let request = StartRequest {
+            harness: "claudecode".into(),
+            bin: "claude".into(),
+            ..Default::default()
+        };
+        let env = vec![
+            ("ORB_CLAUDE_CORE_ROUTING".into(), "1".into()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), "ephemeral-proxy-key".into()),
+        ];
+        let command = mission_command(&request, &env);
+        let vars = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            vars["ANTHROPIC_AUTH_TOKEN"].as_deref(),
+            Some("ephemeral-proxy-key")
+        );
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
+            assert_eq!(vars.get(name), Some(&None));
+        }
+        assert!(!vars.contains_key("HOME") && !vars.contains_key("CLAUDE_CONFIG_DIR"));
+        assert_eq!(mission_command(&request, &[]).get_envs().count(), 0);
+    }
+
+    #[test]
+    fn claude_quota_reset_respects_timezone_and_does_not_retry_other_errors() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T10:56:46Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let (delay, _) = claude_quota_delay(
+            "You've hit your session limit · resets 2:40pm (Europe/Lisbon)",
+            now,
+        )
+        .unwrap();
+        assert_eq!(delay.as_secs(), 9799); // 13:40 UTC plus five seconds
+        assert!(claude_quota_delay("authentication_error: login required", now).is_none());
+        assert!(claude_quota_delay("Request rejected by safeguard", now).is_none());
+        assert_eq!(
+            claude_quota_delay("You've hit your session limit", now)
+                .unwrap()
+                .0
+                .as_secs(),
+            3605
+        );
+        assert_eq!(
+            claude_quota_delay(
+                "You've hit your session limit · resets 11:55am (Europe/Lisbon)",
+                now
+            )
+            .unwrap()
+            .0
+            .as_secs(),
+            60
+        );
+    }
+
+    #[test]
+    fn claude_quota_result_covers_cli_success_and_error_envelopes_only() {
+        let message = "You've hit your session limit · resets 2:40pm (Europe/Lisbon)";
+        for event in [
+            json!({"type":"result","is_error":true,"result":message}),
+            json!({"type":"result","is_error":false,"result":message}),
+            json!({"type":"result","is_error":true,"errors":[message]}),
+        ] {
+            assert_eq!(claude_quota_result(&event).as_deref(), Some(message));
+        }
+        for event in [
+            json!({"type":"result","result":format!("I fixed the error: {message}")}),
+            json!({"type":"assistant","message":{"content":[{"text":message}]}}),
+            json!({"type":"result","is_error":true,"result":"authentication_error"}),
+        ] {
+            assert!(claude_quota_result(&event).is_none());
+        }
+    }
+
+    #[test]
+    fn claude_quota_timer_is_single_shot_and_stop_cancels_it() {
+        let timer = Arc::new(Recheck::default());
+        let input = Arc::new(Mutex::new(Vec::<u8>::new()));
+        timer.quota(Duration::from_millis(80));
+        timer.waiting(Some(vec![])); // task events cannot replace the quota deadline
+        let t = Arc::clone(&timer);
+        let i = Arc::clone(&input);
+        let worker = thread::spawn(move || t.run(&i, &[Duration::from_millis(1)]));
+        assert!(input.lock().unwrap().is_empty());
+        let until = Instant::now() + Duration::from_secs(2);
+        while input.lock().unwrap().is_empty() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        timer.close();
+        worker.join().unwrap();
+        let bytes = input.lock().unwrap();
+        let lines = String::from_utf8_lossy(&bytes);
+        assert_eq!(lines.lines().count(), 1);
+        assert!(lines.contains("do not restart builds"));
+        let stopped = Recheck::default();
+        stopped.quota(Duration::ZERO);
+        stopped.close();
+        let empty = Mutex::new(Vec::<u8>::new());
+        stopped.run(&empty, &[Duration::ZERO]);
+        assert!(empty.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_quota_wait_preserves_session_and_child_until_continuation() {
+        use std::os::unix::fs::PermissionsExt;
+        for is_error in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("claude-fixture");
+            let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '2.1.295 (Claude Code)\n'; exit; fi
+read -r init
+read -r prompt
+printf '%s\n' "$*" > args
+sleep 20 &
+job=$!
+trap 'kill "$job" 2>/dev/null; wait "$job" 2>/dev/null' EXIT
+printf '%s\n' '{"type":"result","is_error":IS_ERROR,"result":"You have hit your session limit"}'
+read -r next || exit 21
+kill -0 "$job" || exit 22
+printf '%s\n' "$next" > next.json
+printf '%s\n' '{"type":"result","result":"Continued in the same session."}'
+"#
+            .replace("IS_ERROR", if is_error { "true" } else { "false" });
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let id = format!("claude-quota-{}", uuid_like());
+            quota_delays()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Duration::from_millis(200));
+            local_agents_start(StartRequest {
+                service_tier: None,
+                effort: None,
+                cyber_revision: None,
+                cyber_access: None,
+                id: id.clone(),
+                harness: "claudecode".into(),
+                bin: bin.to_string_lossy().into_owned(),
+                cwd: dir.path().to_string_lossy().into_owned(),
+                prompt: "Continue".into(),
+                model: None,
+                session_id: Some("12345678-1234-1234-1234-123456789abc".into()),
+                image_paths: vec![],
+                shared_cwd_with: None,
+            })
+            .unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut saw_wait = false;
+            loop {
+                let state = local_agents_poll(id.clone()).unwrap();
+                if state
+                    .activities
+                    .iter()
+                    .any(|a| a.id == "claude:quota" && a.status == "waiting")
+                {
+                    saw_wait = true;
+                    assert!(!state.done);
+                    assert!(state.waiting_since.is_none());
+                }
+                if state.done {
+                    assert!(state.error.is_none(), "{:?}", state.error);
+                    assert!(state.text.contains("Continued in the same session."));
+                    break;
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(saw_wait);
+            assert!(std::fs::read_to_string(dir.path().join("args"))
+                .unwrap()
+                .contains("--resume 12345678-1234-1234-1234-123456789abc"));
+            let next: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("next.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(next["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("do not restart builds"));
+            quota_delays().lock().unwrap().remove(&id);
+            runs().lock().unwrap().remove(&id);
+        }
     }
 
     /// Shorter delays for the run of one test.
@@ -3954,6 +4924,9 @@ printf '%s\n' '{"type":"result"}'
 read -r init
 read -r prompt
 printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"a","description":"Explore"}'
+printf '%s\n' "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"a\",\"status\":\"failed\",\"summary\":\"Background agent \\\"Explore\\\" didn't finish before the previous session ended\"}"
+printf '%s\n' '{"type":"result","result":"Still waiting for agent"}'
+sleep 0.05
 printf '%s\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}'
 printf '%s\n' '{"type":"result","result":"Waiting for agent"}'
 sleep 0.05
@@ -4170,6 +5143,65 @@ printf '%s\n' '{"type":"result"}'
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn claude_steer_keeps_one_process_and_waits_past_the_previous_result() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-steer-fixture");
+        std::fs::write(&bin, r#"#!/bin/sh
+read -r init
+read -r prompt
+read -r steer
+printf '%s\n' '{"type":"assistant","message":{"id":"earlier","content":[{"type":"text","text":"Finishing earlier work"}]}}'
+printf '%s\n' '{"type":"result","result":"Previous turn"}'
+printf '%s\n' "$steer"
+printf '%s\n' '{"type":"result","parent_tool_use_id":"child-sol","is_error":true,"result":"Child result"}'
+printf '%s\n' '{"type":"assistant","message":{"id":"answer","content":[{"type":"text","text":"Steering received in the same session"}]}}'
+printf '%s\n' '{"type":"result"}'
+cat >/dev/null
+"#).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-steer-{}", uuid_like());
+        local_agents_start(StartRequest {
+            service_tier: None,
+            effort: None,
+            cyber_revision: None,
+            cyber_access: None,
+            id: id.clone(),
+            harness: "claudecode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "Keep working".into(),
+            model: None,
+            session_id: None,
+            image_paths: vec![],
+            shared_cwd_with: None,
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let token = loop {
+            if let Some(token) = crate::live_input::token(&id) {
+                break token;
+            }
+            assert!(Instant::now() < deadline, "live input was not registered");
+            thread::sleep(Duration::from_millis(10));
+        };
+        crate::live_input::deliver(&id, &token, "question", "eta").unwrap();
+        let state = loop {
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done || Instant::now() > deadline {
+                break state;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        runs().lock().unwrap().remove(&id);
+        assert!(state.done, "steered session did not finish");
+        assert!(state.error.is_none(), "{:?}", state.error);
+        assert!(state.text.contains("Steering received in the same session"));
+        assert!(!state.text.contains("Child result"));
+    }
+
     #[test]
     fn resumed_claude_session_keeps_the_reply_after_its_empty_first_result() {
         use std::os::unix::fs::PermissionsExt;
@@ -4262,6 +5294,23 @@ printf '%s\n' '{"type":"result"}'
         let line = r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"Hi"}}}"#;
         assert_eq!(extract_text(line).as_deref(), Some("Hi"));
     }
+}
+
+/// Metadata only: a replacement desktop can verify ownership without reading prompts.
+#[cfg(unix)]
+pub fn execution_metadata() -> Result<Value, String> {
+    let all = runs().lock().map_err(|e| e.to_string())?;
+    Ok(Value::Array(
+        all.iter()
+            .map(|(id, run)| {
+                json!({
+                    "mission_id": id, "native_generation": run.generation,
+                    "done": run.done.load(Ordering::SeqCst),
+                    "pid": run.child.lock().ok().map(|child| child.id())
+                })
+            })
+            .collect(),
+    ))
 }
 
 /// Only live harnesses launched by this Orb instance (not unrelated terminals).
@@ -4359,18 +5408,37 @@ pub fn workspace_busy_for(
 ) -> Result<bool, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let shared_parent = shared_cwd_with.map(str::trim).filter(|s| !s.is_empty());
+    let bindings = crate::local_bindings(None, None)?;
+    if self_id.is_some_and(|id| crate::local_workspaces::binding_shares(&bindings[id], &root)) {
+        return Ok(false);
+    }
     Ok(runs()
         .lock()
         .map_err(|e| e.to_string())?
         .iter()
         .any(|(id, run)| {
             self_id != Some(id.as_str())
+                && !(self_id.is_some()
+                    && crate::local_workspaces::binding_shares(&bindings[id], &root))
                 && shared_parent != Some(id.as_str())
                 && (self_id.is_none() || run.shared_cwd_with.as_deref() != self_id)
                 && (shared_parent.is_none() || run.shared_cwd_with.as_deref() != shared_parent)
                 && !run.done.load(Ordering::SeqCst)
                 && run.cwd.canonicalize().ok().as_ref() == Some(&root)
         }))
+}
+
+pub(crate) fn shared_peer_pids(root: &Path) -> Result<Vec<u32>, String> {
+    let bindings = crate::local_bindings(None, None)?;
+    let runs = runs().lock().map_err(|e| e.to_string())?;
+    Ok(runs
+        .iter()
+        .filter(|(id, run)| {
+            !run.done.load(Ordering::SeqCst)
+                && crate::local_workspaces::binding_shares(&bindings[*id], root)
+        })
+        .filter_map(|(_, run)| run.child.lock().ok().map(|child| child.id()))
+        .collect())
 }
 
 pub fn native_generation(id: &str) -> Option<String> {
@@ -4465,10 +5533,36 @@ mod directory_tests {
             workspace_busy_for(root.path(), Some(&uuid::Uuid::new_v4().to_string()), None).unwrap(),
             "unrelated mission must still see directory as busy"
         );
+        // Explicit sharing allows a second independent chat, but never a second
+        // process for the same chat. It does not weaken transfer admission.
+        let shared_id = uuid::Uuid::new_v4().to_string();
+        let shared_request = StartRequest {
+            id: shared_id.clone(),
+            ..request.clone()
+        };
+        let shared_bindings = json!({&shared_id: {"cwd":request.cwd,"shareFolder":true}});
+        start_with_bindings(shared_request.clone(), &[], None, &shared_bindings).unwrap();
+        assert!(
+            start_with_bindings(shared_request, &[], None, &shared_bindings)
+                .unwrap_err()
+                .contains("still running locally")
+        );
+        assert!(
+            workspace_busy(root.path()).unwrap(),
+            "transfers still see live shared work"
+        );
+        assert!(!local_agents_poll(first.clone()).unwrap().done);
         local_agents_stop(side_id.clone()).unwrap();
         runs().lock().unwrap().remove(&side_id);
         local_agents_stop(first.clone()).unwrap();
         runs().lock().unwrap().remove(&first);
+        // The original chat can start its next turn while the opted-in peer runs.
+        start_with_bindings(request.clone(), &[], None, &shared_bindings).unwrap();
+        assert!(!local_agents_poll(shared_id.clone()).unwrap().done);
+        local_agents_stop(first.clone()).unwrap();
+        runs().lock().unwrap().remove(&first);
+        local_agents_stop(shared_id.clone()).unwrap();
+        runs().lock().unwrap().remove(&shared_id);
         assert!(second
             .unwrap_err()
             .contains("directory already has a running local mission"));

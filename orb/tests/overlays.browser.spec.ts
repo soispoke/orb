@@ -271,3 +271,20 @@ test('Codex Ultrafast is a distinct committed selection',async({page})=>{
  await page.getByRole('button',{name:'Speed: Ultrafast'}).click();
  await expect(page.getByRole('option',{name:/Ultrafast/})).toHaveAttribute('aria-selected','true');
 });
+
+for (const theme of ["dark", "light"]) test(`local workspace choice preserves keyboard selection at narrow width: ${theme}`, async({page})=>{
+  await page.setViewportSize({width:390,height:850});
+  await page.goto(`/tests/overlays.html?workspace&theme=${theme}`);
+  const choice=page.getByLabel("Local workspace mode");
+  await expect(choice).toHaveValue("shared");
+  await choice.focus();await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ArrowDown");await page.keyboard.press("Escape");
+  await expect(choice).toHaveValue("shared");
+  await choice.focus();await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("End");await page.keyboard.press("Enter");
+  await expect(choice).toHaveValue("worktree");
+  await expect(page.getByText(/Uncommitted files stay in the original folder/)).toBeVisible();
+  const box=await page.locator(".local-workspace-choice").boundingBox();
+  expect(box!.x+box!.width).toBeLessThanOrEqual(390);
+  await page.screenshot({path:`/private/tmp/orb-workspace-${theme}.png`});
+});

@@ -20,7 +20,6 @@ pub mod ask;
 pub(crate) mod auth;
 pub mod automation_variables;
 pub mod backends;
-pub mod bitwarden;
 pub mod capabilities;
 pub mod claudecode;
 pub mod cli_proxy_accounts;

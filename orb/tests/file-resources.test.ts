@@ -4,7 +4,25 @@ import {
   parseFileTarget,
   splitFileReferences,
   relativeFilePath,
+  checkedFileChunk,
 } from "../src/fileResources";
+describe("download receipts", () => {
+  it("accepts contiguous chunks and a genuinely empty file", () => {
+    expect(checkedFileChunk({bytes:[1,2],next:2,size:4},0).next).toBe(2);
+    expect(checkedFileChunk({bytes:[3,4],next:4,size:4},2,4).next).toBe(4);
+    expect(checkedFileChunk({bytes:[],next:0,size:0},0).size).toBe(0);
+  });
+  it.each([
+    {bytes:[],next:2,size:4},
+    {bytes:[3,4],next:2,size:4},
+    {bytes:[3,4],next:5,size:4},
+    {bytes:[3,4],next:4,size:8},
+    {bytes:[3,4],next:4},
+    {bytes:[3,256],next:4,size:4},
+  ])("rejects a partial or inconsistent receipt %j", reply => {
+    expect(() => checkedFileChunk(reply,2,4)).toThrow("Incomplete file download");
+  });
+});
 describe("file references", () => {
   it.each([
     "audit/guarantees.yaml",

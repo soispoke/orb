@@ -82,29 +82,47 @@ it('supports editing, replacing in order, and sending a queued remote message im
   expect(replayAfter).toHaveBeenCalledWith([{ content: 'Second', attached: undefined }]);
 });
 
-it('sends the selected remote queued message immediately ahead of earlier rows and strips attachment trailers', async () => {
-  const attachedContent = 'Please add a markdown file inside @Context\n\n<!-- paloma:attachment:dd4b234f-6097-4d72-82c7-aae18689e1fc -->\nAttached context: read `.paloma/messages/dd4b234f-6097-4d72-82c7-aae18689e1fc/.paloma/attach.md` (paths in that manifest are relative to `.paloma/messages/dd4b234f-6097-4d72-82c7-aae18689e1fc`).';
-  backend.list.mockResolvedValue([{ id: 'one', content: 'First', source: 'remote-queue' }, { id: 'two', content: attachedContent, source: 'remote-queue' }]);
-  backend.api.mockResolvedValue({ ok: true });
-  const sendImmediate = vi.fn().mockResolvedValue(undefined);
-  render(() => <RemoteQueue mission="remote" onSendImmediate={sendImmediate} onRows={() => {}} onCancel={() => {}}/>);
+it('keeps messages queued when live delivery is unsupported, without cancelling or resending', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'}, {id:'two',content:'Second',source:'remote-queue'}]);
+  backend.api.mockResolvedValue({ok:true,delivered:false});
+  const send = vi.fn(), cancel = vi.fn();
+  render(() => <RemoteQueue mission="remote" onSendImmediate={send} onRows={()=>{}} onCancel={cancel}/>);
   await screen.findByText('2 Queued');
-  await fireEvent.click(screen.getByRole('button', { name: 'Send now: Please add a markdown file inside @Context' }));
-  await waitFor(() => expect(sendImmediate).toHaveBeenCalledWith([
-    { id: 'two', content: 'Please add a markdown file inside @Context', attached: true },
-    { id: 'one', content: 'First', attached: undefined },
-  ]));
+  await fireEvent.click(screen.getByRole('button',{name:'Send now: Second'}));
+  expect((await screen.findByRole('alert')).textContent).toContain('still queued');
+  expect(screen.getByText('2 Queued')).toBeTruthy();
+  expect(backend.api).toHaveBeenCalledTimes(1);
+  expect(backend.api).toHaveBeenCalledWith('/api/control/queue/two/send-now',{method:'POST'});
+  expect(send).not.toHaveBeenCalled(); expect(cancel).not.toHaveBeenCalled();
 });
-
-it('keeps the error alert visible when sendNow fails after clearing the queue', async () => {
-  backend.list.mockResolvedValue([{ id: 'one', content: 'First', source: 'remote-queue' }]);
-  backend.api.mockResolvedValue({ ok: true });
-  const sendImmediate = vi.fn().mockRejectedValue(new Error('Immediate dispatch failed'));
-  render(() => <RemoteQueue mission="remote" onSendImmediate={sendImmediate} onRows={() => {}} onCancel={() => {}}/>);
+it('does not turn an ambiguous network failure into a delete and resend', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'}]);
+  backend.api.mockRejectedValue(new Error('Connection interrupted'));
+  const send = vi.fn();
+  render(() => <RemoteQueue mission="remote" onSendImmediate={send} onRows={()=>{}} onCancel={()=>{}}/>);
   await screen.findByText('1 Queued');
-  await fireEvent.click(screen.getByRole('button', { name: 'Send now: First' }));
-  const alert = await screen.findByRole('alert');
-  expect(alert.textContent).toContain('Immediate dispatch failed');
+  await fireEvent.click(screen.getByRole('button',{name:'Send now: First'}));
+  expect((await screen.findByRole('alert')).textContent).toContain('Connection interrupted');
+  expect(screen.getByText('First')).toBeTruthy();
+  expect(backend.api).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+});
+it('removes ghost receipts absent from the authoritative queue', async () => {
+  backend.list.mockResolvedValue([]);
+  const cancel=vi.fn();
+  render(() => <RemoteQueue mission="remote" confirmed={[{id:'ghost',content:'Old retry'}]} onRows={()=>{}} onCancel={cancel}/>);
+  await waitFor(()=>expect(cancel).toHaveBeenCalledWith('ghost'));
+  expect(screen.queryByText('Old retry')).toBeNull();
+});
+it('preserves a new receipt arriving after a queue read began', async () => {
+  let finish!: (rows:unknown[])=>void;
+  backend.list.mockReturnValue(new Promise(resolve=>{finish=resolve;}));
+  const {createSignal}=await import('solid-js');
+  const [confirmed,setConfirmed]=createSignal<{id:string;content:string}[]>([]);
+  const cancel=vi.fn();
+  render(()=><RemoteQueue mission="remote" confirmed={confirmed()} onRows={()=>{}} onCancel={cancel}/>);
+  setConfirmed([{id:'new',content:'Just sent'}]);finish([]);
+  await waitFor(()=>expect(screen.getByText('Just sent')).toBeTruthy());
+  expect(cancel).not.toHaveBeenCalled();
 });
 
 it('injects the selected queued message live without deleting remaining queued messages when the harness accepts mid-turn input', async () => {
@@ -165,3 +183,168 @@ it('removes a queued message optimistically before the DELETE request resolves a
 });
 
 
+
+it('reconciles a send-now 404 without resending or leaving a zero-item sending indicator', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'Already consumed',source:'remote-queue'}]);
+  backend.api.mockRejectedValue(new Error('404 message not in queue'));
+  const cancel=vi.fn(), send=vi.fn();
+  render(()=><RemoteQueue mission="remote" onRows={()=>{}} onCancel={cancel} onSendImmediate={send}/>);
+  await screen.findByText('Already consumed');
+  fireEvent.click(screen.getByRole('button',{name:'Send now: Already consumed'}));
+  await waitFor(()=>expect(cancel).toHaveBeenCalledWith('one'));
+  expect(screen.queryByRole('region',{name:'Queued messages'})).toBeNull();
+  expect(screen.queryByText('0 Sending…')).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(send).not.toHaveBeenCalled(); expect(backend.api).toHaveBeenCalledTimes(1);
+});
+
+it('reconciles an aborted send without resending and clears its stale error when dequeued', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'Status?',source:'remote-queue'}]);
+  backend.api.mockRejectedValue(new DOMException('Fetch is aborted','AbortError'));
+  const send=vi.fn();
+  render(()=><RemoteQueue mission="remote" onRows={()=>{}} onCancel={()=>{}} onSendImmediate={send}/>);
+  await screen.findByText('Status?');
+  fireEvent.click(screen.getByRole('button',{name:'Send now: Status?'}));
+  expect((await screen.findByRole('alert')).textContent).toContain('Delivery wasn’t confirmed');
+  backend.list.mockResolvedValue([]);
+  await waitFor(()=>expect(screen.queryByRole('alert')).toBeNull(),{timeout:4000});
+  expect(send).not.toHaveBeenCalled(); expect(backend.api).toHaveBeenCalledTimes(1);
+});
+
+it('keeps automatic steering out of the queue and prevents a second keyboard delivery',async()=>{
+ const {createSignal}=await import('solid-js');
+ backend.list.mockResolvedValue([{id:'steering',content:'Visible in chat',source:'remote-queue'}]);
+ const [hidden,setHidden]=createSignal<ReadonlySet<string>>(new Set(['steering']));
+ const edit=vi.fn(),rows=vi.fn();let handle!:RemoteQueueHandle;
+ render(()=><RemoteQueue mission="auto" hiddenIds={hidden()} ref={value=>handle=value} onEdit={edit} onRows={rows} onCancel={()=>{}}/>);
+ await waitFor(()=>expect(rows).toHaveBeenLastCalledWith(['steering']));
+ expect(screen.queryByRole('region',{name:'Queued messages'})).toBeNull();
+ await handle.sendNow();handle.editFirst();
+ expect(backend.api).not.toHaveBeenCalled();expect(edit).not.toHaveBeenCalled();
+ setHidden(new Set<string>());
+ await screen.findByText('Visible in chat');handle.editFirst();
+ expect(edit).toHaveBeenCalledWith({id:'steering',text:'Visible in chat',remote:true});
+});
+
+function deferred<T>() {
+ let resolve!: (value:T)=>void, reject!: (error:Error)=>void;
+ const promise=new Promise<T>((yes,no)=>{resolve=yes;reject=no;});
+ return {promise,resolve,reject};
+}
+
+it('navigation releases the old send lock without letting its completion unlock the new chat',async()=>{
+ const {createSignal}=await import('solid-js');
+ const [mission,setMission]=createSignal('first');
+ backend.list.mockImplementation(async(id:string)=>[{id,content:id,source:'remote-queue'}]);
+ const first=deferred<{delivered:boolean}>(),second=deferred<{delivered:boolean}>();
+ backend.api.mockImplementation((path:string)=>path.includes('/first/')?first.promise:second.promise);
+ const cancel=vi.fn(),send=vi.fn();let handle!:RemoteQueueHandle;
+ render(()=><RemoteQueue mission={mission()} onRows={()=>{}} onCancel={cancel} onSendImmediate={send} ref={h=>handle=h}/>);
+ await screen.findByText('first');const oldSend=handle.sendNow();
+ setMission('second');await screen.findByText('second');
+ expect((screen.getByRole('button',{name:'Send now: second'}) as HTMLButtonElement).disabled).toBe(false);
+ const newSend=handle.sendNow();
+ first.resolve({delivered:true});await oldSend;
+ expect((screen.getByRole('button',{name:'Send now: second'}) as HTMLButtonElement).disabled).toBe(true);
+ expect(cancel).not.toHaveBeenCalled();expect(send).not.toHaveBeenCalled();
+ second.resolve({delivered:true});await newSend;
+ expect(cancel).toHaveBeenCalledWith('second');
+});
+
+it.each(['success','failure'] as const)('ignores an old send %s after navigating away and back',async outcome=>{
+ const {createSignal}=await import('solid-js');
+ const [mission,setMission]=createSignal('first');
+ backend.list.mockImplementation(async(id:string)=>[{id,content:id,source:'remote-queue'}]);
+ const request=deferred<{delivered:boolean}>();backend.api.mockReturnValue(request.promise);
+ const cancel=vi.fn(),send=vi.fn();let handle!:RemoteQueueHandle;
+ render(()=><RemoteQueue mission={mission()} onRows={()=>{}} onCancel={cancel} onSendImmediate={send} ref={h=>handle=h}/>);
+ await screen.findByText('first');const sending=handle.sendNow();
+ setMission('second');await screen.findByText('second');
+ setMission('first');await screen.findByText('first');
+ if(outcome==='success')request.resolve({delivered:true});else request.reject(new Error('Old chat error'));
+ await sending;
+ expect(screen.getByText('first')).toBeTruthy();
+ expect(screen.queryByRole('alert')).toBeNull();
+ expect(cancel).not.toHaveBeenCalled();expect(send).not.toHaveBeenCalled();
+});
+
+it('a failed delete from an old visit cannot restore stale rows after navigating back',async()=>{
+ const {createSignal}=await import('solid-js');
+ const [mission,setMission]=createSignal('first');
+ backend.list.mockResolvedValue([{id:'old',content:'Old queued prompt',source:'remote-queue'}]);
+ const request=deferred<unknown>();backend.api.mockReturnValue(request.promise);
+ render(()=><RemoteQueue mission={mission()} onRows={()=>{}} onCancel={()=>{}}/>);
+ await screen.findByText('Old queued prompt');
+ fireEvent.click(screen.getByRole('button',{name:'Remove queued message: Old queued prompt'}));
+ backend.list.mockResolvedValue([{id:'new',content:'Current queued prompt',source:'remote-queue'}]);
+ setMission('second');await screen.findByText('Current queued prompt');
+ setMission('first');await waitFor(()=>expect(backend.list).toHaveBeenCalledTimes(3));
+ request.reject(new Error('Old deletion failed'));
+ await new Promise(resolve=>setTimeout(resolve,0));
+ expect(screen.queryByText('Old queued prompt')).toBeNull();
+ expect(screen.getByText('Current queued prompt')).toBeTruthy();
+ expect(screen.queryByRole('alert')).toBeNull();
+});
+
+it('stops an in-flight queue edit from deleting or submitting into a newly selected chat',async()=>{
+ const {createSignal}=await import('solid-js');
+ const [mission,setMission]=createSignal('first');
+ backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'},{id:'two',content:'Second',source:'remote-queue'}]);
+ const request=deferred<unknown>();backend.api.mockReturnValue(request.promise);
+ let handle!:RemoteQueueHandle;const cancel=vi.fn(),replace=vi.fn().mockResolvedValue(true),replay=vi.fn();
+ render(()=><RemoteQueue mission={mission()} onRows={()=>{}} onCancel={cancel} ref={h=>handle=h}/>);
+ await screen.findByText('First');const editing=handle.replaceEdited('one',replace,replay);
+ setMission('second');await waitFor(()=>expect(backend.list).toHaveBeenCalledTimes(2));
+ request.resolve({ok:true});expect(await editing).toBe(false);
+ expect(backend.api).toHaveBeenCalledTimes(1);
+ expect(cancel).not.toHaveBeenCalled();expect(replace).not.toHaveBeenCalled();expect(replay).not.toHaveBeenCalled();
+ expect(screen.getByText('First')).toBeTruthy();
+});
+
+it('serializes queue mutations while an optimistic delete is pending',async()=>{
+ backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'},{id:'two',content:'Second',source:'remote-queue'}]);
+ const request=deferred<unknown>();backend.api.mockReturnValue(request.promise);
+ let handle!:RemoteQueueHandle;const replace=vi.fn();
+ render(()=><RemoteQueue mission="first" onRows={()=>{}} onCancel={()=>{}} ref={h=>handle=h}/>);
+ await screen.findByText('First');
+ fireEvent.click(screen.getByRole('button',{name:'Remove queued message: First'}));
+ expect((screen.getByRole('button',{name:'Remove queued message: Second'}) as HTMLButtonElement).disabled).toBe(true);
+ await handle.sendNow('two');expect(await handle.replaceEdited('two',replace)).toBe(false);
+ expect(backend.api).toHaveBeenCalledTimes(1);expect(replace).not.toHaveBeenCalled();
+ request.reject(new Error('Connection unavailable'));
+ await screen.findByText('First');
+ expect((screen.getByRole('button',{name:'Remove queued message: Second'}) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it('does not let a queue poll confirm an optimistic deletion before its request succeeds',async()=>{
+ const callbacks:(()=>void)[]=[];
+ const interval=vi.spyOn(globalThis,'setInterval').mockImplementation(((callback:()=>void)=>{callbacks.push(callback);return 1;}) as typeof setInterval);
+ try {
+  const row={id:'one',content:'Pending deletion',source:'remote-queue'};
+  backend.list.mockResolvedValue([row]);
+  const request=deferred<unknown>();backend.api.mockReturnValue(request.promise);
+  const cancel=vi.fn();
+  render(()=><RemoteQueue mission="first" confirmed={[row]} onRows={()=>{}} onCancel={cancel}/>);
+  await waitFor(()=>expect(backend.list).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole('button',{name:'Remove queued message: Pending deletion'}));
+  for(const refresh of callbacks)refresh();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  expect(backend.list).toHaveBeenCalledTimes(1);expect(cancel).not.toHaveBeenCalled();
+  request.reject(new Error('Connection unavailable'));
+  await screen.findByText('Pending deletion');
+  expect(cancel).not.toHaveBeenCalled();
+ } finally {interval.mockRestore();}
+});
+
+it('does not submit a queued replacement twice while its first deletion is pending',async()=>{
+ backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'}]);
+ const request=deferred<unknown>();backend.api.mockReturnValue(request.promise);
+ let handle!:RemoteQueueHandle;const replace=vi.fn().mockResolvedValue(true);
+ render(()=><RemoteQueue mission="first" onRows={()=>{}} onCancel={()=>{}} ref={h=>handle=h}/>);
+ await screen.findByText('First');
+ const first=handle.replaceEdited('one',replace);
+ expect(await handle.replaceEdited('one',replace)).toBe(false);
+ expect(backend.api).toHaveBeenCalledTimes(1);
+ request.resolve({ok:true});expect(await first).toBe(true);
+ expect(replace).toHaveBeenCalledTimes(1);
+});

@@ -1107,6 +1107,10 @@ impl SqliteMissionStore {
 
             // Run migrations for existing databases
             Self::run_migrations(&conn)?;
+            // Install after the missions table exists. Also repairs abandoned
+            // transfers whose source was deleted by an older build.
+            conn.execute_batch(include_str!("transfer_cleanup.sql"))
+                .map_err(|e| format!("Failed to install transfer cleanup: {e}"))?;
 
             let mut readers = Vec::with_capacity(READ_CONNECTIONS);
             for _ in 0..READ_CONNECTIONS {
@@ -1527,6 +1531,9 @@ impl SqliteMissionStore {
             "TEXT NOT NULL DEFAULT 'opencode'",
         )?;
         add_column_if_missing(conn, "missions", "session_id", "TEXT")?;
+
+        conn.execute_batch(include_str!("preserve_text_boundaries.sql"))
+            .map_err(|e| format!("Failed to preserve transcript boundaries: {e}"))?;
 
         // Add performance indexes if they don't exist (idempotent)
         conn.execute_batch(
@@ -4011,60 +4018,6 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
-    async fn acknowledge_stale_awaiting_user_missions(
-        &self,
-        grace_seconds: u64,
-    ) -> Result<Vec<Uuid>, String> {
-        let conn = self.conn.clone();
-        let cutoff = (Utc::now() - chrono::Duration::seconds(grace_seconds as i64)).to_rfc3339();
-        let now = now_string();
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn.blocking_lock();
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
-            let ids: Vec<Uuid> = {
-                let mut stmt = tx
-                    .prepare(
-                        "SELECT id FROM missions
-                         WHERE status = 'awaiting_user'
-                           AND first_viewed_at IS NOT NULL
-                           AND first_viewed_at <= ?1
-                           AND NOT EXISTS (
-                               SELECT 1 FROM mission_runs r
-                               WHERE r.mission_id = missions.id AND r.execution_state <> 'terminal'
-                           )",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![&cutoff], |row| {
-                        let id_str: String = row.get(0)?;
-                        Ok(parse_uuid_or_nil(&id_str))
-                    })
-                    .map_err(|e| e.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?;
-                rows
-            };
-            if !ids.is_empty() {
-                tx.execute(
-                    "UPDATE missions SET status = 'acknowledged', updated_at = ?1
-                     WHERE status = 'awaiting_user'
-                       AND first_viewed_at IS NOT NULL
-                       AND first_viewed_at <= ?2
-                       AND NOT EXISTS (
-                           SELECT 1 FROM mission_runs r
-                           WHERE r.mission_id = missions.id AND r.execution_state <> 'terminal'
-                       )",
-                    params![&now, &cutoff],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            tx.commit().map_err(|e| e.to_string())?;
-            Ok(ids)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-    }
-
     async fn get_waiting_background_mission_ids(&self) -> Result<Vec<Uuid>, String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -5222,7 +5175,7 @@ impl MissionStore for SqliteMissionStore {
 
                 // A finalized native step is immutable. A log reset may replay
                 // it; do not create duplicate canonical rows or reopen the step.
-                if bubble_id.starts_with("antigravity:") && conn.query_row(
+                if (bubble_id.starts_with("antigravity:") || bubble_id.starts_with("codex:")) && conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM mission_events WHERE mission_id=?1 AND event_type='assistant_message_canonical' AND event_id=?2)",
                     params![&mid, &bubble_id], |row| row.get::<_, bool>(0)
                 ).unwrap_or(false) { return Ok(()); }
@@ -5258,6 +5211,16 @@ impl MissionStore for SqliteMissionStore {
                     }
                     apply_text_ops(&mut content, &ops);
 
+                    // Reserve the next cursor before compacting snapshots. Deleting
+                    // the tail first can move the canonical reply behind live cursors.
+                    let sequence: i64 = conn
+                        .query_row(
+                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
+                            params![&mid],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(1);
+
                     conn.execute(
                         "DELETE FROM mission_events
                          WHERE mission_id = ?1
@@ -5267,13 +5230,6 @@ impl MissionStore for SqliteMissionStore {
                     )
                     .map_err(|e| e.to_string())?;
 
-                    let sequence: i64 = conn
-                        .query_row(
-                            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM mission_events WHERE mission_id = ?1",
-                            params![&mid],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or(1);
                     let (content_inline, content_file) = SqliteMissionStore::store_content(
                         &content_dir,
                         mission_id,
@@ -5545,6 +5501,14 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 objective.clone(),
                 serde_json::json!({ "status": status }),
+            ),
+            AgentEvent::SubagentUpdate { agent, .. } => (
+                "subagent_update",
+                None,
+                None,
+                None,
+                serde_json::to_string(agent).map_err(|e| e.to_string())?,
+                serde_json::json!({}),
             ),
             // Skip events that are less important for debugging
             AgentEvent::Status { .. }
@@ -14666,64 +14630,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_snapshots_remain_durable_and_finalized_steps_cannot_reopen() {
-        use crate::api::control::events::TextOp;
-        let temp_dir = tempfile::tempdir().unwrap();
-        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
-            .await
-            .unwrap();
-        let mission = store
-            .create_mission(Some("native bubbles"), None, None, None, None, None, None)
-            .await
-            .unwrap();
-        let bubble = "antigravity:session:turn:1";
-        let snapshot = |revision, text: &str, done| AgentEvent::TextOp {
-            mission_id: mission.id,
-            bubble_id: bubble.into(),
-            ops: if done {
-                vec![
-                    TextOp::Snapshot {
+    async fn native_snapshots_remain_durable_and_finalized_steps_cannot_reopen() {
+        for harness in ["antigravity", "codex"] {
+            use crate::api::control::events::TextOp;
+            let temp_dir = tempfile::tempdir().unwrap();
+            let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+                .await
+                .unwrap();
+            let mission = store
+                .create_mission(Some("native bubbles"), None, None, None, None, None, None)
+                .await
+                .unwrap();
+            let bubble = format!("{harness}:session:turn:1");
+            let snapshot = |revision, text: &str, done| AgentEvent::TextOp {
+                mission_id: mission.id,
+                bubble_id: bubble.clone(),
+                ops: if done {
+                    vec![
+                        TextOp::Snapshot {
+                            text: text.into(),
+                            revision,
+                        },
+                        TextOp::Finalize,
+                    ]
+                } else {
+                    vec![TextOp::Snapshot {
                         text: text.into(),
                         revision,
-                    },
-                    TextOp::Finalize,
-                ]
-            } else {
-                vec![TextOp::Snapshot {
-                    text: text.into(),
-                    revision,
-                }]
-            },
-        };
-        store
-            .log_event(mission.id, &snapshot(1, "First 🦀", false))
-            .await
-            .unwrap();
-        let active = store
-            .get_events(mission.id, None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(active[0].event_type, "text_op");
-        store
-            .log_event(mission.id, &snapshot(2, "First 🦀 complete", true))
-            .await
-            .unwrap();
-        store
-            .log_event(mission.id, &snapshot(1, "First 🦀", false))
-            .await
-            .unwrap();
-        store
-            .log_event(mission.id, &snapshot(2, "First 🦀 complete", true))
-            .await
-            .unwrap();
-        let events = store
-            .get_events(mission.id, None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "assistant_message_canonical");
-        assert_eq!(events[0].content, "First 🦀 complete");
-        assert_eq!(events[0].metadata["revision"], 2);
+                    }]
+                },
+            };
+            store
+                .log_event(mission.id, &snapshot(1, "First 🦀", false))
+                .await
+                .unwrap();
+            let active = store
+                .get_events(mission.id, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(active[0].event_type, "text_op");
+            let active_cursor = store.max_event_sequence(mission.id).await.unwrap();
+            store
+                .log_event(mission.id, &snapshot(2, "First 🦀 complete", true))
+                .await
+                .unwrap();
+            store
+                .log_event(mission.id, &snapshot(1, "First 🦀", false))
+                .await
+                .unwrap();
+            store
+                .log_event(mission.id, &snapshot(2, "First 🦀 complete", true))
+                .await
+                .unwrap();
+            let events = store
+                .get_events(mission.id, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event_type, "assistant_message_canonical");
+            assert_eq!(events[0].content, "First 🦀 complete");
+            assert_eq!(events[0].metadata["revision"], 2);
+            assert!(events[0].sequence > active_cursor);
+            assert_eq!(
+                store
+                    .get_events_since(mission.id, active_cursor, None, None)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -17908,5 +17884,57 @@ mod id_prefix_tests {
             .await
             .expect("prefix lookup");
         assert!(found.is_empty());
+    }
+    #[tokio::test]
+    async fn delivered_steering_preserves_legacy_snapshot_before_later_tokens() {
+        use crate::api::control::AgentEvent;
+        use uuid::Uuid;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteMissionStore::new(dir.path().to_path_buf(), "test-user")
+            .await
+            .unwrap();
+        let m = store
+            .create_mission(Some("text"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .log_event(
+                m.id,
+                &AgentEvent::TextDelta {
+                    content: "Before question".into(),
+                    mission_id: Some(m.id),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .log_event(
+                m.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "eta".into(),
+                    queued: false,
+                    mission_id: Some(m.id),
+                    source: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .log_event(
+                m.id,
+                &AgentEvent::TextDelta {
+                    content: "Before question. Answer".into(),
+                    mission_id: Some(m.id),
+                },
+            )
+            .await
+            .unwrap();
+        let rows = store.get_events_since(m.id, 0, None, None).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].content, "Before question");
+        assert_eq!(rows[1].event_type, "user_message");
+        assert_eq!(rows[2].content, "Before question. Answer");
+        assert_ne!(rows[0].event_id, rows[2].event_id);
     }
 }

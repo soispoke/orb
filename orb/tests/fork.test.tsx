@@ -44,3 +44,63 @@ it("dismisses a positioned sidebar fork when clicking outside its portal", () =>
   expect(closed).toHaveBeenCalledOnce();
   ui.unmount();
 });
+
+it("forks an Argon route with a real effort level and no Max option", async () => {
+ const fork = vi.spyOn(api,"forkMission").mockResolvedValue({...mission,id:"fork",backend:"opencode"});
+ render(() => <ForkMission mission={mission} choices={[{backend:{id:"opencode",name:"OpenCode"},models:[{value:"route/renamed",label:"Routing — Argon",efforts:["low","medium","high"]}]}]} destination="Core" onClose={() => {}} onFork={() => {}}/>);
+ fireEvent.click(screen.getByRole("menuitem",{name:"OpenCode"}));
+ fireEvent.click(screen.getByRole("menuitem",{name:/Argon/}));
+ expect(screen.queryByRole("menuitem",{name:"Max",exact:true})).toBeNull();
+ fireEvent.click(screen.getByRole("menuitem",{name:"High",exact:true}));
+ await waitFor(() => expect(fork).toHaveBeenCalledWith("source",expect.objectContaining({model_override:"route/renamed",model_effort:"high"})));
+});
+
+it("shows an actionable folder conflict without stopping its owner or retrying the fork", async () => {
+  const raw = '409 ' + JSON.stringify({error: "workspace_occupied", mission_id: "existing-chat", title: "Research"});
+  const fork = vi.spyOn(api, "forkMission").mockRejectedValue(new Error(raw));
+  const get = vi.spyOn(api, "getMission").mockResolvedValue({...mission, id: "existing-chat"});
+  const cancel = vi.spyOn(api, "cancelMission");
+  const opened = vi.fn();
+  render(() => <ForkMission mission={mission} choices={choices} destination="Core" onClose={() => {}} onFork={opened}/>);
+  fireEvent.click(screen.getByRole("menuitem", {name: "Grok Build"}));
+  fireEvent.click(screen.getByRole("menuitem", {name: /Grok 4.6/}));
+  await screen.findByRole("dialog", {name: "This folder is already in use"});
+  expect(screen.getByText(/Research.*still using/)).toBeTruthy();
+  expect(screen.getByText("Technical details").parentElement?.hasAttribute("open")).toBe(false);
+  fireEvent.click(screen.getByRole("button", {name: "Open existing chat"}));
+  await waitFor(() => expect(opened).toHaveBeenCalledWith(expect.objectContaining({id: "existing-chat"})));
+  expect(get).toHaveBeenCalledWith("existing-chat");
+  expect(fork).toHaveBeenCalledOnce();
+  expect(cancel).not.toHaveBeenCalled();
+});
+
+it("keeps fork selections available after dismissing a failed request", async () => {
+  const fork = vi.spyOn(api, "forkMission").mockRejectedValueOnce(new Error("Connection refused")).mockResolvedValue({...mission, id: "retry"});
+  const opened = vi.fn();
+  render(() => <ForkMission mission={mission} choices={choices} destination="Core" onClose={() => {}} onFork={opened}/>);
+  fireEvent.click(screen.getByRole("menuitem", {name: "Grok Build"}));
+  fireEvent.click(screen.getByRole("menuitem", {name: /Grok 4.6/}));
+  await screen.findByRole("dialog");
+  fireEvent.click(screen.getAllByRole("button", {name: "Close", exact: true})[0]);
+  fireEvent.click(screen.getByRole("menuitem", {name: /Grok 4.6/}));
+  await waitFor(() => expect(opened).toHaveBeenCalledOnce());
+  expect(fork).toHaveBeenCalledTimes(2);
+  expect(fork.mock.calls[0][1].idempotency_key).toBe(fork.mock.calls[1][1].idempotency_key);
+});
+
+it('uses the local launcher when forking a Claude conversation into GPT',async()=>{
+ const local=await import('../src/localAgents');
+ vi.spyOn(local,'localBinding').mockReturnValue({harness:'claudecode',bin:'/bin/claude',cwd:'/work',sessionId:'source-session'});
+ vi.spyOn(local,'restoreLocalBindings').mockResolvedValue(undefined);
+ vi.spyOn(local,'localAgentForLaunch').mockResolvedValue({id:'codex',bin:'codex',path:'/bin/codex',installed:true});
+ const launched=vi.spyOn(local,'startLocalOrigin').mockResolvedValue({...mission,id:'local-fork',title:'Original · fork',backend:'codex'});
+ const remote=vi.spyOn(api,'forkMission');const stop=vi.spyOn(api,'cancelMission');
+ const opened=vi.fn();
+ render(()=><ForkMission mission={{...mission,backend:'claudecode',tags:['placement:client'],project:'hardness',local_sync_pending:true,history:[{role:'user',content:'Continue the proof'}]}} choices={choices} destination="This computer" onClose={()=>{}} onFork={opened}/>);
+ fireEvent.click(screen.getByRole('menuitem',{name:'Codex'}));
+ fireEvent.click(screen.getByRole('menuitem',{name:/GPT-6 Astra/}));
+ fireEvent.click(screen.getByRole('menuitem',{name:'High',exact:true}));
+ await waitFor(()=>expect(opened).toHaveBeenCalledWith(expect.objectContaining({id:'local-fork'})));
+ expect(launched).toHaveBeenCalledWith(expect.objectContaining({harness:'codex',cwd:'/work',model:'gpt-6-astra',effort:'high'}),expect.objectContaining({share_folder:true}));
+ expect(remote).not.toHaveBeenCalled();expect(stop).not.toHaveBeenCalled();
+});

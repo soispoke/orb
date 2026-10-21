@@ -1186,6 +1186,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(control::machine_transfer::local_origin)
                 .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
+        .route(
+            "/api/control/missions/:id/fork-observation",
+            post(control::fork_observation::attach),
+        )
+        .route(
+            "/api/control/missions/:id/agent-observation",
+            post(control::fork_observation::publish_agents)
+                .layer(DefaultBodyLimit::max(512 * 1024)),
+        )
         // Mission portability — export a mission for transfer to another
         // instance, and import one coming from elsewhere. The import route
         // gets its own body limit layer because mission bundles routinely
@@ -1488,8 +1497,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/proxy-keys", proxy_keys_api::routes())
         // Secrets management endpoints
         .nest("/api/secrets", secrets_api::routes())
-        // Bitwarden Secrets Manager (`bws`) integration endpoints
-        .nest("/api/bitwarden", super::bitwarden::routes())
         // Global settings endpoints
         .nest("/api/settings", settings_api::routes())
         // Desktop session management endpoints

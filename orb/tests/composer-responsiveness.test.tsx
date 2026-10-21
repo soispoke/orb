@@ -1,0 +1,42 @@
+import {afterEach,beforeEach,expect,it,vi} from 'vitest';
+import {cleanup,fireEvent,render,screen,waitFor} from '@solidjs/testing-library';
+import {Composer} from '../src/App';
+import {loadAttachItems} from '../src/attach';
+import {saveComposerDraft} from '../src/composerDrafts';
+vi.mock('../src/attach',async original=>({...await original<typeof import('../src/attach')>(),loadAttachItems:vi.fn()}));
+vi.mock('../src/api',async original=>({...await original<typeof import('../src/api')>(),isConnected:()=>true}));
+vi.mock('../src/composerDrafts',()=>({readComposerDraft:vi.fn(async()=>undefined),saveComposerDraft:vi.fn(async()=>{})}));
+beforeEach(()=>{vi.mocked(loadAttachItems).mockReturnValue(new Promise(()=>{}));});
+afterEach(()=>{cleanup();vi.clearAllMocks();});
+it('sends plain text without waiting for unrelated project context and keeps the next draft editable',async()=>{
+ const send=vi.fn(()=>new Promise<boolean>(()=>{})),pending=vi.fn();
+ const view=render(()=><Composer scope="responsive" projectSlug="test" placeholder="Reply" busy allowConcurrentSend onSend={send} onPending={pending}/>);
+ const input=screen.getByPlaceholderText('Reply') as HTMLTextAreaElement;
+ fireEvent.input(input,{target:{value:'First message'}});fireEvent.keyDown(input,{key:'Enter'});
+ expect(input.value).toBe('');expect(input.readOnly).toBe(false);
+ expect(pending).toHaveBeenCalledWith(expect.objectContaining({text:'First message'}));
+ await waitFor(()=>expect(send).toHaveBeenCalledWith('First message',[]));
+ fireEvent.input(input,{target:{value:'My next draft'}});
+ await waitFor(()=>expect(saveComposerDraft).toHaveBeenCalledWith('responsive',expect.objectContaining({text:'My next draft'})));
+ view.unmount();
+ expect(vi.mocked(saveComposerDraft).mock.calls.at(-1)?.[1].text).toBe('My next draft');
+});
+it('still resolves explicit mentions before sending their attachments',async()=>{
+ let resolve!:(items:any[])=>void;
+ vi.mocked(loadAttachItems).mockReturnValue(new Promise(r=>resolve=r));
+ const send=vi.fn(async()=>true),attachments=vi.fn();
+ render(()=><Composer projectSlug="test" placeholder="Reply" busy={false} onSend={send} onAttachments={attachments}/>);
+ const input=screen.getByPlaceholderText('Reply');
+ fireEvent.input(input,{target:{value:'Read @proof.txt please'}});fireEvent.keyDown(input,{key:'Enter'});
+ await Promise.resolve();expect(send).not.toHaveBeenCalled();
+ resolve([{id:'proof',kind:'context',path:'proof.txt',label:'proof.txt',project:'test',section:'Files'}]);
+ await waitFor(()=>expect(send).toHaveBeenCalledOnce());
+ expect(attachments).toHaveBeenCalledWith([expect.objectContaining({id:'proof',path:'proof.txt'})]);
+});
+it('does not notify the parent attachment UI for every plain-text keystroke',()=>{
+ const attachments=vi.fn();
+ render(()=><Composer placeholder="Reply" busy={false} onSend={()=>{}} onAttachments={attachments}/>);
+ const input=screen.getByPlaceholderText('Reply');attachments.mockClear();
+ for(const text of ['h','he','hel','hell','hello'])fireEvent.input(input,{target:{value:text}});
+ expect(attachments).not.toHaveBeenCalled();
+});

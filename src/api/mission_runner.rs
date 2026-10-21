@@ -6481,6 +6481,12 @@ pub(crate) fn ensure_opencode_provider_for_model(
                 });
             }
             let mut model = serde_json::json!({"name": model_id});
+            if provider_id == "builtin" {
+                crate::opencode::effort::add_variants(
+                    &mut model,
+                    crate::opencode::effort::configured_efforts(app_working_dir, model_override),
+                );
+            }
             if provider_id != "builtin" {
                 model["id"] = serde_json::json!(format!("{provider_id}/{model_id}"));
             }

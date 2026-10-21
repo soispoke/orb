@@ -22,6 +22,7 @@ it('loads a bounded tail, recovers older tool calls and preserves them on refres
 });
 it('can replay live events after an older page without mutating reducer state',async()=>{
  vi.mocked(getMissionEventPage).mockResolvedValueOnce({events:[row(10,'user_message','Current')],nextCursor:10,pageMax:10,hasMore:true});
+ vi.mocked(getMissionEventPage).mockResolvedValueOnce({events:[],hasMore:false});
  const tail=await loadTranscript('live');
  vi.mocked(getMissionEventPage).mockResolvedValueOnce({events:[row(1,'user_message','Earlier')],nextCursor:1,pageMax:1,hasMore:false});
  const older=await loadOlderTranscript('live');
@@ -33,6 +34,7 @@ it('can replay live events after an older page without mutating reducer state',a
 });
 it('empty older pages terminate pagination without losing existing content',async()=>{
  vi.mocked(getMissionEventPage).mockResolvedValueOnce({events:[row(8,'user_message','Only retained history')],nextCursor:8,pageMax:8,hasMore:true});
+ vi.mocked(getMissionEventPage).mockResolvedValueOnce({events:[],hasMore:false});
  const tail=await loadTranscript('empty');
  vi.mocked(getMissionEventPage).mockResolvedValueOnce({events:[],hasMore:false});
  const older=await loadOlderTranscript('empty');expect(older.hasOlder).toBe(false);expect(older.items).toEqual(tail.items);

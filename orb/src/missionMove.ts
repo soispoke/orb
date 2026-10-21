@@ -1,8 +1,9 @@
 import { api, getApiUrl, getMission, connectionVersion } from './api';
 import { copyText } from './clipboard';
 const prefix = 'orb:cut-mission:';
-export async function cutMission(id: string): Promise<string> {
+export async function cutMission(id: string, prepared?: (text: string) => void): Promise<string> {
   const text = prefix + JSON.stringify({ id, backend: getApiUrl(), nonce: crypto.randomUUID() });
+  prepared?.(text);
   await copyText(text);
   return text;
 }
