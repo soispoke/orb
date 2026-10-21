@@ -7,7 +7,7 @@ pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read 
 /// "eta" or "status" there reads as background unless it is marked as a
 /// question awaiting an answer; the session instructions alone are not enough.
 pub fn midturn_text(text: &str) -> String {
-    format!("{text}\n\n<system-reminder>The user sent this while you were working. Reply to it in your next message (briefly for a status or ETA question), then continue the task.</system-reminder>")
+    format!("{text}\n\n<system-reminder>The user sent this while you were working. Answer it in a visible reply in your next message, not only in your thinking (briefly for a status or ETA question), then continue the task.</system-reminder>")
 }
 
 /// An assistant event is not a receipt for queued user input. Only that input's
@@ -46,7 +46,8 @@ mod tests {
     fn midturn_messages_keep_the_user_text_and_ask_for_a_reply() {
         let text = midturn_text("eta");
         assert!(text.starts_with("eta\n\n<system-reminder>"));
-        assert!(text.contains("Reply to it in your next message"));
+        assert!(text.contains("visible reply in your next message"));
+        assert!(text.contains("not only in your thinking"));
     }
 
     #[test]
