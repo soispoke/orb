@@ -67,6 +67,36 @@ impl Identity {
     }
 }
 
+/// The folder and HOME a mission's native thread is bound to, when that
+/// placement is still intact: same mission, workspace and account, and the
+/// bound cwd, HOME and CODEX_HOME still exist as the same directories. Core can
+/// later resolve the mission to another folder (a working-directory override, a
+/// relocated root, an upgrade); resuming in the bound placement keeps the
+/// thread's history, while a real change still fails closed.
+pub fn intact_bound_placement(
+    path: &Path,
+    mission_id: Uuid,
+    workspace_id: Uuid,
+    account: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    let bound = read(path).ok()??.identity;
+    if bound.mission_id != mission_id
+        || bound.workspace_id != workspace_id
+        || bound.account != account
+    {
+        return None;
+    }
+    let current = Identity::new(
+        mission_id,
+        workspace_id,
+        &bound.cwd,
+        &bound.home,
+        account.to_string(),
+    )
+    .ok()?;
+    (current == bound).then_some((bound.cwd, bound.home))
+}
+
 pub fn account_fingerprint(kind: &str, identity: &str) -> String {
     format!("{:x}", Sha256::digest(format!("{kind}:{identity}")))
 }
@@ -262,5 +292,61 @@ impl Lease {
         std::fs::rename(&tmp, &self.path)?;
         std::fs::File::open(self.path.parent().unwrap())?.sync_all()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn bind(dir: &Path, mission: Uuid, workspace: Uuid, account: &str) -> (PathBuf, PathBuf) {
+        let home = dir.join("mission");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let identity = Identity::new(mission, workspace, &home, &home, account.into()).unwrap();
+        let path = dir.join("binding.json");
+        let binding = Binding {
+            version: 1,
+            identity,
+            thread_id: Some("thread".into()),
+            goal_seen: false,
+        };
+        std::fs::write(&path, serde_json::to_vec(&binding).unwrap()).unwrap();
+        (path, home.canonicalize().unwrap())
+    }
+
+    #[test]
+    fn an_intact_bound_placement_is_kept_when_core_resolves_another_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mission, workspace) = (Uuid::new_v4(), Uuid::new_v4());
+        let (path, home) = bind(dir.path(), mission, workspace, "acct");
+        assert_eq!(
+            intact_bound_placement(&path, mission, workspace, "acct"),
+            Some((home.clone(), home.clone()))
+        );
+        // Another account, workspace or mission is a real change.
+        assert_eq!(
+            intact_bound_placement(&path, mission, workspace, "other"),
+            None
+        );
+        assert_eq!(
+            intact_bound_placement(&path, mission, Uuid::new_v4(), "acct"),
+            None
+        );
+        assert_eq!(
+            intact_bound_placement(&path, Uuid::new_v4(), workspace, "acct"),
+            None
+        );
+        // A replaced directory is not the bound one, even at the same path.
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        assert_eq!(
+            intact_bound_placement(&path, mission, workspace, "acct"),
+            None
+        );
+        // No binding: nothing to keep.
+        assert_eq!(
+            intact_bound_placement(&dir.path().join("none.json"), mission, workspace, "acct"),
+            None
+        );
     }
 }

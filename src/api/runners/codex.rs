@@ -1440,11 +1440,30 @@ async fn run_codex_turn(
                     },
                 },
             };
+        let (bound_cwd, bound_home) = match continuity::intact_bound_placement(
+            &native_input.path,
+            mission_id,
+            workspace.id,
+            &account,
+        ) {
+            Some((cwd, home)) => {
+                if cwd != codex_work_dir || home != mission_work_dir {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        bound_cwd = %cwd.display(),
+                        resolved_cwd = %codex_work_dir.display(),
+                        "Codex thread resumes in its intact bound workspace"
+                    );
+                }
+                (cwd, home)
+            }
+            None => (codex_work_dir.clone(), mission_work_dir.to_path_buf()),
+        };
         let identity = match continuity::Identity::new(
             mission_id,
             workspace.id,
-            &codex_work_dir,
-            mission_work_dir,
+            &bound_cwd,
+            &bound_home,
             account,
         ) {
             Ok(identity) => identity,
