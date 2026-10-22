@@ -499,6 +499,13 @@ pub(crate) fn codex_reply_is_substantive(final_message: &str) -> bool {
     text.chars().count() >= 400 && !codex_final_message_looks_like_progress_update(text)
 }
 
+/// A substantive answer stands without tool use, except when the message
+/// attached context to read: an answer that never opened it is not complete.
+pub(crate) fn codex_reply_stands_without_tools(user_message: &str, final_message: &str) -> bool {
+    codex_reply_is_substantive(final_message)
+        && !crate::api::mission_payload::asks_to_read_attached_context(user_message)
+}
+
 pub(crate) fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
     let assistant = assistant_message.trim().to_ascii_lowercase();
     if assistant.is_empty() {
@@ -2065,7 +2072,7 @@ pub(crate) async fn consume_codex_events(
     let stopped_before_required_tools = success
         && tool_events_seen == 0
         && tool_activity_required
-        && !codex_reply_is_substantive(&final_message);
+        && !codex_reply_stands_without_tools(user_message, &final_message);
     let stopped_on_progress_update = success
         && tool_activity_required
         && codex_final_message_looks_like_progress_update(&final_message);
@@ -2224,6 +2231,12 @@ mod tests {
         assert!(codex_reply_is_substantive(&review));
         assert!(!codex_reply_is_substantive("I'll run it."));
         assert!(!codex_reply_is_substantive(&format!("I'm running the benchmark now. {}", "x".repeat(500))));
+        // Attached context must be read: a long answer that never opened it
+        // still stopped before the required tools.
+        use crate::api::runners::codex::codex_reply_stands_without_tools;
+        assert!(codex_reply_stands_without_tools(draft, &review));
+        let attached = format!("{draft}\n\nRead attached context in `.paloma/attach.md`.");
+        assert!(!codex_reply_stands_without_tools(&attached, &review));
     }
 
     use super::{codex_transport_failure_stage, codex_transport_reason_is_retryable};

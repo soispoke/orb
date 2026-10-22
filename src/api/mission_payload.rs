@@ -645,6 +645,12 @@ impl Drop for MacDirectoryEntries {
 // assigning a new dispatch ID. Only this exact server format is resolved; paths
 // from prose are never opened. Snapshots are immutable once published.
 const SNAPSHOT_MARKER: &str = "<!-- paloma:attachment:";
+
+/// True when a harness prompt asks the agent to read context attached to it
+/// (both attachment forms point at a `.paloma/attach.md` manifest).
+pub fn asks_to_read_attached_context(prompt: &str) -> bool {
+    prompt.contains(".paloma/attach.md")
+}
 const SNAPSHOT_CAP: usize = 16 * 1024 * 1024;
 
 /// Attachment references are generated only after a snapshot is durably staged.
