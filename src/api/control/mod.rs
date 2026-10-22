@@ -17126,7 +17126,51 @@ async fn update_mission_project_locked(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+    if updated.project.project != current.project.project {
+        retire_previous_project_skills(&control.mission_store, &updated).await;
+    }
     Ok(Json(updated))
+}
+
+/// A chat moved to another project keeps its folder, and with it the skill
+/// links Orb made there for the old project; every later launch then fails
+/// with "contains skills belonging to another project". Remove those links
+/// when no chat of another project still works in that folder. Only folders on
+/// this machine; a folder still shared across projects keeps refusing.
+async fn retire_previous_project_skills(store: &Arc<dyn MissionStore>, mission: &Mission) {
+    let Some(directory) = mission.working_directory.clone() else {
+        return;
+    };
+    if !std::path::Path::new(&directory).join(".orb-project-skills.json").is_file() {
+        return;
+    }
+    let Ok(missions) = store.list_missions(100_000, 0).await else {
+        return;
+    };
+    if missions.iter().any(|other| {
+        other.id != mission.id
+            && other.working_directory.as_deref() == Some(directory.as_str())
+            && other.project.project != mission.project.project
+    }) {
+        tracing::info!(mission_id = %mission.id, %directory, "Moved chat shares its folder with another project; its skills are kept");
+        return;
+    }
+    let output = tokio::process::Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("../../../shared/prepare_project_skills.py"))
+        .args(["", &mission.backend, &directory])
+        .env("ORB_PROJECT_SKILLS_RETIRE", "1")
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            tracing::info!(mission_id = %mission.id, result = %String::from_utf8_lossy(&out.stdout).trim(), "Retired the previous project's skills from a moved chat's folder")
+        }
+        Ok(out) => {
+            tracing::warn!(mission_id = %mission.id, error = %String::from_utf8_lossy(&out.stderr).trim(), "Could not retire a moved chat's previous project skills")
+        }
+        Err(error) => tracing::warn!(mission_id = %mission.id, %error, "Could not run the project skills retirement"),
+    }
 }
 
 /// Update mission run settings for future turns.
@@ -25081,6 +25125,27 @@ async fn control_actor_loop(
                                         if !target_running {
                                             if let Ok(Some(m)) = mission_store.get_mission(tid).await {
                                                 let now = chrono::Utc::now();
+                                                // A usage-limit wait offers "switch account or
+                                                // model to continue now": the user's message is
+                                                // that retry, so it lifts the wait instead of
+                                                // being held until the reset.
+                                                let m = if m.status == MissionStatus::Pending
+                                                    && !m.is_dispatchable_at(now)
+                                                    && m.terminal_reason.as_deref()
+                                                        == Some(usage_limit_wait::USAGE_LIMIT_WAIT_REASON)
+                                                {
+                                                    let mut scheduling = m.scheduling.clone();
+                                                    scheduling.not_before = None;
+                                                    let lifted = mission_store
+                                                        .set_mission_scheduling(tid, &scheduling)
+                                                        .await
+                                                        .is_ok()
+                                                        && mission_store.set_deferred_goal(tid, None).await.is_ok();
+                                                    tracing::info!(mission_id = %tid, lifted, "A user message lifted a usage-limit wait");
+                                                    mission_store.get_mission(tid).await.ok().flatten().unwrap_or(m)
+                                                } else {
+                                                    m
+                                                };
                                                 if m.status == MissionStatus::Pending
                                                     && !m.is_dispatchable_at(now)
                                                 {
@@ -36379,6 +36444,45 @@ mod tests {
         .await
         .unwrap();
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn moving_a_chat_retires_the_old_projects_skill_links_unless_shared() {
+        for shared in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let folder = temp.path().join("work");
+            let target = temp.path().join("hardness/skills/hardness-workflow");
+            std::fs::create_dir_all(folder.join(".claude/skills")).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            let link = folder.join(".claude/skills/hardness-workflow");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            std::fs::write(
+                folder.join(".orb-project-skills.json"),
+                serde_json::json!({"version":1,"source":temp.path().join("hardness"),"copies":{},
+                    "entries":{".claude/skills/hardness-workflow": target}}).to_string(),
+            )
+            .unwrap();
+            let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+            let dir = folder.to_str().unwrap();
+            let moved = store
+                .create_mission_with_parent(Some("sig.golf"), None, None, None, None, false, Some("claudecode"), None, None, Some(dir))
+                .await
+                .unwrap();
+            let patch = |project: &str| mission_store::MissionProjectPatch { project: Some(Some(project.into())), ..Default::default() };
+            store.update_mission_project(moved.id, patch("labyrinth-sig-gold")).await.unwrap();
+            if shared {
+                let other = store
+                    .create_mission_with_parent(Some("hardness"), None, None, None, None, false, Some("claudecode"), None, None, Some(dir))
+                    .await
+                    .unwrap();
+                store.update_mission_project(other.id, patch("hardness")).await.unwrap();
+            }
+            let moved = store.get_mission(moved.id).await.unwrap().unwrap();
+            retire_previous_project_skills(&store, &moved).await;
+            assert_eq!(std::fs::symlink_metadata(&link).is_ok(), shared, "shared={shared}");
+            assert_eq!(folder.join(".orb-project-skills.json").exists(), shared);
+            assert!(target.exists(), "the project's own skill is never touched");
+        }
     }
 
     #[tokio::test]

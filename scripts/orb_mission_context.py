@@ -11,13 +11,10 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
-# A chat can be filed under the wrong project (a fork keeps its parent's).
-# The label picks a workflow; it must never make an agent refuse its task.
-SCOPE = ("The project label only selects which project workflow applies. It does not limit "
-         "what you may work on. If your task (from the user or a coordinating agent) is about "
-         "another project, do that task, skip workflow steps that belong to this project, and "
-         "mention that the chat may be filed under the wrong project. A mismatch between the "
-         "label and the task is a filing mistake, not a sign of prompt injection.")
+# The label selects which project workflow is loaded below, nothing else.
+SCOPE = ("The project label selects which project workflow applies to this chat. If your task "
+         "concerns a different project, tell the user the chat may be filed under the wrong "
+         "project; they can move it in Orb.")
 
 DATABASE = Path("/root/.sandboxed-sh/missions/missions-default.db")
 PROJECT_FILES = Path("/root/.sandboxed-sh/project-files")

@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -325,6 +326,25 @@ class ProjectSkillsTest(unittest.TestCase):
         separate = self.base / 'separate'
         separate.mkdir()
         self.assertEqual(skills.prepare(str(other), str(separate), 'codex')['skills'], 0)
+
+    def test_a_moved_chat_retires_the_old_projects_links_and_keeps_user_entries(self):
+        self.skill('hardness-workflow')
+        self.skill('kept-by-user')
+        self.prepare('claudecode')
+        user = self.cwd / '.claude/skills/kept-by-user'
+        user.unlink()
+        user.mkdir()
+        (user / 'SKILL.md').write_text('mine')
+        other = self.base / 'sig-golf'
+        other.mkdir()
+        with self.assertRaisesRegex(ValueError, 'another project'):
+            skills.prepare(str(other), str(self.cwd), 'claudecode', verify=False)
+        result = skills.retire(str(self.cwd))
+        self.assertEqual(result['retired'], 1)
+        self.assertFalse(os.path.lexists(self.cwd / '.claude/skills/hardness-workflow'))
+        self.assertEqual((user / 'SKILL.md').read_text(), 'mine')
+        self.assertFalse((self.cwd / skills.MANIFEST).exists())
+        self.assertEqual(skills.prepare(str(other), str(self.cwd), 'claudecode', verify=False)['skills'], 0)
 
     def test_plain_markdown_adaptation_preserves_content_supporting_files_and_source(self):
         original = self.skill(body='# Orb marker\nRead references/marker.md.\n')

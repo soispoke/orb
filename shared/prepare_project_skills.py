@@ -273,9 +273,37 @@ def prepare(source, cwd, harness, verify=True, cleanup_only=False, discovery_roo
         return {"skills": len(skills), "source": source}
 
 
+def retire(cwd):
+    """A chat moved to another project: remove the discovery links and copies
+    Orb made in its folder for the previous project. Entries a user replaced
+    are left in place and simply no longer managed. Called by Core only when no
+    chat of another project still works in this folder."""
+    cwd = Path(cwd).resolve(strict=True)
+    lock_path = cwd / ".orb-project-skills.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_state(cwd)
+        removed = 0
+        for relative, target in state["entries"].items():
+            if owns_entry(cwd, state, relative, target):
+                path = cwd / relative
+                if relative in state["copies"]:
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                removed += 1
+        if (cwd / MANIFEST).exists():
+            (cwd / MANIFEST).unlink()
+        return {"retired": removed, "previous_source": state["source"]}
+
+
 if __name__ == "__main__":
     try:
         source, harness, *directory = sys.argv[1:]
+        if os.environ.get("ORB_PROJECT_SKILLS_RETIRE") == "1":
+            print(json.dumps(retire(directory[0] if directory else os.getcwd())))
+            sys.exit(0)
         print(json.dumps(prepare(source or None, directory[0] if directory else os.getcwd(), harness, cleanup_only=os.environ.get("ORB_PROJECT_SKILLS_CLEANUP_ONLY") == "1", discovery_roots=json.loads(os.environ.get("ORB_PROJECT_SKILLS_DISCOVERY_ROOTS", "[]")))))
     except Exception as error:
         print(f"Prepare project skills: {error} Fix the project files or working directory and retry; your draft is kept.", file=sys.stderr)

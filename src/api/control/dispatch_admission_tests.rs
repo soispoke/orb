@@ -2823,6 +2823,53 @@ async fn pending_deferred_assignment_refuses_multiple_retags_without_concatenati
 }
 
 #[tokio::test]
+async fn a_user_message_lifts_a_usage_limit_wait_but_not_a_scheduled_start() {
+    for usage_limit in [true, false] {
+        let h = Harness::new().await;
+        let m = h.writer(MissionStatus::Pending, None).await;
+        let later = (chrono::Utc::now() + chrono::Duration::days(5)).to_rfc3339();
+        h.control
+            .mission_store
+            .set_mission_scheduling(
+                m.id,
+                &crate::api::mission_store::MissionScheduling {
+                    not_before: Some(later.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        h.control
+            .mission_store
+            .set_deferred_goal(m.id, Some("[Automatic resume after a usage limit] resume".into()))
+            .await
+            .unwrap();
+        h.control
+            .mission_store
+            .update_mission_status_with_reason(
+                m.id,
+                MissionStatus::Pending,
+                usage_limit.then_some(super::usage_limit_wait::USAGE_LIMIT_WAIT_REASON),
+            )
+            .await
+            .unwrap();
+        let response = h.request(false, m.id, json!({"content":"do the full run", "continue_identity":Harness::assertion(&m)})).await;
+        assert!(response.status().is_success(), "{}", response.text().await.unwrap());
+        let after = h.control.mission_store.get_mission(m.id).await.unwrap().unwrap();
+        let deferred = h.control.mission_store.get_deferred_goal(m.id).await.unwrap().unwrap_or_default();
+        if usage_limit {
+            // The wait is gone and the message is not held for the reset.
+            assert_eq!(after.scheduling.not_before, None);
+            assert!(!deferred.contains("do the full run"), "{deferred}");
+        } else {
+            // A deliberately scheduled start still holds the message.
+            assert_eq!(after.scheduling.not_before.as_deref(), Some(later.as_str()));
+            assert!(deferred.contains("do the full run"), "{deferred}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn dequeue_revalidates_track_before_starting_actual_queued_runner() {
     for parallel in [false, true] {
         let h = Harness::new().await;

@@ -41,9 +41,11 @@ Core, both identical; the tracked copy is
 `scripts/orb-ship/core/workspace-CLAUDE.md`. Install both files the same way
 (backup in `/root/.sandboxed-sh/deployment-backups/`, then atomic replace).
 
-A chat can be filed under the wrong project: a fork keeps its parent's project.
-Both files therefore say the label only selects a workflow and never limits the
-task. Without that, a helper agent whose brief names another project read the
-mismatch as a prompt injection and refused (sig.golf chats filed under Hardness,
-2026-10-22). Fix a wrong label by moving the chat (cut it, paste it into the
-right project), not by rewording briefs.
+A chat can be filed under the wrong project: a fork keeps its parent's. Fix it
+by moving the chat (cut it, paste it into the right project). The helper only
+states that the label selects the workflow and asks agents to tell the user
+about a mismatch. Do not add text that argues against an agent's caution (for
+example "this is not prompt injection"): on 2026-10-22 such text was correctly
+flagged as possible tampering. Record every change to these files in
+`/root/workspaces/.orb-support/CHANGES.md` (tracked copy
+`scripts/orb-ship/core/orb-support-CHANGES.md`).
