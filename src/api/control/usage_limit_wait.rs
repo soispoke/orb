@@ -251,6 +251,59 @@ fn another_account_usable(backend: &str, files: &serde_json::Value, now: DateTim
     })
 }
 
+/// How often parked chats are checked against the proxy's live accounts.
+const REVIVE_INTERVAL_SECS: u64 = 5 * 60;
+
+/// Chats parked because every account was used up resume as soon as one has
+/// quota again (reconnected, newly added, or reset early), instead of waiting
+/// for the date they were given. Only the start date is dropped: the held
+/// resume, and any messages appended to it, run in order.
+pub(crate) async fn revive_loop(store: Arc<dyn MissionStore>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(REVIVE_INTERVAL_SECS));
+    loop {
+        tick.tick().await;
+        let Some(files) = proxy_auth_files().await else { continue };
+        let now = Utc::now();
+        let missions = parked_on_usage_limit(&store).await;
+        for mission in revivable(&missions, &files, now) {
+            let mut scheduling = mission.scheduling.clone();
+            scheduling.not_before = None;
+            let revived = store.set_mission_scheduling(mission.id, &scheduling).await.is_ok();
+            tracing::info!(mission_id = %mission.id, revived, "An account has quota again; resuming a chat parked on a usage limit");
+        }
+    }
+}
+
+/// Chats parked on a usage limit, loaded in full (the list view omits their
+/// schedule).
+async fn parked_on_usage_limit(store: &Arc<dyn MissionStore>) -> Vec<Mission> {
+    let Ok(listed) = store.list_missions(100_000, 0).await else {
+        return vec![];
+    };
+    let mut parked = vec![];
+    for listed in listed.iter().filter(|m| {
+        m.status == MissionStatus::Pending && m.terminal_reason.as_deref() == Some(USAGE_LIMIT_WAIT_REASON)
+    }) {
+        if let Ok(Some(mission)) = store.get_mission(listed.id).await {
+            parked.push(mission);
+        }
+    }
+    parked
+}
+
+/// The parked chats whose provider has an account with quota again.
+fn revivable<'a>(missions: &'a [Mission], files: &serde_json::Value, now: DateTime<Utc>) -> Vec<&'a Mission> {
+    missions
+        .iter()
+        .filter(|m| {
+            m.status == MissionStatus::Pending
+                && m.terminal_reason.as_deref() == Some(USAGE_LIMIT_WAIT_REASON)
+                && !m.is_dispatchable_at(now)
+                && another_account_usable(&m.backend, files, now)
+        })
+        .collect()
+}
+
 /// Decide whether the mission of a finished turn waits for a usage limit.
 ///
 /// `None` keeps the previous outcome (the mission fails) when the store
@@ -910,6 +963,34 @@ pub(crate) fn after_replay_failure(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn parked_chats_resume_when_an_account_has_quota_again() {
+        // The real store: the in-memory one does not keep schedules.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn MissionStore> = Arc::new(
+            SqliteMissionStore::new(dir.path().to_path_buf(), "test-user").await.expect("store"),
+        );
+        let now = Utc::now();
+        let later = (now + Duration::days(5)).to_rfc3339();
+        let mut ids = vec![];
+        for (backend, reason) in [("codex", Some(USAGE_LIMIT_WAIT_REASON)), ("codex", None), ("claudecode", Some(USAGE_LIMIT_WAIT_REASON))] {
+            let m = store.create_mission(Some("parked"), None, None, None, None, Some(backend), None).await.unwrap();
+            store.set_mission_scheduling(m.id, &crate::api::mission_store::MissionScheduling { not_before: Some(later.clone()), ..Default::default() }).await.unwrap();
+            store.update_mission_status_with_reason(m.id, MissionStatus::Pending, reason).await.unwrap();
+            ids.push(m.id);
+        }
+        let missions = parked_on_usage_limit(&store).await;
+        assert_eq!(missions.len(), 2, "only chats parked on a usage limit");
+        let used_up = serde_json::json!({"type":"codex","disabled":false,"cooldowns":[{"reason":"credential_quota","retry_at":later}]});
+        let fresh = serde_json::json!({"type":"codex","disabled":false,"cooldowns":[]});
+        // Every codex account still used up: nothing resumes.
+        assert!(revivable(&missions, &serde_json::json!({"files":[used_up.clone()]}), now).is_empty());
+        // A reconnected codex account: only the codex chat parked on a usage
+        // limit resumes; a deliberately scheduled chat and the Claude one wait.
+        let revived: Vec<_> = revivable(&missions, &serde_json::json!({"files":[used_up, fresh]}), now).iter().map(|m| m.id).collect();
+        assert_eq!(revived, vec![ids[0]]);
+    }
+
     #[test]
     fn an_account_that_only_failed_transiently_is_still_usable() {
         let now = DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z").unwrap().with_timezone(&Utc);

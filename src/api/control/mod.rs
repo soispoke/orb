@@ -21601,6 +21601,10 @@ fn spawn_control_session(
         });
     }
 
+    if state.mission_store.is_persistent() {
+        tokio::spawn(usage_limit_wait::revive_loop(Arc::clone(&state.mission_store)));
+    }
+
     // Spawn background stale mission cleanup task (if enabled)
     if config.stale_mission_hours > 0 && state.mission_store.is_persistent() {
         tokio::spawn(stale_mission_cleanup_loop(
