@@ -23,6 +23,10 @@ step=icon-build; mkdir -p "$tauri/gen/app-icon"; xcrun actool "$tauri/icons/Orb.
   --minimum-deployment-target 11.0 --platform macosx >"$logs/$step.log" 2>&1
 step=frontend-install; pnpm install --frozen-lockfile >"$logs/$step.log" 2>&1
 step=typecheck; pnpm exec tsc --noEmit >"$logs/$step.log" 2>&1
+# Gates: a failing test stops the build. The native set covers the local runner
+# (including the after-reboot recovery), live input and the saved connection.
+step=app-tests; NODE_OPTIONS=--no-experimental-webstorage pnpm exec vitest run >"$logs/$step.log" 2>&1
+step=native-tests; cargo test --offline --manifest-path "$tauri/Cargo.toml" -- local_runtime live_input connection_store >"$logs/$step.log" 2>&1
 step=frontend-build; pnpm exec vite build >"$logs/$step.log" 2>&1
 cd "$repo"
 step=native-build; CARGO_TARGET_DIR="$target" CARGO_PROFILE_DEV_DEBUG=0 \

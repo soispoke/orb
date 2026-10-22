@@ -16,7 +16,10 @@ record = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'scope
 
 with open(g.ROOT / 'boot.lock', 'a+') as lock:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    before = g.rpc('status'); rows = g.processes()
+    # No local runner (e.g. right after a reboot): no runs to preserve; the
+    # restarted app starts a fresh one.
+    worker = (g.ROOT / 'owner.sock').exists()
+    before = g.rpc('status') if worker else None; rows = g.processes()
     ui = [p for p, r in rows.items() if r['exe'] == str(exe)
           and subprocess.check_output(['ps', '-p', str(p), '-o', 'args='], text=True).strip() == str(exe)]
     assert len(ui) == 1, ui
@@ -25,7 +28,7 @@ with open(g.ROOT / 'boot.lock', 'a+') as lock:
     assert all(q.get('decoded') and not any(r.get('state') == 'dispatching' for r in q.get('metadata', []))
                for q in queue_rows if q.get('kind') == 'queue'), 'A message is being delivered; try again in a moment'
     protected = {p: r for p, r in rows.items()
-                 if p == before['pid'] or p in g.descendants(rows, before['pid']) or Path(r['exe']).name in ('lake', 'lean')}
+                 if (before and (p == before['pid'] or p in g.descendants(rows, before['pid']))) or Path(r['exe']).name in ('lake', 'lean')}
     record.update(worker_before=before, protected_before=protected, queue_metadata=queue_rows)
     (stage / 'UI_ACTIVATION_BEFORE.json').write_text(json.dumps(record, indent=2))
 
@@ -46,7 +49,7 @@ with open(g.ROOT / 'boot.lock', 'a+') as lock:
     deadline = time.monotonic() + 60
     while ui[0] in g.processes() and time.monotonic() < deadline: time.sleep(.1)
     assert ui[0] not in g.processes(), 'UI did not quit; nothing was forced or replaced'
-    assert g.rpc('status')['pid'] == before['pid']
+    if before: assert g.rpc('status')['pid'] == before['pid']
     assert g.digest(exe) == v['installed_sha256']
     app.rename(rollback)
     try:
@@ -55,9 +58,9 @@ with open(g.ROOT / 'boot.lock', 'a+') as lock:
         if not app.exists(): rollback.rename(app)
         raise
 
-after = g.rpc('status'); now = g.processes()
-assert after['pid'] == before['pid'] and after['executable'] == before['executable']
-for r in before['runs']:
+after = g.rpc('status') if before else None; now = g.processes()
+if before: assert after['pid'] == before['pid'] and after['executable'] == before['executable']
+for r in (before['runs'] if before else []):
     if not r['done']:
         m = [q for q in after['runs'] if q['mission_id'] == r['mission_id']]
         assert m and m[0]['native_generation'] == r['native_generation'], f"run changed: {r['mission_id']}"
@@ -69,4 +72,4 @@ subprocess.run(['open', '-a', str(app)], check=True)
 record['ui_relaunch_requested'] = True
 (stage / 'ACTIVATED.json').write_text(json.dumps(record, indent=2))
 print('INSTALLED', json.dumps({k: record[k] for k in ['installed_sha256', 'preserved_processes', 'exited_during_window']}
-                              | {'worker_pid': after['pid'], 'runs': len(after['runs'])}))
+                              | {'worker_pid': after['pid'] if after else None, 'runs': len(after['runs']) if after else 0}))

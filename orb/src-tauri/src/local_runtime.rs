@@ -181,13 +181,15 @@ fn pin_executable(root: &Path) -> Result<PathBuf, String> {
     }
     Ok(dest)
 }
-fn connection() -> Result<UnixStream, String> {
-    let root = root()?;
-    private_root(&root)?;
+/// Decide who owns local execution. `Ok(Ok(stream))`: a live worker answered.
+/// `Ok(Err(boot))`: no worker is alive and nothing it started survived; the
+/// caller may start one while holding `boot`. Anything uncertain is an error.
+fn claim_owner_slot(root: &Path) -> Result<Result<UnixStream, File>, String> {
+    let root = root.to_path_buf();
     if root.join("owner.sock").exists() {
         // Only an unreachable socket may be stale; any other answer is final.
         match connect_at(&root) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => return Ok(Ok(stream)),
             Err(error) if error != UNCERTAIN => return Err(error),
             Err(_) => {}
         }
@@ -197,7 +199,7 @@ fn connection() -> Result<UnixStream, String> {
     if root.join("owner.sock").exists() {
         // Only an unreachable socket may be stale; any other answer is final.
         match connect_at(&root) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => return Ok(Ok(stream)),
             Err(error) if error != UNCERTAIN => return Err(error),
             Err(_) => {}
         }
@@ -206,9 +208,8 @@ fn connection() -> Result<UnixStream, String> {
     owner.try_lock_exclusive().map_err(|_| UNCERTAIN)?;
     // A live worker holds owner.lock for its whole life, so a free lock means
     // the worker is gone (a crash, or every reboot). Its record and socket are
-    // then stale. Children that might have survived still block a new worker:
-    // each holds its run lock, checked below.
-    retire_dead_owner_files(&root)?;
+    // stale, but are only set aside once the checks below show that nothing it
+    // started survived (each child holds its run lock).
     FileExt::unlock(&owner).map_err(|e| e.to_string())?;
     let run_locks = root
         .parent()
@@ -261,6 +262,18 @@ fn connection() -> Result<UnixStream, String> {
             }
         }
     }
+    // Starters hold boot.lock, so no worker can appear before ours starts.
+    retire_dead_owner_files(&root)?;
+    Ok(Err(boot))
+}
+
+fn connection() -> Result<UnixStream, String> {
+    let root = root()?;
+    private_root(&root)?;
+    let _boot = match claim_owner_slot(&root)? {
+        Ok(stream) => return Ok(stream),
+        Err(boot) => boot,
+    };
     let exe = pin_executable(&root)?;
     let mut command = Command::new(exe);
     command
@@ -786,6 +799,66 @@ printf '%s\n' '{"type":"result"}'
         std::os::unix::fs::symlink(dir.path(), &symlink).unwrap();
         assert!(private_root(&symlink).is_err());
     }
+    /// The state a reboot leaves: the worker's record and socket survive, every
+    /// lock is free, and finished local chats remain in the journal.
+    fn after_reboot(dir: &Path) -> (PathBuf, PathBuf) {
+        let home = dir.join("home");
+        let root = dir.join("r");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir_all(home.join(".orb")).unwrap();
+        let orb = root.parent().unwrap();
+        std::fs::create_dir_all(orb.join("run-locks")).unwrap();
+        std::fs::write(orb.join("run-locks/old-chat.lock"), "").unwrap();
+        std::fs::create_dir_all(orb.join("local-origins/account")).unwrap();
+        std::fs::write(
+            orb.join("local-origins/account/old-chat.json"),
+            r#"{"snapshot":{"status":"awaiting_user"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("owner.json"), r#"{"protocol":1,"pid":90812}"#).unwrap();
+        drop(UnixListener::bind(root.join("owner.sock")).unwrap());
+        (root, home)
+    }
+
+    #[test]
+    fn after_a_reboot_a_fresh_worker_starts_and_answers() {
+        let dir = tempfile::Builder::new().prefix("orb-boot-").tempdir_in("/tmp").unwrap();
+        let (root, home) = after_reboot(dir.path());
+        let boot = claim_owner_slot(&root).unwrap().expect_err("no live worker: the slot is ours");
+        assert!(!root.join("owner.json").exists() && !root.join("owner.sock").exists());
+        drop(boot);
+        let mut worker = fixture(&root, &home);
+        wait_for(|| connect_at(&root).is_ok());
+        let hello = request(connect_at(&root).unwrap(), "status", json!({})).unwrap();
+        assert_eq!(hello["execution_owner"], "worker");
+        // The next start finds that worker instead of starting another.
+        let mut stream = claim_owner_slot(&root).unwrap().expect("connects to the live worker");
+        send(&mut stream, &json!({"method":"status","args":{}})).unwrap();
+        assert_eq!(receive(&mut stream).unwrap()["result"]["pid"], hello["pid"]);
+        let _ = worker.kill();
+        let _ = worker.wait();
+    }
+
+    #[test]
+    fn a_surviving_chat_or_a_live_worker_blocks_a_new_one_and_nothing_is_touched() {
+        // A chat process survived: it still holds its run lock.
+        let dir = tempfile::Builder::new().prefix("orb-boot-").tempdir_in("/tmp").unwrap();
+        let (root, _) = after_reboot(dir.path());
+        let child = lock(&root.parent().unwrap().join("run-locks/old-chat.lock")).unwrap();
+        child.lock_exclusive().unwrap();
+        assert!(claim_owner_slot(&root).unwrap_err().contains("still owns local work"));
+        assert!(root.join("owner.json").exists() && root.join("owner.sock").exists());
+        drop(child);
+        // A live worker (it holds owner.lock) whose socket does not answer.
+        let dir = tempfile::Builder::new().prefix("orb-boot-").tempdir_in("/tmp").unwrap();
+        let (root, _) = after_reboot(dir.path());
+        let live = lock(&root.join("owner.lock")).unwrap();
+        live.lock_exclusive().unwrap();
+        assert_eq!(claim_owner_slot(&root).unwrap_err(), UNCERTAIN);
+        assert!(root.join("owner.json").exists() && root.join("owner.sock").exists());
+    }
+
     #[test]
     fn a_worker_lost_in_a_reboot_leaves_files_a_new_worker_can_replace() {
         let dir = tempfile::Builder::new().prefix("orb-dead-").tempdir_in("/tmp").unwrap();
