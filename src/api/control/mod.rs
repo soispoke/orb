@@ -19779,6 +19779,59 @@ async fn cleanup_mission_workspace_dirs_for_delete(
             ),
         ));
     }
+    // A fork is recorded as a child of the chat it came from, so deleting an
+    // old fork would also delete every newer fork still in use, and the folder
+    // they all share. Refuse instead: open descendants and other chats that
+    // still use a folder this delete would remove keep it.
+    let open: Vec<&Mission> = missions
+        .iter()
+        .skip(1)
+        .filter(|m| !matches!(
+            m.status,
+            MissionStatus::Completed | MissionStatus::Failed | MissionStatus::NotFeasible | MissionStatus::Acknowledged
+        ))
+        .collect();
+    if !open.is_empty() {
+        let names: Vec<String> = open.iter().map(|m| format!("\"{}\"", m.title.as_deref().unwrap_or("Untitled"))).collect();
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{} chat(s) forked from this one or started by it are still open and would be deleted too: {}. Archive this chat instead, or delete those first.",
+                open.len(),
+                names.join(", ")
+            ),
+        ));
+    }
+    let mut doomed_dirs = Vec::new();
+    for mission in &missions {
+        if let Some(ws) = workspaces.get(mission.workspace_id).await {
+            doomed_dirs.push(workspace::mission_workspace_dir_for_workspace(&ws, mission.id));
+        }
+    }
+    let doomed_ids: HashSet<Uuid> = missions.iter().map(|m| m.id).collect();
+    let others = mission_store
+        .list_missions(100_000, 0)
+        .await
+        .map_err(internal_error)?;
+    if let Some(user) = others.iter().find(|m| {
+        !doomed_ids.contains(&m.id)
+            && (m.project.tags.iter().any(|tag| {
+                tag.strip_prefix("fork-workspace:")
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    .is_some_and(|id| doomed_ids.contains(&id))
+            }) || m.working_directory.as_deref().is_some_and(|wd| {
+                doomed_dirs.iter().any(|dir| std::path::Path::new(wd).starts_with(dir))
+            }))
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "\"{}\" still works in this chat's folder, so deleting it would remove that chat's files. Archive this chat instead.",
+                user.title.as_deref().unwrap_or("Another chat")
+            ),
+        ));
+    }
+
     let mut deleted_dirs = Vec::new();
     for mission in missions {
         let Some(ws) = workspaces.get(mission.workspace_id).await else {
@@ -36326,6 +36379,88 @@ mod tests {
         .await
         .unwrap();
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn deleting_an_old_fork_keeps_newer_forks_and_their_shared_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let original = store
+            .create_mission(Some("sig.golf"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let fork = store
+            .create_mission_with_parent(Some("sig.golf · fork"), None, None, None, None, false, None, None, Some(original.id), None)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(fork.id, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                fork.id,
+                mission_store::MissionProjectPatch {
+                    tags: Some(vec![format!("fork-workspace:{}", original.id)]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let shared = workspace::mission_workspace_dir_for_root(temp.path(), original.id);
+        tokio::fs::create_dir_all(&shared).await.unwrap();
+
+        let refused = cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, original.id, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("sig.golf · fork"), "{}", refused.1);
+        assert!(shared.exists());
+
+        // A finished fork no longer blocks, but it still uses the folder
+        // unless it is deleted too; here it is, so the delete proceeds.
+        store
+            .update_mission_status(fork.id, MissionStatus::Acknowledged)
+            .await
+            .unwrap();
+        cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, original.id, &[])
+            .await
+            .expect("an archived chain can be deleted");
+        assert!(!shared.exists());
+    }
+
+    #[tokio::test]
+    async fn a_chat_using_another_chats_folder_keeps_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let owner = store
+            .create_mission(Some("Owner"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let folder = workspace::mission_workspace_dir_for_root(temp.path(), owner.id);
+        tokio::fs::create_dir_all(folder.join("work")).await.unwrap();
+        let user = store
+            .create_mission(Some("Uses the folder"), None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                user.id,
+                mission_store::MissionProjectPatch {
+                    tags: Some(vec![format!("fork-workspace:{}", owner.id)]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let refused = cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, owner.id, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("Uses the folder"), "{}", refused.1);
+        assert!(folder.join("work").exists());
     }
 
     #[tokio::test]
