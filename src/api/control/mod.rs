@@ -29597,6 +29597,27 @@ async fn control_actor_loop(
                                         }
                                     }
                                 }
+                                // Goal mode for a turn the main queue ran (a message to an idle
+                                // mission): continue it exactly as a parallel runner would.
+                                if !transport_requeued
+                                    && completed_execution_outcome.as_ref().is_some_and(|(success, _)| *success)
+                                    && completed_terminal_reason == Some(TerminalReason::TurnComplete)
+                                    && !completed_cancellation_requested
+                                    && !queue_has_pending_target_mission(&queue, mission_id)
+                                {
+                                    if let Some(prompt) = goal_continuation::next(mission_store.as_ref(), mission_id)
+                                        .await
+                                        .filter(|_| goal_continuation::take_turn(&mut goal_auto_turns, mission_id))
+                                    {
+                                        match activate_mission_id_for_message(&control_hub, &mission_store, &events_tx, mission_id, &prompt).await {
+                                            Ok(()) => {
+                                                tracing::info!(%mission_id, "Goal mode: queueing the next turn automatically");
+                                                queue.push_back((Uuid::new_v4(), prompt, None, Some(mission_id), Some(goal_continuation::SOURCE.to_string())));
+                                            }
+                                            Err(error) => tracing::warn!(%mission_id, "Goal continuation could not reactivate mission: {error}"),
+                                        }
+                                    }
+                                }
                                 if !transport_requeued {
                                     if let Some((success, error)) = completed_execution_outcome {
                                         if let Err(error) = mission_store.complete_turn_executions_for_mission(mission_id, completed_message_id, success, error).await {

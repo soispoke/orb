@@ -12874,6 +12874,53 @@ async fn a_typed_stop_ends_the_automatic_turns() {
 }
 
 #[tokio::test]
+async fn a_goal_turn_on_the_main_queue_is_continued_too() {
+    // A message to the actor's current mission runs on the main queue, not a
+    // parallel runner. Resumed goal lanes took that path and went idle.
+    let h = Harness::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let m = h
+        .control
+        .mission_store
+        .create_mission_with_parent(
+            Some("goal"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("claudecode"),
+            None,
+            None,
+            Some(dir.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    SCRIPTED.lock().unwrap().insert(
+        m.id,
+        ([true, true, false].into_iter().collect(), Vec::new()),
+    );
+    h.control
+        .mission_store
+        .update_mission_goal(m.id, true, Some("ship the package"))
+        .await
+        .unwrap();
+    *h.control.current_mission.write().await = Some(m.id);
+    assert!(h
+        .request(false, m.id, json!({"content": "keep at it"}))
+        .await
+        .status()
+        .is_success());
+    let settled = wait_settled(&h, m.id).await;
+    let prompts = scripted_prompts(m.id);
+    assert_eq!(prompts.len(), 3, "{prompts:#?}");
+    assert!(prompts[1..]
+        .iter()
+        .all(|p| p.contains("Goal mode is on") && p.contains("ship the package")));
+    assert_eq!(settled.status, MissionStatus::AwaitingUser);
+}
+
+#[tokio::test]
 async fn automatic_turns_stop_at_the_cap() {
     let h = Harness::new().await;
     let id = scripted_goal_mission(&h, "opencode", &vec![true; goal_continuation::MAX_CONSECUTIVE + 10]).await;
