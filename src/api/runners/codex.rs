@@ -1382,8 +1382,17 @@ async fn run_codex_turn(
     // and the fallback attempt would fail instead of authenticating with
     // its own credential. Strip only our own stanza; an operator-set
     // provider is left untouched.
+    // A bound native thread reads its config and auth from its bound HOME,
+    // which can differ from the folder Core resolved for this turn.
+    let codex_state_home = native_input
+        .enabled
+        .then(|| continuity::read(&native_input.path).ok().flatten())
+        .flatten()
+        .map(|binding| binding.identity.home)
+        .filter(|home| home.join(".codex").is_dir())
+        .unwrap_or_else(|| mission_work_dir.to_path_buf());
     if codex_proxy.is_none() {
-        let config_path = mission_work_dir.join(".codex").join("config.toml");
+        let config_path = codex_state_home.join(".codex").join("config.toml");
         if let Ok(existing) = std::fs::read_to_string(&config_path) {
             let stripped = crate::workspace::config::strip_codex_cli_proxy_provider(&existing);
             if stripped != existing {
@@ -1458,7 +1467,7 @@ async fn run_codex_turn(
                     app_working_dir,
                 ) {
                     Some(key) => continuity::account_fingerprint("apikey", &key),
-                    None => match staged_codex_account_identity(mission_work_dir) {
+                    None => match staged_codex_account_identity(&codex_state_home) {
                         Some(account) => account,
                         None => return continuity_failure(
                             "native account identity is unavailable; refusing an unbound launch",
