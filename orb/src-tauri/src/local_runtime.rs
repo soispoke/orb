@@ -240,7 +240,10 @@ fn claim_owner_slot(root: &Path) -> Result<Result<UnixStream, File>, String> {
                     let record: Value =
                         serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
                             .map_err(|_| "Unconfirmed legacy journal")?;
-                    if !matches!(
+                    // Core refused a rejected record for good: it is never synced
+                    // or resumed again, whatever status it last recorded.
+                    let rejected = record["rejected"].as_bool() == Some(true);
+                    if !rejected && !matches!(
                         record["snapshot"]["status"].as_str(),
                         Some(
                             "failed"
@@ -816,6 +819,12 @@ printf '%s\n' '{"type":"result"}'
             r#"{"snapshot":{"status":"awaiting_user"}}"#,
         )
         .unwrap();
+        // Left "active" when Core refused it (seen after the 2026-10-22 reboot).
+        std::fs::write(
+            orb.join("local-origins/account/refused-chat.json"),
+            r#"{"rejected":true,"snapshot":{"status":"active"}}"#,
+        )
+        .unwrap();
         std::fs::write(root.join("owner.json"), r#"{"protocol":1,"pid":90812}"#).unwrap();
         drop(UnixListener::bind(root.join("owner.sock")).unwrap());
         (root, home)
@@ -856,6 +865,17 @@ printf '%s\n' '{"type":"result"}'
         let live = lock(&root.join("owner.lock")).unwrap();
         live.lock_exclusive().unwrap();
         assert_eq!(claim_owner_slot(&root).unwrap_err(), UNCERTAIN);
+        assert!(root.join("owner.json").exists() && root.join("owner.sock").exists());
+        drop(live);
+        // A chat that may really still be running (active, not refused) blocks.
+        let dir = tempfile::Builder::new().prefix("orb-boot-").tempdir_in("/tmp").unwrap();
+        let (root, _) = after_reboot(dir.path());
+        std::fs::write(
+            root.parent().unwrap().join("local-origins/account/running-chat.json"),
+            r#"{"snapshot":{"status":"active"}}"#,
+        )
+        .unwrap();
+        assert!(claim_owner_slot(&root).unwrap_err().contains("active or unconfirmed work"));
         assert!(root.join("owner.json").exists() && root.join("owner.sock").exists());
     }
 
