@@ -621,7 +621,7 @@ async fn send_message_streaming_app_server(
         thread,
         inbound,
         is_goal_mission,
-        mut pending_steer,
+        pending_hint,
         initial_objective,
         pre_activation_messages,
         plan_model,
@@ -660,19 +660,24 @@ async fn send_message_streaming_app_server(
             native_thread_id: Some(thread_id.clone()),
             ..Default::default()
         };
-        let mut observed_turn_id = thread
-            .turns
-            .iter()
-            .find(|turn| turn["status"] == "inProgress")
-            .and_then(|turn| turn["id"].as_str())
-            .map(str::to_string);
+        let mut steer = SteerSlot {
+            turn_id: thread
+                .turns
+                .iter()
+                .find(|turn| turn["status"] == "inProgress")
+                .and_then(|turn| turn["id"].as_str())
+                .map(str::to_string),
+            ..Default::default()
+        };
         if is_goal_mission {
-            if let Some(id) = &observed_turn_id {
+            if let Some(id) = &steer.turn_id {
                 translator.goal_active_turns.insert(id.clone());
             }
         }
+        if let Some(hint) = pending_hint {
+            steer.hold(hint);
+        }
         let mut recovered_notifications = pre_activation_messages;
-        let steer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut terminal = false;
         let mut stream_closed_unexpectedly = false;
 
@@ -768,7 +773,7 @@ async fn send_message_streaming_app_server(
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Some(turn_id) = observed_turn_id.as_deref() {
+                        if let Some(turn_id) = steer.turn_id.as_deref() {
                             match session_arc.turn_steer(&thread_id, turn_id, &steer_text).await {
                                 Ok(_) => {
                                     tracing::info!(
@@ -784,23 +789,11 @@ async fn send_message_streaming_app_server(
                                         %error,
                                         "Codex mid-turn turn/steer failed; queueing for next turn/started"
                                     );
-                                    match pending_steer.as_mut() {
-                                        Some(existing) => {
-                                            existing.push_str("\n\n");
-                                            existing.push_str(&steer_text);
-                                        }
-                                        None => pending_steer = Some(steer_text),
-                                    }
+                                    steer.hold(steer_text);
                                 }
                             }
                         } else {
-                            match pending_steer.as_mut() {
-                                Some(existing) => {
-                                    existing.push_str("\n\n");
-                                    existing.push_str(&steer_text);
-                                }
-                                None => pending_steer = Some(steer_text),
-                            }
+                            steer.hold(steer_text);
                         }
                         continue;
                     }
@@ -812,13 +805,14 @@ async fn send_message_streaming_app_server(
                         None => break, // inner loop → check whether to reconnect
                     },
                     _ = async {
-                        if pending_steer.is_some() {
-                            tokio::time::sleep_until(steer_deadline).await;
+                        if let Some(deadline) = steer.deadline {
+                            tokio::time::sleep_until(deadline).await;
                         } else {
                             std::future::pending::<()>().await;
                         }
                     } => {
-                        let _ = tx.send(ExecutionEvent::Error { message: "codex_continuity_steer_unconfirmed: native goal did not expose a new turn; current hint was not delivered".into() }).await;
+                        let held = steer.held.take().unwrap_or_default();
+                        let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: no native turn started within 30s; this input was not delivered and must be sent again: {held}") }).await;
                         break 'outer;
                     }
                     _ = async {
@@ -845,8 +839,7 @@ async fn send_message_streaming_app_server(
                 match msg {
                     InboundMessage::Notification { method, params } => {
                         if method == "turn/started" && params["threadId"] == thread_id {
-                            observed_turn_id = params["turn"]["id"].as_str().map(str::to_string);
-                            if let Some(hint) = pending_steer.take() {
+                            if let Some(hint) = steer.turn_started(params["turn"]["id"].as_str()) {
                                 let turn_id = params["turn"]["id"].as_str().ok_or_else(|| {
                                     anyhow::anyhow!("native started turn has no id")
                                 });
@@ -855,10 +848,12 @@ async fn send_message_streaming_app_server(
                                     Err(error) => Err(error),
                                 };
                                 if let Err(error) = result {
-                                    let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: {error}; hint was not replayed") }).await;
+                                    let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: {error}; this input was not delivered and must be sent again: {hint}") }).await;
                                     break 'outer;
                                 }
                             }
+                        } else if method == "turn/completed" && params["threadId"] == thread_id {
+                            steer.turn_completed(params["turn"]["id"].as_str());
                         }
                         let outcome =
                             translator.handle_notification(&method, &params, is_goal_mission);
@@ -1165,7 +1160,7 @@ async fn send_message_streaming_app_server(
                 // A completed turn may exist only in the resumed snapshot if EOF
                 // lost its notifications. Interpret receipts, never replay commands.
                 for turn in &resumed_thread.turns {
-                    if turn["id"].as_str() == observed_turn_id.as_deref()
+                    if turn["id"].as_str() == steer.turn_id.as_deref()
                         && matches!(
                             turn["status"].as_str(),
                             Some("completed" | "interrupted" | "failed")
@@ -1269,8 +1264,8 @@ async fn send_message_streaming_app_server(
             tracing::info!("codex app-server reconnected via thread/resume");
         }
 
-        if pending_steer.is_some() {
-            let _ = tx.send(ExecutionEvent::Error { message: "codex_continuity_steer_unconfirmed: current hint was not delivered before the native run stopped".into() }).await;
+        if let Some(held) = steer.close(midturn_messages.as_mut()) {
+            let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: the native run stopped before this input was delivered; send it again: {held}") }).await;
         }
         if stream_closed_unexpectedly {
             let interrupted_ids = translator.pending_tool_ids();
@@ -1327,6 +1322,63 @@ fn elicitation_auto_approve(method: &str) -> serde_json::Value {
         | "item/fileChange/requestApproval"
         | "item/permissions/requestApproval" => json!({ "decision": "approve" }),
         _ => json!({ "decision": "approve" }),
+    }
+}
+
+/// How long input held for the next native turn may wait for `turn/started`.
+const STEER_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The native turn that can take a `turn/steer`, and input waiting for one.
+/// The wait is measured from the moment input is held, never from run start.
+#[derive(Default)]
+struct SteerSlot {
+    turn_id: Option<String>,
+    held: Option<String>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl SteerSlot {
+    /// Keep input for the next `turn/started`; each new input restarts the wait.
+    fn hold(&mut self, text: String) {
+        match self.held.as_mut() {
+            Some(existing) => {
+                existing.push_str("\n\n");
+                existing.push_str(&text);
+            }
+            None => self.held = Some(text),
+        }
+        self.deadline = Some(tokio::time::Instant::now() + STEER_CONFIRM_WINDOW);
+    }
+
+    /// A turn started: it takes the steers from now on, starting with any
+    /// held input, which is returned for delivery.
+    fn turn_started(&mut self, turn_id: Option<&str>) -> Option<String> {
+        self.turn_id = turn_id.map(str::to_string);
+        self.deadline = None;
+        self.held.take()
+    }
+
+    /// A completed turn cannot be steered; input waits for the next turn.
+    fn turn_completed(&mut self, turn_id: Option<&str>) {
+        if turn_id.is_some() && self.turn_id.as_deref() == turn_id {
+            self.turn_id = None;
+        }
+    }
+
+    /// The run is ending: refuse further input, so the sender keeps it, and
+    /// return everything that never reached a turn.
+    fn close(
+        &mut self,
+        midturn: Option<&mut tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ) -> Option<String> {
+        if let Some(rx) = midturn {
+            rx.close();
+            while let Ok(text) = rx.try_recv() {
+                self.hold(text);
+            }
+        }
+        self.deadline = None;
+        self.held.take()
     }
 }
 
@@ -2870,6 +2922,73 @@ mod tests {
             .unwrap();
         assert!(!session.id.is_empty());
         assert_eq!(session.directory, "/tmp");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn midturn_message_sixty_seconds_into_a_run_is_steered_not_failed() {
+        use tokio::time::{advance, Duration, Instant};
+        let mut steer = SteerSlot::default();
+        assert_eq!(steer.turn_started(Some("turn-1")), None);
+        advance(Duration::from_secs(60)).await;
+
+        // With a turn active, the message goes straight to turn/steer.
+        assert_eq!(steer.turn_id.as_deref(), Some("turn-1"));
+        assert!(steer.deadline.is_none());
+
+        // If that steer fails, the wait starts now, not at run start.
+        steer.hold("send now".into());
+        assert_eq!(steer.deadline, Some(Instant::now() + STEER_CONFIRM_WINDOW));
+        advance(Duration::from_secs(29)).await;
+        assert!(steer.deadline.unwrap() > Instant::now());
+
+        // A later message restarts the wait.
+        steer.hold("and this".into());
+        assert_eq!(steer.deadline, Some(Instant::now() + STEER_CONFIRM_WINDOW));
+        assert_eq!(
+            steer.turn_started(Some("turn-2")).as_deref(),
+            Some("send now\n\nand this")
+        );
+        assert!(steer.deadline.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn midturn_message_between_goal_turns_waits_for_the_next_turn() {
+        use tokio::time::{advance, Duration};
+        let mut steer = SteerSlot::default();
+        steer.turn_started(Some("turn-1"));
+        // A sibling thread's turn id never clears this run's turn.
+        steer.turn_completed(Some("other-turn"));
+        assert_eq!(steer.turn_id.as_deref(), Some("turn-1"));
+        steer.turn_completed(Some("turn-1"));
+        assert_eq!(steer.turn_id, None);
+
+        // No turn can take it now, so it is held for the next turn/started.
+        advance(Duration::from_secs(45)).await;
+        steer.hold("between turns".into());
+        advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            steer.turn_started(Some("turn-2")).as_deref(),
+            Some("between turns")
+        );
+        assert_eq!(steer.turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(steer.close(None), None);
+    }
+
+    #[test]
+    fn midturn_message_pending_when_the_run_ends_is_returned() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut steer = SteerSlot::default();
+        steer.hold("held for a turn".into());
+        tx.send("still in the channel".to_string()).unwrap();
+
+        assert_eq!(
+            steer.close(Some(&mut rx)).as_deref(),
+            Some("held for a turn\n\nstill in the channel")
+        );
+        assert!(steer.deadline.is_none());
+        // A message sent after the run ended goes back to its sender.
+        assert_eq!(tx.send("late".to_string()).unwrap_err().0, "late");
+        assert_eq!(steer.close(Some(&mut rx)), None);
     }
 }
 
