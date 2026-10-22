@@ -1027,6 +1027,16 @@ everything is truly done, report completion and stop."
     true
 }
 
+/// Whether archiving a mission also archives this descendant. Only a parked
+/// `AwaitingUser` child is promoted. Running, pending and background-waiting
+/// children are live; a paused one is the operator's; and terminal statuses
+/// (a user-cancelled `Interrupted` coordinator, `Completed`, `Failed`, ...)
+/// are evidence that `Acknowledged` would erase. An `Acknowledged` mission is
+/// not terminal, so turning an `Interrupted` one into it made it wakeable.
+fn archive_cascade_promotes(status: MissionStatus) -> bool {
+    status == MissionStatus::AwaitingUser
+}
+
 #[cfg(test)]
 mod campaign_guard_tests {
     use super::*;
@@ -1869,6 +1879,154 @@ mod campaign_guard_tests {
         ] {
             assert!(!campaign_slot_held_by(status), "{status}");
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_and_cancel_cascade_tests {
+    use super::*;
+
+    struct Session {
+        _dir: tempfile::TempDir,
+        control: ControlState,
+    }
+
+    async fn session() -> Session {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let config = Config::new(path.clone());
+        let root_agent: AgentRef = Arc::new(crate::agents::OpenCodeAgent::new(config.clone()));
+        let mcp = Arc::new(McpRegistry::new(&path).await);
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(path.clone()).await);
+        let library = Arc::new(RwLock::new(None));
+        let hub = ControlHub::new(
+            config.clone(),
+            root_agent.clone(),
+            mcp.clone(),
+            workspaces.clone(),
+            library.clone(),
+            None,
+        );
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(path.join("missions"), "cascade-test")
+                .await
+                .unwrap(),
+        );
+        let control = spawn_control_session(
+            hub,
+            config,
+            root_agent,
+            mcp,
+            workspaces,
+            library,
+            store,
+            None,
+            None,
+            "cascade-test".into(),
+        );
+        Session { _dir: dir, control }
+    }
+
+    async fn mk(
+        store: &Arc<dyn MissionStore>,
+        parent: Option<Uuid>,
+        status: MissionStatus,
+        reason: Option<&str>,
+    ) -> Uuid {
+        let id = store
+            .create_mission_with_parent(
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some("claudecode"),
+                None,
+                parent,
+                None,
+            )
+            .await
+            .expect("create")
+            .id;
+        store
+            .update_mission_status_with_reason(id, status, reason)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn get(store: &Arc<dyn MissionStore>, id: Uuid) -> Mission {
+        store.get_mission(id).await.unwrap().unwrap()
+    }
+
+    #[test]
+    fn archive_cascade_promotes_only_parked_children() {
+        assert!(archive_cascade_promotes(MissionStatus::AwaitingUser));
+        for status in [
+            MissionStatus::Pending,
+            MissionStatus::Active,
+            MissionStatus::WaitingBackground,
+            MissionStatus::Acknowledged,
+            MissionStatus::Paused,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::NotFeasible,
+        ] {
+            assert!(!archive_cascade_promotes(status), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn archiving_an_ancestor_keeps_a_cancelled_coordinator_cancelled() {
+        // Incident: root -> fork -> user-cancelled coordinator -> worker.
+        // Archiving the root turned the coordinator `acknowledged` (and wiped
+        // its terminal_reason), which the watchdog and stall-guard then woke.
+        let s = session().await;
+        let store = &s.control.mission_store;
+        let root = mk(store, None, MissionStatus::AwaitingUser, None).await;
+        let fork = mk(store, Some(root), MissionStatus::AwaitingUser, None).await;
+        let coordinator = mk(
+            store,
+            Some(fork),
+            MissionStatus::Interrupted,
+            Some("cancelled"),
+        )
+        .await;
+        let worker = mk(
+            store,
+            Some(coordinator),
+            MissionStatus::AwaitingUser,
+            Some("turn_complete"),
+        )
+        .await;
+        let paused = mk(store, Some(fork), MissionStatus::Paused, None).await;
+        let done = mk(store, Some(fork), MissionStatus::Completed, None).await;
+
+        let (tx, rx) = oneshot::channel();
+        s.control
+            .cmd_tx
+            .send(ControlCommand::SetMissionStatus {
+                id: root,
+                status: MissionStatus::Acknowledged,
+                respond: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let c = get(store, coordinator).await;
+        assert_eq!(c.status, MissionStatus::Interrupted);
+        assert_eq!(c.terminal_reason.as_deref(), Some("cancelled"));
+        assert_eq!(get(store, paused).await.status, MissionStatus::Paused);
+        assert_eq!(get(store, done).await.status, MissionStatus::Completed);
+        // Parked descendants are still archived, keeping their evidence.
+        assert_eq!(get(store, fork).await.status, MissionStatus::Acknowledged);
+        let w = get(store, worker).await;
+        assert_eq!(w.status, MissionStatus::Acknowledged);
+        assert_eq!(w.terminal_reason.as_deref(), Some("turn_complete"));
     }
 }
 
@@ -26660,19 +26818,16 @@ async fn control_actor_loop(
                                                 else {
                                                     continue;
                                                 };
-                                                if matches!(
-                                                    child.status,
-                                                    MissionStatus::Active
-                                                        | MissionStatus::Pending
-                                                        | MissionStatus::WaitingBackground
-                                                        | MissionStatus::Acknowledged
-                                                ) {
+                                                if !archive_cascade_promotes(child.status) {
                                                     continue;
                                                 }
+                                                // Keep the child's terminal_reason: the board
+                                                // reads it to settle an archived worker.
                                                 if mission_store
-                                                    .update_mission_status(
+                                                    .update_mission_status_with_reason(
                                                         child_id,
                                                         MissionStatus::Acknowledged,
+                                                        child.terminal_reason.as_deref(),
                                                     )
                                                     .await
                                                     .is_ok()
