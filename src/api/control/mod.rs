@@ -519,7 +519,10 @@ pub(crate) fn wakeup_supersession_key(
     match source? {
         // Wall-clock wakeups all represent the mission's next timer and may
         // supersede one another regardless of which helper created them.
-        "claude-builtin" | "automation-manager" | "orb-local" => Some("wall-clock".to_string()),
+        "claude-builtin"
+        | "automation-manager"
+        | "orb-local"
+        | continuations::STALL_GUARD_SOURCE => Some("wall-clock".to_string()),
         // Durable completions are independent. Only a replacement watcher for
         // the same job may supersede an older one.
         "durable-job-terminal" => match trigger {
@@ -1018,8 +1021,11 @@ everything is truly done, report completion and stop."
         "stall-guard auto-resume {}/{} (orchestrator parked with no wakeup armed)",
         count, STALL_GUARD_MAX_CONSECUTIVE_ARMS
     );
-    crate::api::mission_runner::spawn_claude_builtin_wakeup_automation(
+    // Its own source, not the agent's "claude-builtin": delivery drops it
+    // once the mission is archived (continuations::deliver).
+    crate::api::mission_runner::spawn_server_wakeup_automation(
         mission_id,
+        continuations::STALL_GUARD_SOURCE,
         STALL_GUARD_WAKEUP_SECONDS,
         prompt,
         reason,
@@ -2114,6 +2120,18 @@ mod stall_guard_tests {
         reset_stall_guard(boss);
         assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
         reset_stall_guard(boss);
+    }
+
+    #[test]
+    fn stall_guard_arms_under_its_own_wakeup_source() {
+        // It must be told apart from the agent's own ScheduleWakeup
+        // ("claude-builtin") yet still supersede and be superseded by it.
+        assert_ne!(continuations::STALL_GUARD_SOURCE, "claude-builtin");
+        let interval = mission_store::TriggerType::Interval { seconds: 1200 };
+        assert_eq!(
+            wakeup_supersession_key(Some(continuations::STALL_GUARD_SOURCE), &interval),
+            wakeup_supersession_key(Some("claude-builtin"), &interval)
+        );
     }
 
     #[test]
