@@ -63,7 +63,11 @@ export function RemoteQueue(p: {
     }
     return out.filter(row => !p.hiddenIds?.has(row.id));
   };
-  const [error, setError] = createSignal("");
+  // One notice line: a real failure (red alert), or a normal wait that is only
+  // information (`waiting`), such as a message that is still queued.
+  const [notice, setNotice] = createSignal<{ text: string; waiting?: boolean }>({ text: "" });
+  const error = () => notice().text;
+  const setError = (text: string) => setNotice({ text });
   let deliveryErrorId: string | undefined;
   const [cancelling, setCancelling] = createSignal<string>();
   const [working, setWorking] = createSignal(false);
@@ -155,9 +159,9 @@ export function RemoteQueue(p: {
         return;
       }
       if (!current()) return;
-      setError(target.queue_error
+      setNotice({ waiting: true, text: target.queue_error
         ? `Not sent yet: ${target.queue_error.replace(/\.$/, "")}. It’s still queued.`
-        : "Not sent yet: it’s still queued and goes in as soon as this chat can start its next turn.");
+        : "Not sent yet: it’s still queued and goes in as soon as this chat can start its next turn." });
     } catch (e) {
       if (!current()) return;
       const message = e instanceof Error ? e.message : String(e);
@@ -255,7 +259,7 @@ export function RemoteQueue(p: {
           <Show when={row.queue_error}><small title={row.queue_error ?? undefined}>{row.source === "remote-queue" ? `Delivery paused · ${row.queue_error}` : row.queue_error}</small></Show>
         </li>;
       }}</For></ol></Show>
-      <Show when={error()}><p role="alert">{error()}</p></Show>
+      <Show when={error()}>{notice().waiting ? <p class="queue-notice" role="status" style={{ margin: "6px 8px 2px", color: "var(--fg-3)", "font-size": "12px" }}>{error()}</p> : <p role="alert">{error()}</p>}</Show>
     </section>
   </Show>;
 }
