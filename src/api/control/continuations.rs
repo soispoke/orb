@@ -968,10 +968,14 @@ mod tests {
         );
         let mut queue = std::collections::VecDeque::from([scheduled.clone()]);
         assert_eq!(
-            super::super::pop_next_runnable_control_queue(&mut queue, &store)
-                .await
-                .unwrap()
-                .0,
+            super::super::pop_next_runnable_control_queue(
+                &mut queue,
+                &store,
+                &mut Default::default()
+            )
+            .await
+            .unwrap()
+            .0,
             occurrence.id
         );
         queue.push_back(scheduled);
@@ -998,10 +1002,14 @@ mod tests {
             None,
         ));
         assert_eq!(
-            super::super::pop_next_runnable_control_queue(&mut queue, &store)
-                .await
-                .unwrap()
-                .0,
+            super::super::pop_next_runnable_control_queue(
+                &mut queue,
+                &store,
+                &mut Default::default()
+            )
+            .await
+            .unwrap()
+            .0,
             ordinary
         );
         assert!(queue.is_empty());

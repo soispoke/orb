@@ -89,11 +89,22 @@ it('keeps messages queued when live delivery is unsupported, without cancelling 
   render(() => <RemoteQueue mission="remote" onSendImmediate={send} onRows={()=>{}} onCancel={cancel}/>);
   await screen.findByText('2 Queued');
   await fireEvent.click(screen.getByRole('button',{name:'Send now: Second'}));
-  expect((await screen.findByRole('alert')).textContent).toContain('still queued');
+  // Waiting is normal, not a failure: it is shown as information, not an alert.
+  expect((await screen.findByRole('status')).textContent).toContain('still queued');
+  expect(screen.queryByRole('alert')).toBeNull();
   expect(screen.getByText('2 Queued')).toBeTruthy();
   expect(backend.api).toHaveBeenCalledTimes(1);
   expect(backend.api).toHaveBeenCalledWith('/api/control/queue/two/send-now',{method:'POST'});
   expect(send).not.toHaveBeenCalled(); expect(cancel).not.toHaveBeenCalled();
+});
+it('shows the reason a queued message waits without calling it a failure', async () => {
+  backend.list.mockResolvedValue([{id:'one',content:'First',source:'host-queue:api:u',queue_error:'Waiting for a free run slot (5 of 5 in use); it starts automatically'}]);
+  backend.api.mockResolvedValue({ok:true,delivered:false});
+  render(() => <RemoteQueue mission="host" onRows={()=>{}} onCancel={()=>{}}/>);
+  await screen.findByText('1 Queued');
+  await fireEvent.click(screen.getByRole('button',{name:'Send now: First'}));
+  expect((await screen.findByRole('status')).textContent).toBe('Not sent yet: Waiting for a free run slot (5 of 5 in use); it starts automatically. It’s still queued.');
+  expect(screen.queryByRole('alert')).toBeNull();
 });
 it('does not turn an ambiguous network failure into a delete and resend', async () => {
   backend.list.mockResolvedValue([{id:'one',content:'First',source:'remote-queue'}]);
