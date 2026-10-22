@@ -126,6 +126,27 @@ impl ToolCallJournal {
         Ok(())
     }
 
+    /// Codex completed the turn, so its thread holds the final outcome of every
+    /// command it started, including ones it left running in the background.
+    /// None of them can be replayed; only an interrupted turn keeps pending ones.
+    pub async fn settle_completed_turn(&self) -> anyhow::Result<usize> {
+        let _guard = lock().lock().await;
+        let mut entries = self.load_entries().await?;
+        let mut settled = 0;
+        for entry in &mut entries {
+            if let Entry::Started { descriptor } = entry {
+                *entry = Entry::Completed {
+                    descriptor: descriptor.clone(),
+                };
+                settled += 1;
+            }
+        }
+        if settled > 0 {
+            self.store(&entries).await?;
+        }
+        Ok(settled)
+    }
+
     pub async fn pending(&self) -> anyhow::Result<Vec<PendingToolCall>> {
         Ok(self
             .load_entries()
@@ -150,6 +171,20 @@ impl ToolCallJournal {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_completed_turn_settles_commands_left_running_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = ToolCallJournal::at(dir.path().join("j.tools.json"));
+        let call = |id: &str| PendingToolCall { id: id.into(), name: "bash".into(), start_payload: serde_json::json!({}) };
+        journal.started(call("finished")).await.unwrap();
+        journal.completed("finished").await.unwrap();
+        journal.started(call("background-profile")).await.unwrap();
+        assert_eq!(journal.pending().await.unwrap().len(), 1);
+        assert_eq!(journal.settle_completed_turn().await.unwrap(), 1);
+        assert!(journal.pending().await.unwrap().is_empty());
+        assert_eq!(journal.settle_completed_turn().await.unwrap(), 0);
+    }
+
     use super::*;
 
     #[tokio::test]

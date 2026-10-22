@@ -917,6 +917,19 @@ async fn send_message_streaming_app_server(
                         if journal_failed {
                             break 'outer;
                         }
+                        // A completed turn finalizes every command it started,
+                        // even ones Codex left running in the background; only
+                        // an interrupted turn may leave a command to reconcile.
+                        if outcome.terminal
+                            && method == "turn/completed"
+                            && params["turn"]["status"] == "completed"
+                        {
+                            match tool_call_journal.settle_completed_turn().await {
+                                Ok(0) => {}
+                                Ok(settled) => tracing::info!(settled, "Settled tool calls of a completed Codex turn"),
+                                Err(err) => tracing::warn!(?err, "could not settle tool calls of a completed Codex turn"),
+                            }
+                        }
                         if outcome.terminal
                             && planning
                             && method == "turn/completed"
