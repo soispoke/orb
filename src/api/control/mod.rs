@@ -6401,7 +6401,7 @@ pub async fn get_queue(
 /// Run slots as the scheduler counts them: a turn in progress holds one of the
 /// `max_parallel_missions` slots, and a mission without a live turn waits for one.
 #[derive(Debug, Default)]
-pub(crate) struct SlotUsage {
+pub struct SlotUsage {
     pub busy: usize,
     pub max: usize,
     /// Missions whose turn is live (running or parked); their own runner
