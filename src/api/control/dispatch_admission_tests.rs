@@ -10945,7 +10945,10 @@ async fn host_followup_queue_persists_fifo_deduplicates_and_cancels_under_pr_con
     .await
     .unwrap();
     assert_eq!(readonly_queue.len(), 2);
-    assert!(readonly_queue.iter().all(|row| row.queue_error.is_none()));
+    // It still says why it waits: its own mission is paused.
+    assert!(readonly_queue
+        .iter()
+        .all(|row| row.queue_error.as_deref() == Some("Paused")));
     h.control
         .mission_store
         .update_mission_project(
@@ -12911,4 +12914,540 @@ async fn wait_native_file_count(id: Uuid, count: usize) {
     })
     .await
     .expect("scripted turns started");
+}
+
+fn host_followup_entry(mission_id: Uuid, content: &str) -> QueuedMessage {
+    QueuedMessage {
+        id: Uuid::new_v4(),
+        content: content.into(),
+        agent: None,
+        mission_id: Some(mission_id),
+        source: Some("host-queue:api:admission-test".into()),
+        inflight: false,
+        queue_error: None,
+    }
+}
+
+/// An idle mission whose turns the native fixture answers once the harness
+/// installs it.
+async fn idle_codex_mission(store: &SqliteMissionStore) -> Uuid {
+    let m = store
+        .create_mission(None, None, None, None, None, Some("codex"), None)
+        .await
+        .unwrap();
+    store
+        .update_mission_status(m.id, MissionStatus::AwaitingUser)
+        .await
+        .unwrap();
+    m.id
+}
+
+/// The prompts the native fixture received, in order.
+fn native_prompts(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("requests.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let request: Value = serde_json::from_str(line).unwrap();
+            let params = &request["params"];
+            params["input"][0]["text"]
+                .as_str()
+                .or(params["objective"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Start a control session whose durable queue already holds `queued`, as
+/// after a restart. Missions were created in `store` beforehand.
+async fn restarted_with_queue(
+    dir: tempfile::TempDir,
+    store: SqliteMissionStore,
+    queued: &[QueuedMessage],
+) -> Harness {
+    store
+        .save_control_queue("admission-test", &serde_json::to_string(queued).unwrap())
+        .await
+        .unwrap();
+    drop(store);
+    Harness::with_directory(
+        FixtureDir {
+            path: dir.path().to_path_buf(),
+            _cleanup: Some(dir),
+        },
+        Vec::new(),
+    )
+    .await
+}
+
+async fn load_main_mission(h: &Harness, id: Uuid) {
+    let (respond, rx) = oneshot::channel();
+    h.control
+        .cmd_tx
+        .send(ControlCommand::LoadMission { id, respond })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+}
+
+async fn send_to_actor(h: &Harness, id: Uuid, mission: Uuid, content: &str) -> UserMessageAck {
+    let (respond, rx) = oneshot::channel();
+    h.control
+        .cmd_tx
+        .send(ControlCommand::UserMessage {
+            id,
+            content: content.into(),
+            agent: None,
+            target_mission_id: Some(mission),
+            strict: false,
+            source: None,
+            respond,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
+#[tokio::test]
+async fn a_message_to_the_idle_main_session_leaves_a_desktop_followup_to_its_own_mission() {
+    // Mission B's desktop follow-up is still in the main queue, waiting for
+    // the once-a-second promotion pass, when a message for the main mission T
+    // arrives and the idle main session dequeues. B's follow-up must wait for
+    // its own admission (here: another writer holds B's PR), not run on the
+    // main session, and its failure to start is not T's caller's.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteMissionStore::new(dir.path().join("missions"), "admission-test")
+        .await
+        .unwrap();
+    let mut writers = Vec::new();
+    for status in [MissionStatus::AwaitingUser, MissionStatus::Paused] {
+        let m = store
+            .create_mission(None, None, None, None, None, Some("codex"), None)
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                m.id,
+                MissionProjectPatch {
+                    github_pr: Some(Some("org/repo#9".into())),
+                    tags: Some(vec!["pr-writer".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store.update_mission_status(m.id, status).await.unwrap();
+        writers.push(m.id);
+    }
+    let (b, blocker) = (writers[0], writers[1]);
+    let t = store
+        .create_mission(None, None, None, None, None, Some("codex"), None)
+        .await
+        .unwrap()
+        .id;
+    store
+        .update_mission_status(t, MissionStatus::AwaitingUser)
+        .await
+        .unwrap();
+    let followup = host_followup_entry(b, "B follow-up");
+    let h = restarted_with_queue(dir, store, std::slice::from_ref(&followup)).await;
+    let b_dir = install_native_fixture(&h, b, "after").await;
+    let t_dir = install_native_fixture(&h, t, "after").await;
+    load_main_mission(&h, t).await;
+    let response = h.request(false, t, json!({"content": "T next"})).await;
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+
+    wait_until("T's message ran", 10, || async {
+        native_prompts(&t_dir).iter().any(|p| p.contains("T next"))
+    })
+    .await;
+    wait_settled(&h, t).await;
+    assert!(
+        native_prompts(&b_dir).is_empty(),
+        "B's follow-up must not run yet"
+    );
+    assert!(native_prompts(&t_dir)
+        .iter()
+        .all(|p| !p.contains("B follow-up")));
+    assert!(h
+        .control
+        .mission_store
+        .load_control_queue(&h.user.id)
+        .await
+        .unwrap()
+        .contains(&followup.id.to_string()));
+    let Json(queue) = get_queue(
+        State(h.state.clone()),
+        Extension(h.user.clone()),
+        Query(QueueQuery {
+            mission_id: Some(b),
+        }),
+    )
+    .await
+    .unwrap();
+    let row = queue.iter().find(|row| row.id == followup.id).unwrap();
+    assert!(
+        row.queue_error
+            .as_deref()
+            .is_some_and(|error| error.contains(&blocker.to_string())),
+        "{row:?}"
+    );
+    NATIVE_FIXTURES.lock().unwrap().remove(&b);
+    NATIVE_FIXTURES.lock().unwrap().remove(&t);
+}
+
+#[tokio::test]
+async fn a_dequeued_message_for_another_mission_runs_on_that_missions_history() {
+    let h = Harness::new().await;
+    let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+    let mut seeded = Vec::new();
+    for earlier in ["T earlier", "B earlier"] {
+        let m = store
+            .create_mission(None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        store
+            .update_mission_history(
+                m.id,
+                &[MissionHistoryEntry {
+                    role: "user".into(),
+                    content: earlier.into(),
+                }],
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_status(m.id, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        seeded.push(m.id);
+    }
+    let (t, b) = (seeded[0], seeded[1]);
+    let current = Arc::new(RwLock::new(Some(t)));
+    let mut history = vec![("user".to_string(), "T earlier".to_string())];
+    let (events_tx, _) = broadcast::channel(16);
+    let entry = (Uuid::new_v4(), "B next".to_string(), None, Some(b), None);
+    prepare_main_delivery(
+        &h.state.control,
+        &store,
+        &events_tx,
+        &current,
+        &mut history,
+        &entry,
+    )
+    .await
+    .unwrap();
+    assert_eq!(history, vec![("user".to_string(), "B earlier".to_string())]);
+    assert_eq!(*current.read().await, Some(b));
+    let b_after = store.get_mission(b).await.unwrap().unwrap();
+    assert_eq!(b_after.status, MissionStatus::Active);
+
+    // A delivery for a mission that is gone is refused before anything runs.
+    let gone = (
+        Uuid::new_v4(),
+        "lost".to_string(),
+        None,
+        Some(Uuid::new_v4()),
+        None,
+    );
+    assert!(prepare_main_delivery(
+        &h.state.control,
+        &store,
+        &events_tx,
+        &current,
+        &mut history,
+        &gone,
+    )
+    .await
+    .is_err());
+    assert_eq!(*current.read().await, Some(b));
+}
+
+#[tokio::test]
+async fn a_followup_for_a_deleted_mission_neither_blocks_the_queue_nor_stays_forever() {
+    // The follow-up's mission is gone, so the promotion pass can never move
+    // it; main-queue messages behind it must still run.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteMissionStore::new(dir.path().join("missions"), "admission-test")
+        .await
+        .unwrap();
+    let t = idle_codex_mission(&store).await;
+    let orphan = host_followup_entry(Uuid::new_v4(), "for a deleted mission");
+    let h = restarted_with_queue(dir, store, std::slice::from_ref(&orphan)).await;
+    let mut events = h.control.events_tx.subscribe();
+    let t_dir = install_native_fixture(&h, t, "after").await;
+    load_main_mission(&h, t).await;
+    for content in ["T one", "T two"] {
+        let response = h.request(false, t, json!({"content": content})).await;
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    }
+    wait_until("both main messages ran", 10, || async {
+        native_prompts(&t_dir).len() == 2
+    })
+    .await;
+    let prompts = native_prompts(&t_dir);
+    assert!(
+        prompts[0].contains("T one") && prompts[1].contains("T two"),
+        "{prompts:#?}"
+    );
+    wait_until("the orphaned follow-up is retired", 10, || async {
+        !h.control
+            .mission_store
+            .load_control_queue(&h.user.id)
+            .await
+            .unwrap()
+            .contains(&orphan.id.to_string())
+    })
+    .await;
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(AgentEvent::Error { message, .. }) if message.contains("no longer exists") => {
+                    return message;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(error) => panic!("event stream closed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the retirement is visible");
+    assert!(retired.contains("dropped"), "{retired}");
+    NATIVE_FIXTURES.lock().unwrap().remove(&t);
+}
+#[tokio::test]
+async fn a_refused_message_can_be_sent_again_with_the_same_id() {
+    // A message refused by the actor never ran, so a retry with the same id
+    // must be considered again, not acknowledged as a duplicate.
+    let h = Harness::new().await;
+    let store = h.control.mission_store.clone();
+    let paused = store
+        .create_mission(None, None, None, None, None, Some("codex"), None)
+        .await
+        .unwrap();
+    store
+        .update_mission_status(paused.id, MissionStatus::Paused)
+        .await
+        .unwrap();
+    let fixture = install_native_fixture(&h, paused.id, "after").await;
+    let id = Uuid::new_v4();
+    let first = send_to_actor(&h, id, paused.id, "Continue").await;
+    assert!(matches!(first, UserMessageAck::Rejected(_)), "{first:?}");
+    store
+        .update_mission_status(paused.id, MissionStatus::AwaitingUser)
+        .await
+        .unwrap();
+    let retry = send_to_actor(&h, id, paused.id, "Continue").await;
+    assert!(
+        matches!(
+            retry,
+            UserMessageAck::Queued | UserMessageAck::Continued { .. }
+        ),
+        "{retry:?}"
+    );
+    wait_until("the retried message ran", 10, || async {
+        native_prompts(&fixture)
+            .iter()
+            .any(|prompt| prompt.contains("Continue"))
+    })
+    .await;
+    wait_settled(&h, paused.id).await;
+    NATIVE_FIXTURES.lock().unwrap().remove(&paused.id);
+}
+
+#[tokio::test]
+async fn at_capacity_a_message_that_cannot_wait_for_a_slot_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_capacity(
+        FixtureDir {
+            path: dir.path().to_path_buf(),
+            _cleanup: Some(dir),
+        },
+        Vec::new(),
+        true,
+        1,
+    )
+    .await;
+    let store = h.control.mission_store.clone();
+    let busy = store
+        .create_mission(
+            Some("holds the slot"),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            None,
+        )
+        .await
+        .unwrap();
+    let busy_dir = install_native_fixture(&h, busy.id, "before").await;
+    assert!(h
+        .request(false, busy.id, json!({"content":"/goal hold the slot"}))
+        .await
+        .status()
+        .is_success());
+    wait_native_file(&busy_dir.join("started")).await;
+
+    // An Active mission without a runner is never dispatched by the scheduler,
+    // which only starts Pending ones: acknowledging the message as queued
+    // would lose it.
+    let active = store
+        .create_mission(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_status(active.id, MissionStatus::Active)
+        .await
+        .unwrap();
+    let ack = send_to_actor(&h, Uuid::new_v4(), active.id, "Continue").await;
+    assert!(matches!(ack, UserMessageAck::Rejected(_)), "{ack:?}");
+    assert!(store.get_deferred_goal(active.id).await.unwrap().is_none());
+
+    // A failed mission waits as Pending, and a second message joins the first.
+    let failed = store
+        .create_mission(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_status(failed.id, MissionStatus::Failed)
+        .await
+        .unwrap();
+    let ids = [Uuid::new_v4(), Uuid::new_v4()];
+    for (id, content) in ids.iter().zip(["first", "second"]) {
+        assert_eq!(
+            send_to_actor(&h, *id, failed.id, content).await,
+            UserMessageAck::Queued
+        );
+    }
+    let waiting = store.get_mission(failed.id).await.unwrap().unwrap();
+    assert_eq!(waiting.status, MissionStatus::Pending);
+    let goal = store.get_deferred_goal(failed.id).await.unwrap().unwrap();
+    assert_eq!(
+        deferred_messages::decode(&goal)
+            .1
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+
+    std::fs::write(busy_dir.join("release"), "").unwrap();
+    wait_native_status(&h, busy.id, MissionStatus::Blocked).await;
+    NATIVE_FIXTURES.lock().unwrap().remove(&busy.id);
+}
+
+#[tokio::test]
+async fn the_queue_says_why_a_followup_has_not_started() {
+    // Another mission holds the track lease, so every start attempt is
+    // refused by admission; a full set of run slots is not the reason.
+    let dir = tempfile::tempdir().unwrap();
+    let projects = ProjectsStore::open(dir.path().join("projects.db")).unwrap();
+    projects
+        .upsert_project("lido", None, None, None, None)
+        .unwrap();
+    projects
+        .absorb_track("lido", "trio-reserve1", None, None)
+        .unwrap();
+    let store = SqliteMissionStore::new(dir.path().join("missions"), "admission-test")
+        .await
+        .unwrap();
+    let mut on_track = Vec::new();
+    for _ in 0..2 {
+        let m = store
+            .create_mission(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("test-no-execution"),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_project(
+                m.id,
+                MissionProjectPatch {
+                    project: Some(Some("lido".into())),
+                    track: Some(Some("trio-reserve1".into())),
+                    tags: Some(vec!["pr-writer".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_mission_status(m.id, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        on_track.push(m.id);
+    }
+    let (owner, mission) = (on_track[0], on_track[1]);
+    projects
+        .acquire_track_lease(&crate::api::track_leases::lease_request(
+            "lido",
+            "trio-reserve1",
+            &owner.to_string(),
+            "writer",
+            None,
+        ))
+        .unwrap();
+    drop(projects);
+    let followup = host_followup_entry(mission, "Continue");
+    let h = restarted_with_queue(dir, store, std::slice::from_ref(&followup)).await;
+    let reason = || async {
+        let Json(queue) = get_queue(
+            State(h.state.clone()),
+            Extension(h.user.clone()),
+            Query(QueueQuery {
+                mission_id: Some(mission),
+            }),
+        )
+        .await
+        .unwrap();
+        queue
+            .into_iter()
+            .find(|row| row.id == followup.id)
+            .and_then(|row| row.queue_error)
+    };
+    wait_until("the queue shows the start error", 10, || async {
+        reason().await.is_some()
+    })
+    .await;
+    let reason = reason().await.unwrap();
+    assert!(!reason.contains("run slot"), "{reason}");
+    assert!(h
+        .control
+        .mission_store
+        .get_latest_mission_run(mission)
+        .await
+        .unwrap()
+        .is_none());
 }

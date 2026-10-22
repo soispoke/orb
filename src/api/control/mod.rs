@@ -198,21 +198,16 @@ fn enqueue_control_message(queue: &mut VecDeque<ControlQueueEntry>, entry: Contr
     }
 }
 
-/// Pop the first queued delivery whose target is not explicitly paused or
-/// still owned by a detached durable wait. Parked deliveries remain durable
-/// and rotate behind runnable work; when all entries are parked the queue
-/// returns to its original order and nothing is dequeued, avoiding both
-/// head-of-line blocking and a retry spin on the active run constraint.
 /// Where the next message queued for a mission sits.
 enum QueuedAt {
     Main(usize),
     Runner(usize),
 }
 
-/// Take the earliest message queued for `mission_id` when a parked Claude
-/// session can answer it. Agent overrides, scheduler batches and slash
-/// commands need a fresh turn: they stay queued, and so does everything
-/// queued behind them.
+/// Take the earliest plain message queued for `mission_id`, which a parked
+/// Claude session can answer on its stdin. Agent overrides, scheduler batches
+/// and slash commands need a fresh turn, so they stay queued; plain messages
+/// behind them are still taken, in the order they were queued.
 fn take_for_parked_session(
     mission_id: Uuid,
     is_main: bool,
@@ -227,14 +222,10 @@ fn take_for_parked_session(
             )
             && !content.trim_start().starts_with('/')
     }
-    if let Some(position) = queue
-        .iter()
-        .position(|entry| entry.3 == Some(mission_id) || (entry.3.is_none() && is_main))
-    {
-        let entry = &queue[position];
-        if !plain(&entry.1, &entry.2, &entry.4) {
-            return None;
-        }
+    if let Some(position) = queue.iter().position(|entry| {
+        (entry.3 == Some(mission_id) || (entry.3.is_none() && is_main))
+            && plain(&entry.1, &entry.2, &entry.4)
+    }) {
         let (id, content, agent, _, source) = queue.remove(position)?;
         return Some((
             QueuedAt::Main(position),
@@ -247,11 +238,11 @@ fn take_for_parked_session(
         ));
     }
     let runner = parallel_runners.get_mut(&mission_id)?;
-    let first = runner.queue.front()?;
-    if !plain(&first.content, &first.agent, &first.source) {
-        return None;
-    }
-    Some((QueuedAt::Runner(0), runner.queue.pop_front()?))
+    let position = runner
+        .queue
+        .iter()
+        .position(|entry| plain(&entry.content, &entry.agent, &entry.source))?;
+    Some((QueuedAt::Runner(position), runner.queue.remove(position)?))
 }
 
 fn take_queued_by_id(
@@ -324,72 +315,170 @@ fn host_followup_source(source: Option<&str>) -> bool {
     source.is_some_and(|source| source.starts_with("host-queue:api:"))
 }
 
+/// Per-message retry delay for main-queue deliveries whose start failed
+/// (activation or run-lease rejection). Only that message waits: it keeps its
+/// place while later messages for other missions start.
+#[derive(Default)]
+struct DeliveryBackoff(HashMap<Uuid, (u32, Instant)>);
+
+impl DeliveryBackoff {
+    fn waiting(&self, id: Uuid) -> bool {
+        self.0
+            .get(&id)
+            .is_some_and(|(_, until)| *until > Instant::now())
+    }
+
+    /// The next attempt waits 2 s, then 4 s, 8 s, … up to a minute.
+    fn defer(&mut self, id: Uuid) {
+        let (attempts, until) = self.0.entry(id).or_insert((0, Instant::now()));
+        *attempts = attempts.saturating_add(1);
+        *until =
+            Instant::now() + std::time::Duration::from_secs(2u64.saturating_pow(*attempts).min(60));
+    }
+}
+
+/// Take the first queued delivery the main session can start now; everything
+/// else keeps its place. A delivery waits while its mission is paused, not yet
+/// dispatchable or held by a detached durable wait, while it backs off after a
+/// failed start, and always when it is a host follow-up (the parallel delivery
+/// pump owns those). Later deliveries for the same mission wait behind it, so
+/// a mission's messages keep their order, but no other mission is held up.
+/// A revoked scheduled continuation is dropped.
 async fn pop_next_runnable_control_queue(
     queue: &mut VecDeque<ControlQueueEntry>,
     store: &Arc<dyn MissionStore>,
+    backoff: &mut DeliveryBackoff,
 ) -> Option<ControlQueueEntry> {
-    let queued = queue.len();
-    for _ in 0..queued {
-        let entry = queue.pop_front()?;
-        if entry.4.as_deref() == Some("scheduled-continuation") {
-            let Some(mission_id) = entry.3 else { continue };
-            match store
-                .can_admit_scheduled_delivery(mission_id, entry.0)
-                .await
-            {
+    backoff
+        .0
+        .retain(|id, _| queue.iter().any(|entry| entry.0 == *id));
+    let mut waiting: HashSet<Option<Uuid>> = HashSet::new();
+    let mut index = 0;
+    while index < queue.len() {
+        let (id, target) = (queue[index].0, queue[index].3);
+        let source = queue[index].4.clone();
+        let mut runnable = !waiting.contains(&target)
+            && !host_followup_source(source.as_deref())
+            && !backoff.waiting(id);
+        if runnable && source.as_deref() == Some("scheduled-continuation") {
+            let Some(mission_id) = target else {
+                queue.remove(index);
+                continue;
+            };
+            match store.can_admit_scheduled_delivery(mission_id, id).await {
                 Ok(true) => {}
-                Ok(false) => continue,
+                Ok(false) => {
+                    queue.remove(index);
+                    continue;
+                }
                 Err(error) => {
                     // Preserve work on transient store failures, but never launch
                     // a scheduled message whose revocation cannot be checked.
                     tracing::warn!(%mission_id, %error, "Scheduled dequeue validation failed");
-                    queue.push_back(entry);
-                    continue;
+                    runnable = false;
                 }
             }
         }
-        let parked = match entry.3 {
-            Some(mission_id) => {
-                let paused = store
-                    .get_mission(mission_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|mission| {
-                        mission.status == MissionStatus::Paused
-                            || (mission.status == MissionStatus::Pending
-                                && !mission.is_dispatchable_at(chrono::Utc::now()))
-                    });
-                let detached_wait = store
-                    .get_active_mission_run(mission_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|run| {
-                        matches!(
-                            run.execution_state,
-                            MissionExecutionState::WaitingRemoteJob
-                                | MissionExecutionState::Stopping
-                        )
-                    });
-                let running = host_followup_source(entry.4.as_deref())
-                    && store
-                        .get_active_mission_run(mission_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some();
-                paused || detached_wait || running
-            }
-            None => false,
-        };
-        if parked {
-            queue.push_back(entry);
-            continue;
+        if let (true, Some(mission_id)) = (runnable, target) {
+            let parked = store
+                .get_mission(mission_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|mission| host_followup_parked(&mission));
+            let detached_wait = store
+                .get_active_mission_run(mission_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|run| {
+                    matches!(
+                        run.execution_state,
+                        MissionExecutionState::WaitingRemoteJob | MissionExecutionState::Stopping
+                    )
+                });
+            runnable = !parked && !detached_wait;
         }
-        return Some(entry);
+        if runnable {
+            return queue.remove(index);
+        }
+        waiting.insert(target);
+        index += 1;
     }
     None
+}
+
+/// Ready a dequeued main-queue delivery to run. The main session's history
+/// belongs to `current_mission`, so a delivery for another mission first loads
+/// that mission's history: a turn must never run on, or be persisted over,
+/// another mission's transcript. Then the mission is activated again.
+async fn prepare_main_delivery(
+    control_hub: &ControlHub,
+    store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    current_mission: &Arc<RwLock<Option<Uuid>>>,
+    history: &mut Vec<(String, String)>,
+    entry: &ControlQueueEntry,
+) -> Result<(), String> {
+    let (_, content, _, target, source) = entry;
+    if let Some(mission_id) = *target {
+        if *current_mission.read().await != Some(mission_id) {
+            let mission = store
+                .get_mission(mission_id)
+                .await?
+                .ok_or_else(|| format!("mission {mission_id} no longer exists"))?;
+            *history = mission
+                .history
+                .iter()
+                .map(|entry| (entry.role.clone(), entry.content.clone()))
+                .collect();
+            *current_mission.write().await = Some(mission_id);
+        }
+    }
+    if queued_delivery_requires_activation(*target, source.as_deref()) {
+        let Some(mission_id) = *target else {
+            return Err("transport auto-resume is missing mission_id".to_string());
+        };
+        activate_mission_id_for_message(control_hub, store, events_tx, mission_id, content).await?;
+    }
+    Ok(())
+}
+
+/// A dequeued main-queue delivery could not start. If its mission no longer
+/// exists nothing can ever run it: it is retired with a visible error and this
+/// returns true. Otherwise it goes back to the front, where it came from, and
+/// waits out its own backoff so the next runnable message is not held up; the
+/// reason is kept for the queue view.
+async fn defer_main_delivery(
+    queue: &mut VecDeque<ControlQueueEntry>,
+    backoff: &mut DeliveryBackoff,
+    queue_errors: &mut HashMap<Uuid, String>,
+    store: &Arc<dyn MissionStore>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    entry: ControlQueueEntry,
+    error: String,
+) -> bool {
+    let mission_id = entry.3;
+    if let Some(mid) = mission_id {
+        if matches!(store.get_mission(mid).await, Ok(None)) {
+            queue_errors.remove(&entry.0);
+            let _ = events_tx.send(AgentEvent::Error {
+                message: format!("Queued message dropped: mission {mid} no longer exists"),
+                mission_id,
+                resumable: false,
+            });
+            return true;
+        }
+    }
+    let _ = events_tx.send(AgentEvent::Error {
+        message: format!("Queued message not started yet, retrying shortly: {error}"),
+        mission_id,
+        resumable: true,
+    });
+    backoff.defer(entry.0);
+    queue_errors.insert(entry.0, error);
+    queue.push_front(entry);
+    false
 }
 
 /// Silence threshold before declaring a mission stuck. Conservative so
@@ -455,19 +544,23 @@ fn background_tasks_block_ack(status: MissionStatus, task_count: usize) -> bool 
 /// prompt (left in `deferred_goal` on purpose for a capacity-race retry).
 /// Concatenating a follow-up onto that prompt buries the operator's message
 /// and the scheduler never re-dispatches non-Pending rows, so the follow-up
-/// is lost. Replace instead.
+/// is lost. Replace instead — unless the stored goal holds operator messages
+/// (identity envelopes) that are still waiting to run: those are kept and the
+/// new message joins them (the join ignores a batch it already holds).
 pub(crate) fn deferred_goal_for_incoming_message(
     status: MissionStatus,
     previous_goal: Option<&str>,
     content: &str,
 ) -> String {
-    if status == MissionStatus::Pending {
-        match previous_goal {
-            Some(prev) if !prev.is_empty() => deferred_messages::join(prev, content),
-            _ => content.to_string(),
+    match previous_goal {
+        Some(prev)
+            if !prev.is_empty()
+                && (status == MissionStatus::Pending
+                    || !deferred_messages::decode(prev).1.is_empty()) =>
+        {
+            deferred_messages::join(prev, content)
         }
-    } else {
-        content.to_string()
+        _ => content.to_string(),
     }
 }
 
@@ -6255,6 +6348,12 @@ pub async fn get_queue(
             "failed to get queue".to_string(),
         )
     })?;
+    // Why each live message has not started yet; the durable snapshot merged
+    // in below does not carry it.
+    let start_errors: HashMap<Uuid, String> = queue
+        .iter()
+        .filter_map(|entry| Some((entry.id, entry.queue_error.clone()?)))
+        .collect();
     queue.extend(
         remote_queue::waiting(&state.projects, Some(&user.id))
             .map_err(internal_error)?
@@ -6353,6 +6452,9 @@ pub async fn get_queue(
     };
     let mut blockers = HashMap::new();
     for entry in &mut queue {
+        if entry.queue_error.is_none() {
+            entry.queue_error = start_errors.get(&entry.id).cloned();
+        }
         if !host_followup_source(entry.source.as_deref()) || entry.inflight {
             continue;
         }
@@ -6362,14 +6464,21 @@ pub async fn get_queue(
                 .get_mission(mid)
                 .await
                 .map_err(internal_error)?;
+            // What holds a follow-up, most specific first: a PR writer, its
+            // last start error, a pause, then a full set of run slots.
+            let start_error = entry.queue_error.take();
+            let paused = mission
+                .as_ref()
+                .is_some_and(|mission| mission.status == MissionStatus::Paused)
+                .then(|| "Paused".to_string());
+            let slot_wait = usage.as_ref().and_then(|usage| usage.waiting_for_slot(mid));
             if let Some(mission) = mission.as_ref() {
                 if !mission_is_pr_writer_in_store(&control.mission_store, mission)
                     .await
                     .map_err(internal_error)?
                     && !message_requests_pr_writer(mission, &entry.content)
                 {
-                    entry.queue_error =
-                        usage.as_ref().and_then(|usage| usage.waiting_for_slot(mid));
+                    entry.queue_error = start_error.or(paused).or(slot_wait);
                     continue;
                 }
             }
@@ -6392,7 +6501,9 @@ pub async fn get_queue(
                 .get(&mid)
                 .cloned()
                 .flatten()
-                .or_else(|| usage.as_ref().and_then(|usage| usage.waiting_for_slot(mid)));
+                .or(start_error)
+                .or(paused)
+                .or(slot_wait);
         }
     }
     Ok(Json(queue))
@@ -24192,6 +24303,13 @@ async fn control_actor_loop(
     let mut running_backend_id: Option<String> = None;
     let mut running_run: Option<MissionRun> = None;
     let mut parallel_followup_retry = std::time::Instant::now();
+    // Missions with a host follow-up waiting for a run slot, longest waiting
+    // first, so free slots go round the missions instead of to one of them.
+    let mut followup_turns: Vec<Uuid> = Vec::new();
+    let mut delivery_backoff = DeliveryBackoff::default();
+    // Why a queued message has not started yet (its last start error), shown
+    // by the queue view until the message starts or leaves the queue.
+    let mut queue_errors: HashMap<Uuid, String> = HashMap::new();
     let mut parallel_poll = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut queued_delivery_retry = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut execution_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -25128,6 +25246,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(cid),
                                                 resumable: false,
                                             });
+                                            accepted_user_message_ids.remove(&id);
                                             let _ = respond.send(UserMessageAck::Dropped);
                                             continue;
                                         }
@@ -25195,6 +25314,7 @@ async fn control_actor_loop(
                                                 mission_id: goal_target_mission,
                                                 resumable: true,
                                             });
+                                            accepted_user_message_ids.remove(&id);
                                             let _ = respond.send(UserMessageAck::Dropped);
                                             continue;
                                         }
@@ -25216,6 +25336,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 resumable: true,
                                             });
+                                            accepted_user_message_ids.remove(&id);
                                             let _ = respond.send(UserMessageAck::Dropped);
                                             continue;
                                         }
@@ -25270,6 +25391,7 @@ async fn control_actor_loop(
                                                                 mission_id: Some(tid),
                                                                 resumable: true,
                                                             });
+                                                            accepted_user_message_ids.remove(&id);
                                                             let _ = respond.send(UserMessageAck::Rejected(error));
                                                             continue;
                                                         }
@@ -25310,6 +25432,7 @@ async fn control_actor_loop(
                                                             mission_id = %tid,
                                                             "Failed to stash deferred goal: {e}"
                                                         );
+                                                        accepted_user_message_ids.remove(&id);
                                                         let _ = respond.send(UserMessageAck::Dropped);
                                                         continue;
                                                     }
@@ -25356,6 +25479,7 @@ async fn control_actor_loop(
                                                     mission_id: Some(tid),
                                                     resumable: true,
                                                 });
+                                                accepted_user_message_ids.remove(&id);
                                                 let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
@@ -25542,6 +25666,7 @@ async fn control_actor_loop(
                                             let mission = match mission_store.get_mission(tid).await {
                                                 Ok(Some(mission)) => mission,
                                                 Ok(None) => {
+                                                    accepted_user_message_ids.remove(&id);
                                                     let _ = respond.send(UserMessageAck::Dropped);
                                                     continue;
                                                 }
@@ -25554,10 +25679,27 @@ async fn control_actor_loop(
                                                         mission_id: Some(tid),
                                                         resumable: true,
                                                     });
+                                                    accepted_user_message_ids.remove(&id);
                                                     let _ = respond.send(UserMessageAck::Dropped);
                                                     continue;
                                                 }
                                             };
+                                            if mission.status != MissionStatus::Pending
+                                                && !follow_up_should_requeue_as_pending(mission.status)
+                                            {
+                                                let error = format!(
+                                                    "Every run slot is taken and mission {tid} is {}, so the message cannot wait for one; send it again when a slot is free",
+                                                    mission.status
+                                                );
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: error.clone(),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Rejected(error));
+                                                continue;
+                                            }
                                             let writer_lease = match acquire_pr_writer_lease_for_message(
                                                 &control_hub,
                                                 &mission_store,
@@ -25576,6 +25718,7 @@ async fn control_actor_loop(
                                                         mission_id: Some(tid),
                                                         resumable: true,
                                                     });
+                                                    accepted_user_message_ids.remove(&id);
                                                     let _ = respond.send(UserMessageAck::Rejected(error));
                                                     continue;
                                                 }
@@ -25593,7 +25736,10 @@ async fn control_actor_loop(
                                             match mission_store.set_deferred_goal(tid, Some(combined)).await
                                             {
                                                 Ok(()) => {
-                                                    if follow_up_should_requeue_as_pending(mission.status) {
+                                                    if mission.status != MissionStatus::Pending {
+                                                        // The scheduler only dispatches Pending
+                                                        // missions: without the switch nothing
+                                                        // would ever run the stashed message.
                                                         if let Err(error) = mission_store
                                                             .update_mission_status(
                                                                 tid,
@@ -25601,10 +25747,26 @@ async fn control_actor_loop(
                                                             )
                                                             .await
                                                         {
-                                                            tracing::warn!(
-                                                                mission_id = %tid,
-                                                                "At capacity: stashed follow-up but could not requeue as pending: {error}"
+                                                            let _ = mission_store
+                                                                .set_deferred_goal(tid, previous_goal)
+                                                                .await;
+                                                            rollback_message_writer_tag(
+                                                                &mission_store,
+                                                                &mission,
+                                                                &writer_lease,
+                                                            )
+                                                            .await;
+                                                            let error = format!(
+                                                                "Every run slot is taken and mission {tid} could not be queued for one: {error}"
                                                             );
+                                                            let _ = events_tx.send(AgentEvent::Error {
+                                                                message: error.clone(),
+                                                                mission_id: Some(tid),
+                                                                resumable: true,
+                                                            });
+                                                            accepted_user_message_ids.remove(&id);
+                                                            let _ = respond.send(UserMessageAck::Rejected(error));
+                                                            continue;
                                                         } else {
                                                             let _ = events_tx.send(
                                                                 AgentEvent::MissionStatusChanged {
@@ -25655,6 +25817,7 @@ async fn control_actor_loop(
                                                         mission_id: Some(tid),
                                                         resumable: true,
                                                     });
+                                                    accepted_user_message_ids.remove(&id);
                                                     let _ = respond.send(UserMessageAck::Dropped);
                                                 }
                                             }
@@ -25675,6 +25838,7 @@ async fn control_actor_loop(
                                                             mission_id: Some(tid),
                                                             resumable: true,
                                                         });
+                                                        accepted_user_message_ids.remove(&id);
                                                         let _ = respond.send(UserMessageAck::Dropped);
                                                         continue;
                                                     }
@@ -25695,6 +25859,7 @@ async fn control_actor_loop(
                                                             mission_id: Some(tid),
                                                             resumable: true,
                                                         });
+                                                        accepted_user_message_ids.remove(&id);
                                                         let _ = respond.send(UserMessageAck::Rejected(error));
                                                         continue;
                                                     }
@@ -25851,6 +26016,7 @@ async fn control_actor_loop(
                                                         mission_id: Some(tid),
                                                         resumable: true,
                                                     });
+                                                    accepted_user_message_ids.remove(&id);
                                                     let _ = respond.send(UserMessageAck::Dropped);
                                                     continue;
                                                 }
@@ -25877,6 +26043,7 @@ async fn control_actor_loop(
                                         target = ?effective_target,
                                         "Dropping strict control-plane message: non-main target not deliverable this pass"
                                     );
+                                    accepted_user_message_ids.remove(&id);
                                     let _ = respond.send(UserMessageAck::Dropped);
                                     continue;
                                 }
@@ -25919,6 +26086,7 @@ async fn control_actor_loop(
                                                         mission_id: Some(tid),
                                                         resumable: true,
                                                     });
+                                                    accepted_user_message_ids.remove(&id);
                                                     let _ = respond.send(UserMessageAck::Rejected(error));
                                                     continue;
                                                 }
@@ -25962,6 +26130,7 @@ async fn control_actor_loop(
                                                             mission_id: Some(tid),
                                                             resumable: true,
                                                         });
+                                                        accepted_user_message_ids.remove(&id);
                                                         let _ = respond.send(UserMessageAck::Rejected(error));
                                                         continue;
                                                     }
@@ -26000,6 +26169,7 @@ async fn control_actor_loop(
                                                             mission_id: Some(tid),
                                                             resumable: true,
                                                         });
+                                                        accepted_user_message_ids.remove(&id);
                                                         let _ = respond.send(UserMessageAck::Rejected(error));
                                                         continue;
                                                     }
@@ -26050,6 +26220,7 @@ async fn control_actor_loop(
                                                     mission_id: Some(tid),
                                                     resumable: true,
                                                 });
+                                                accepted_user_message_ids.remove(&id);
                                                 let _ = respond.send(UserMessageAck::Rejected(error));
                                                 continue;
                                             }
@@ -26102,7 +26273,7 @@ async fn control_actor_loop(
                                     });
                                 }
                                 if running.is_none() {
-                                    if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = pop_next_runnable_control_queue(&mut queue, &mission_store).await {
+                                    if let Some(entry) = pop_next_runnable_control_queue(&mut queue, &mission_store, &mut delivery_backoff).await {
                                         // Persist the dequeue before the awaits that start
                                         // the run, so a crash here can't restore + re-run it.
                                         if let Err(error) = persist_control_queue_if_changed(
@@ -26115,19 +26286,64 @@ async fn control_actor_loop(
                                         )
                                         .await
                                         {
-                                            queue.push_front((
-                                                mid,
-                                                msg,
-                                                per_msg_agent,
-                                                msg_target_mid,
-                                                msg_source,
-                                            ));
+                                            queue.push_front(entry);
                                             let _ = respond.send(UserMessageAck::Queued);
                                             tracing::warn!(
                                                 "Queued delivery retained because dequeue persistence failed: {error}"
                                             );
                                             continue;
                                         }
+                                        // The dequeued delivery may be an older one, for
+                                        // another mission: it runs on its own mission's
+                                        // history, and a failure to start it is its own,
+                                        // not this caller's, whose message stays queued.
+                                        if let Err(error) = prepare_main_delivery(
+                                            &control_hub,
+                                            &mission_store,
+                                            &events_tx,
+                                            &current_mission,
+                                            &mut history,
+                                            &entry,
+                                        )
+                                        .await
+                                        {
+                                            let dequeued_id = entry.0;
+                                            let retired = defer_main_delivery(
+                                                &mut queue,
+                                                &mut delivery_backoff,
+                                                &mut queue_errors,
+                                                &mission_store,
+                                                &events_tx,
+                                                entry,
+                                                error,
+                                            )
+                                            .await;
+                                            let _ = persist_control_queue_if_changed(
+                                                &mission_store,
+                                                &session_user_id,
+                                                &queue,
+                                                &parallel_runners,
+                                                &recovered_consumed_user_messages,
+                                                &mut last_persisted_queue,
+                                            )
+                                            .await;
+                                            set_and_emit_status(
+                                                &status,
+                                                &events_tx,
+                                                ControlRunState::Idle,
+                                                queue.len(),
+                                                target_mission_id,
+                                            )
+                                            .await;
+                                            if retired && dequeued_id == id {
+                                                accepted_user_message_ids.remove(&id);
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                            } else {
+                                                let _ = respond.send(UserMessageAck::Queued);
+                                            }
+                                            continue;
+                                        }
+                                        let (mid, msg, per_msg_agent, msg_target_mid, msg_source) = entry;
                                         set_and_emit_status(
                                             &status,
                                             &events_tx,
@@ -26169,26 +26385,6 @@ async fn control_actor_loop(
                                         let (workspace_id, model_override, model_effort, fast_mode, service_tier, mission_agent, backend_id, session_id, mission_config_profile, pr_readonly) = if let Some(mid) = mission_id {
                                             match mission_store.get_mission(mid).await {
                                                 Ok(Some(mission)) => {
-                                                    if let Err(error) = activate_mission_for_message(
-                                                        &control_hub,
-                                                        &mission_store,
-                                                        &events_tx,
-                                                        &mission,
-                                                        &msg,
-                                                    )
-                                                    .await
-                                                    {
-                                                        let _ = events_tx.send(AgentEvent::Error {
-                                                            message: format!(
-                                                                "Cannot activate mission {}: {}",
-                                                                mid, error
-                                                            ),
-                                                            mission_id: Some(mid),
-                                                            resumable: true,
-                                                        });
-                                                        let _ = respond.send(UserMessageAck::Rejected(error));
-                                                        continue;
-                                                    }
                                                     (
                                                         Some(mission.workspace_id),
                                                         model_for_dispatch(&mission_store, &mission).await,
@@ -26222,7 +26418,7 @@ async fn control_actor_loop(
                                             (None, None, None, false, None, None, None, None, None, false)
                                         };
                                         // Per-message agent overrides mission agent
-                                        let agent_override = per_msg_agent.or(mission_agent);
+                                        let agent_override = per_msg_agent.clone().or(mission_agent);
                                         running_cancel = Some(cancel.clone());
                                         running_mission_id = mission_id;
                                         running_backend_id = backend_id.clone();
@@ -26245,10 +26441,10 @@ async fn control_actor_loop(
                                                 running_cancel = None;
                                                 running_mission_id = None;
                                                 running_backend_id = None;
-                                                // The queue dequeue was already persisted, but no
-                                                // run owns this delivery. Roll back the just-appended
-                                                // history entry and release the deterministic message
-                                                // id so the caller/outbox can retry it safely.
+                                                // No run owns this delivery. Roll back the
+                                                // just-appended history entry and put the
+                                                // delivery back to retry on its own backoff;
+                                                // the caller's message is still queued.
                                                 if history.last().is_some_and(|entry| {
                                                     entry.0 == "user" && entry.1 == msg
                                                 }) {
@@ -26261,7 +26457,25 @@ async fn control_actor_loop(
                                                     )
                                                     .await;
                                                 }
-                                                accepted_user_message_ids.remove(&mid);
+                                                let retired = defer_main_delivery(
+                                                    &mut queue,
+                                                    &mut delivery_backoff,
+                                                    &mut queue_errors,
+                                                    &mission_store,
+                                                    &events_tx,
+                                                    (mid, msg, per_msg_agent, msg_target_mid, msg_source),
+                                                    format!("Mission run lease rejected: {error}"),
+                                                )
+                                                .await;
+                                                let _ = persist_control_queue_if_changed(
+                                                    &mission_store,
+                                                    &session_user_id,
+                                                    &queue,
+                                                    &parallel_runners,
+                                                    &recovered_consumed_user_messages,
+                                                    &mut last_persisted_queue,
+                                                )
+                                                .await;
                                                 set_and_emit_status(
                                                     &status,
                                                     &events_tx,
@@ -26270,12 +26484,12 @@ async fn control_actor_loop(
                                                     msg_target_mid,
                                                 )
                                                 .await;
-                                                let _ = respond.send(UserMessageAck::Rejected(error.clone()));
-                                                let _ = events_tx.send(AgentEvent::Error {
-                                                    message: format!("Mission run lease rejected: {error}"),
-                                                    mission_id,
-                                                    resumable: true,
-                                                });
+                                                if retired && mid == id {
+                                                    accepted_user_message_ids.remove(&id);
+                                                    let _ = respond.send(UserMessageAck::Dropped);
+                                                } else {
+                                                    let _ = respond.send(UserMessageAck::Queued);
+                                                }
                                                 continue;
                                             }
                                         };
@@ -27790,7 +28004,18 @@ async fn control_actor_loop(
 
                                         // Start execution if not already running
                                         if running.is_none() {
-                                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = pop_next_runnable_control_queue(&mut queue, &mission_store).await {
+                                            // Only the resumed mission's own delivery runs with
+                                            // the history and settings loaded above. Anything
+                                            // else goes back to the queue, whose next pass
+                                            // starts it with its own mission's state.
+                                            let next = match pop_next_runnable_control_queue(&mut queue, &mission_store, &mut delivery_backoff).await {
+                                                Some(entry) if entry.3 != Some(mission_id) => {
+                                                    queue.push_front(entry);
+                                                    None
+                                                }
+                                                next => next,
+                                            };
+                                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = next {
                                                 // Persist the dequeue before the awaits that
                                                 // start the run, so a crash here can't
                                                 // restore + re-run it.
@@ -28101,7 +28326,7 @@ async fn control_actor_loop(
                                         mission_id: *target_mid,
                                         source: source.clone(),
                                         inflight: false,
-                                        queue_error: None,
+                                        queue_error: queue_errors.get(id).cloned(),
                                     })
                                     .collect();
                                 // Also collect queued messages from parallel runners
@@ -28114,7 +28339,7 @@ async fn control_actor_loop(
                                             mission_id: Some(*mid),
                                             source: qm.source.clone(),
                                             inflight: false,
-                                            queue_error: None,
+                                            queue_error: queue_errors.get(&qm.id).cloned(),
                                         });
                                     }
                                 }
@@ -28993,13 +29218,7 @@ async fn control_actor_loop(
                         }
 
                         // Start next queued message, if any.
-                        if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = pop_next_runnable_control_queue(&mut queue, &mission_store).await {
-                            if host_followup_source(msg_source.as_deref()) {
-                                // The parallel delivery pump owns admission, capacity,
-                                // run acquisition and rollback for every host follow-up.
-                                queue.push_front((mid, msg, per_msg_agent, msg_target_mid, msg_source));
-                                continue;
-                            }
+                        if let Some(entry) = pop_next_runnable_control_queue(&mut queue, &mission_store, &mut delivery_backoff).await {
                             // Persist the dequeue before the awaits that start the run, so
                             // a crash here can't restore + re-run it.
                             if let Err(error) = persist_control_queue_if_changed(
@@ -29012,74 +29231,56 @@ async fn control_actor_loop(
                             )
                             .await
                             {
-                                queue.push_front((
-                                    mid,
-                                    msg,
-                                    per_msg_agent,
-                                    msg_target_mid,
-                                    msg_source,
-                                ));
+                                queue.push_front(entry);
                                 tracing::warn!(
                                     "Queued delivery retained because dequeue persistence failed: {error}"
                                 );
                                 continue;
                             }
-                            // Re-assert activation for every targeted delivery at
-                            // dequeue. A message may have waited behind another turn
-                            // while cancellation, acknowledgement, a background wait,
-                            // or a controller restart changed the presentation row.
-                            // Acquiring a new run without this check can produce an
-                            // interrupted/acknowledged mission with a live run lease.
-                            if queued_delivery_requires_activation(
-                                msg_target_mid,
-                                msg_source.as_deref(),
-                            ) {
-                                let activation = match msg_target_mid {
-                                    Some(mission_id) => {
-                                        activate_mission_id_for_message(
-                                            &control_hub,
-                                            &mission_store,
-                                            &events_tx,
-                                            mission_id,
-                                            &msg,
-                                        )
-                                        .await
-                                    }
-                                    None => Err("transport auto-resume is missing mission_id".to_string()),
-                                };
-                                if let Err(error) = activation {
-                                    queue.push_front((
-                                        mid,
-                                        msg,
-                                        per_msg_agent,
-                                        msg_target_mid,
-                                        msg_source,
-                                    ));
-                                    if let Err(persist_error) = persist_control_queue_if_changed(
-                                        &mission_store,
-                                        &session_user_id,
-                                        &queue,
-                                        &parallel_runners,
-                                        &recovered_consumed_user_messages,
-                                        &mut last_persisted_queue,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to restore queued delivery after activation rejection: {persist_error}"
-                                        );
-                                    }
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: format!(
-                                            "Queued delivery could not activate its mission: {error}"
-                                        ),
-                                        mission_id: msg_target_mid,
-                                        resumable: true,
-                                    });
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                                    continue;
+                            // Load the target's history and re-assert activation for
+                            // every targeted delivery at dequeue. A message may have
+                            // waited behind another turn while cancellation,
+                            // acknowledgement, a background wait, or a controller
+                            // restart changed the presentation row. Acquiring a new run
+                            // without this check can produce an interrupted/acknowledged
+                            // mission with a live run lease.
+                            if let Err(error) = prepare_main_delivery(
+                                &control_hub,
+                                &mission_store,
+                                &events_tx,
+                                &current_mission,
+                                &mut history,
+                                &entry,
+                            )
+                            .await
+                            {
+                                defer_main_delivery(
+                                    &mut queue,
+                                    &mut delivery_backoff,
+                                    &mut queue_errors,
+                                    &mission_store,
+                                    &events_tx,
+                                    entry,
+                                    format!("Queued delivery could not activate its mission: {error}"),
+                                )
+                                .await;
+                                if let Err(persist_error) = persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &parallel_runners,
+                                    &recovered_consumed_user_messages,
+                                    &mut last_persisted_queue,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to restore queued delivery after activation rejection: {persist_error}"
+                                    );
                                 }
+                                continue;
                             }
+                            let (mid, msg, per_msg_agent, msg_target_mid, msg_source) = entry;
                             // Acquire the durable run before publishing the message as
                             // started or appending it to history. If a stale run lease
                             // rejects acquisition, retain the exact queued delivery so
@@ -29095,13 +29296,16 @@ async fn control_actor_loop(
                             {
                                 Ok(run) => run,
                                 Err(error) => {
-                                    queue.push_front((
-                                        mid,
-                                        msg,
-                                        per_msg_agent,
-                                        msg_target_mid,
-                                        msg_source,
-                                    ));
+                                    defer_main_delivery(
+                                        &mut queue,
+                                        &mut delivery_backoff,
+                                        &mut queue_errors,
+                                        &mission_store,
+                                        &events_tx,
+                                        (mid, msg, per_msg_agent, msg_target_mid, msg_source),
+                                        format!("Mission run lease rejected: {error}"),
+                                    )
+                                    .await;
                                     if let Err(persist_error) = persist_control_queue_if_changed(
                                         &mission_store,
                                         &session_user_id,
@@ -29116,11 +29320,6 @@ async fn control_actor_loop(
                                             "Failed to persist queued delivery after run lease rejection: {persist_error}"
                                         );
                                     }
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: format!("Mission run lease rejected: {error}"),
-                                        mission_id,
-                                        resumable: true,
-                                    });
                                     set_and_emit_status(
                                         &status,
                                         &events_tx,
@@ -29129,7 +29328,6 @@ async fn control_actor_loop(
                                         mission_id,
                                     )
                                     .await;
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                                     continue;
                                 }
                             };
@@ -29275,7 +29473,7 @@ async fn control_actor_loop(
                                 if let Err(error) = dispatch_admission::admit_followup(&control_hub, &mission_store, mid, &message.content).await {
                                     match position {
                                         QueuedAt::Main(index) => queue.insert(index, (message.id, message.content, message.agent, Some(mid), message.source)),
-                                        QueuedAt::Runner(_) => { if let Some(runner) = parallel_runners.get_mut(&mid) { runner.queue.push_front(message); } }
+                                        QueuedAt::Runner(index) => { if let Some(runner) = parallel_runners.get_mut(&mid) { runner.queue.insert(index.min(runner.queue.len()), message); } }
                                     }
                                     tracing::debug!(%mid, %error, "Parked follow-up remains queued");
                                     continue;
@@ -29319,9 +29517,9 @@ async fn control_actor_loop(
                                         message.source,
                                     ),
                                 ),
-                                QueuedAt::Runner(_) => {
+                                QueuedAt::Runner(index) => {
                                     if let Some(runner) = parallel_runners.get_mut(&mid) {
-                                        runner.queue.push_front(message);
+                                        runner.queue.insert(index.min(runner.queue.len()), message);
                                     }
                                 }
                             }
@@ -29340,12 +29538,33 @@ async fn control_actor_loop(
                             // Promote durable host queues even while an unrelated main
                             // turn runs. Preserve each mission's FIFO and leave work on
                             // the main queue if its current turn or legacy entries own it.
-                            let targets: HashSet<_> = queue.iter().filter(|entry| host_followup_source(entry.4.as_deref())).filter_map(|entry| entry.3).collect();
+                            let mut targets = Vec::new();
+                            for mid in queue.iter().filter(|entry| host_followup_source(entry.4.as_deref())).filter_map(|entry| entry.3) {
+                                if !targets.contains(&mid) { targets.push(mid); }
+                            }
                             for mid in targets {
                                 if (running.is_some() && running_mission_id == Some(mid))
                                     || queue.iter().find(|entry| entry.3 == Some(mid)).is_some_and(|entry| !host_followup_source(entry.4.as_deref())) { continue; }
                                 if let std::collections::hash_map::Entry::Vacant(slot) = parallel_runners.entry(mid) {
-                                    let Ok(Some(mission)) = mission_store.get_mission(mid).await else { continue; };
+                                    let mission = match mission_store.get_mission(mid).await {
+                                        Ok(Some(mission)) => mission,
+                                        Ok(None) => {
+                                            // Nothing can ever run these: retire them visibly
+                                            // instead of keeping them queued forever.
+                                            let before = queue.len();
+                                            queue.retain(|entry| entry.3 != Some(mid) || !host_followup_source(entry.4.as_deref()));
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!("{} queued message(s) dropped: mission {mid} no longer exists", before - queue.len()),
+                                                mission_id: Some(mid),
+                                                resumable: false,
+                                            });
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            tracing::warn!(mission_id = %mid, "Queued follow-up waits, its mission could not be loaded: {error}");
+                                            continue;
+                                        }
+                                    };
                                     let mut runner = super::mission_runner::MissionRunner::new(
                                         mid, mission.workspace_id, mission.agent.clone(), Some(mission.backend.clone()),
                                         mission.session_id.clone(), mission.config_profile.clone(),
@@ -29369,20 +29588,51 @@ async fn control_actor_loop(
                                         false
                                     } else { true }
                                 });
+                                if !followup_turns.contains(&mid) { followup_turns.push(mid); }
                             }
+                            // Also missions whose follow-ups were restored into their
+                            // runner, then drop missions with nothing left waiting.
+                            let waits = |runner: &super::mission_runner::MissionRunner| !runner.is_running()
+                                && runner.inflight_message().or_else(|| runner.queue.front()).is_some_and(|message| host_followup_source(message.source.as_deref()));
+                            for (mid, runner) in parallel_runners.iter() {
+                                if waits(runner) && !followup_turns.contains(mid) { followup_turns.push(*mid); }
+                            }
+                            followup_turns.retain(|mid| parallel_runners.get(mid).is_some_and(waits));
+                            queue_errors.retain(|id, _| queue.iter().any(|entry| entry.0 == *id)
+                                || parallel_runners.values().any(|runner| runner.inflight_message().is_some_and(|message| message.id == *id) || runner.queue.iter().any(|message| message.id == *id)));
 
                             let mut ready = Vec::new();
                             let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
                             let occupied = parallel_runners.values().filter(|runner| runner.is_running()).count() + usize::from(running.is_some());
                             let available = max_parallel.saturating_sub(occupied);
-                            for (mid, runner) in parallel_runners.iter_mut() {
+                            // Longest waiting first; a mission that starts goes to the back.
+                            for mid in followup_turns.clone() {
                                 if ready.len() >= available { break; }
+                                let Some(runner) = parallel_runners.get_mut(&mid) else { continue; };
+                                let next = runner.inflight_message().or_else(|| runner.queue.front()).map(|message| message.id);
                                 match prepare_host_parallel_followup(&control_hub, &mission_store, &events_tx, runner, &format!("control:{session_user_id}")).await {
-                                    Ok(Some(previous)) => ready.push((*mid, previous)),
-                                    Ok(None) => {},
-                                    Err(error) => tracing::warn!(mission_id = %mid, "Queued parallel delivery deferred: {error}"),
+                                    Ok(Some(previous)) => {
+                                        ready.push((mid, previous));
+                                        followup_turns.retain(|turn| *turn != mid);
+                                        if let Some(id) = next { queue_errors.remove(&id); }
+                                    }
+                                    Ok(None) => { if let Some(id) = next { queue_errors.remove(&id); } }
+                                    Err(_) if matches!(mission_store.get_mission(mid).await, Ok(None)) => {
+                                        let dropped = runner.clear_queue();
+                                        followup_turns.retain(|turn| *turn != mid);
+                                        let _ = events_tx.send(AgentEvent::Error {
+                                            message: format!("{dropped} queued message(s) dropped: mission {mid} no longer exists"),
+                                            mission_id: Some(mid),
+                                            resumable: false,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(mission_id = %mid, "Queued parallel delivery deferred: {error}");
+                                        if let Some(id) = next { queue_errors.insert(id, error); }
+                                    }
                                 }
                             }
+                            prune_empty_provisional_runners(&mut parallel_runners);
                             if !ready.is_empty() {
                                 let persisted = persist_control_queue_if_changed(&mission_store, &session_user_id, &queue, &parallel_runners, &recovered_consumed_user_messages, &mut last_persisted_queue).await.is_ok();
                                 for (mid, (previous, deferred_goal)) in ready {
@@ -40406,7 +40656,7 @@ Investigate <service/> failures.
             active_entry.clone(),
         ]);
 
-        let popped = pop_next_runnable_control_queue(&mut queue, &store)
+        let popped = pop_next_runnable_control_queue(&mut queue, &store, &mut Default::default())
             .await
             .expect("active delivery should be selected");
         assert_eq!(popped.0, active_entry.0);
@@ -40415,10 +40665,172 @@ Investigate <service/> failures.
             VecDeque::from([remote_entry.clone(), paused_entry.clone()])
         );
 
-        assert!(pop_next_runnable_control_queue(&mut queue, &store)
-            .await
-            .is_none());
+        assert!(
+            pop_next_runnable_control_queue(&mut queue, &store, &mut Default::default())
+                .await
+                .is_none()
+        );
         assert_eq!(queue, VecDeque::from([remote_entry, paused_entry]));
+    }
+
+    #[tokio::test]
+    async fn main_dequeue_skips_what_it_cannot_run_and_keeps_each_missions_order() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = || {
+            let store = store.clone();
+            async move {
+                let mission = store
+                    .create_mission(None, None, None, None, None, None, None)
+                    .await
+                    .unwrap();
+                store
+                    .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+                    .await
+                    .unwrap();
+                mission.id
+            }
+        };
+        let followup_mission = mission().await;
+        let retrying = mission().await;
+        let other = mission().await;
+        let entry = |target: Uuid, source: Option<&str>| {
+            (
+                Uuid::new_v4(),
+                "message".to_string(),
+                None,
+                Some(target),
+                source.map(str::to_owned),
+            )
+        };
+        // A desktop follow-up belongs to the parallel delivery pump, and a
+        // delivery whose start just failed waits out its backoff; neither
+        // holds up another mission, and neither is overtaken by a later
+        // message for its own mission.
+        let followup = entry(followup_mission, Some("host-queue:api:test"));
+        let behind_followup = entry(followup_mission, None);
+        let failed = entry(retrying, None);
+        let behind_failed = entry(retrying, None);
+        let runnable = entry(other, None);
+        let mut queue = VecDeque::from([
+            followup.clone(),
+            behind_followup.clone(),
+            failed.clone(),
+            behind_failed.clone(),
+            runnable.clone(),
+        ]);
+        let mut backoff = DeliveryBackoff::default();
+        backoff.defer(failed.0);
+        assert!(backoff.waiting(failed.0));
+
+        let popped = pop_next_runnable_control_queue(&mut queue, &store, &mut backoff).await;
+        assert_eq!(popped.map(|entry| entry.0), Some(runnable.0));
+        assert_eq!(
+            queue,
+            VecDeque::from([
+                followup,
+                behind_followup,
+                failed.clone(),
+                behind_failed.clone()
+            ])
+        );
+        assert!(
+            pop_next_runnable_control_queue(&mut queue, &store, &mut backoff)
+                .await
+                .is_none()
+        );
+
+        // Once the backoff is over the failed delivery is next, in order.
+        backoff.0.insert(failed.0, (1, Instant::now()));
+        let popped = pop_next_runnable_control_queue(&mut queue, &store, &mut backoff).await;
+        assert_eq!(popped.map(|entry| entry.0), Some(failed.0));
+        let popped = pop_next_runnable_control_queue(&mut queue, &store, &mut backoff).await;
+        assert_eq!(popped.map(|entry| entry.0), Some(behind_failed.0));
+        // A message that left the queue takes its backoff with it.
+        assert!(backoff.0.is_empty());
+    }
+
+    #[test]
+    fn delivery_backoff_grows_to_a_minute() {
+        let id = Uuid::new_v4();
+        let mut backoff = DeliveryBackoff::default();
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            backoff.defer(id);
+            let until = backoff.0[&id].1;
+            delays.push((until - Instant::now()).as_secs_f64().round() as u64);
+        }
+        assert_eq!(delays, vec![2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn parked_session_takes_plain_messages_queued_behind_ones_needing_a_fresh_turn() {
+        let mission = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let entry = |target, content: &str, agent: Option<&str>| {
+            (
+                Uuid::new_v4(),
+                content.to_string(),
+                agent.map(str::to_owned),
+                Some(target),
+                None,
+            )
+        };
+        let slash = entry(mission, "/compact", None);
+        let overridden = entry(mission, "use another agent", Some("reviewer"));
+        let first = entry(mission, "first plain", None);
+        let second = entry(mission, "second plain", None);
+        let mut queue = VecDeque::from([
+            slash.clone(),
+            entry(other, "other mission", None),
+            overridden.clone(),
+            first.clone(),
+            second.clone(),
+        ]);
+        let mut runners = HashMap::new();
+        let Some((QueuedAt::Main(position), message)) =
+            take_for_parked_session(mission, false, &mut queue, &mut runners)
+        else {
+            panic!("the first plain message is taken");
+        };
+        assert_eq!((position, message.id), (3, first.0));
+        let Some((QueuedAt::Main(_), message)) =
+            take_for_parked_session(mission, false, &mut queue, &mut runners)
+        else {
+            panic!("then the next one");
+        };
+        assert_eq!(message.id, second.0);
+        assert!(take_for_parked_session(mission, false, &mut queue, &mut runners).is_none());
+        assert_eq!(queue.len(), 3, "messages needing a fresh turn stay queued");
+
+        // The same holds for a parallel runner's queue.
+        let mut runner = crate::api::mission_runner::MissionRunner::new(
+            mission,
+            Uuid::new_v4(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        let scheduled = Uuid::new_v4();
+        let plain = Uuid::new_v4();
+        runner.queue_message(scheduled, "batch".into(), None, Some("scheduler".into()));
+        runner.queue_message(plain, "plain".into(), None, None);
+        runners.insert(mission, runner);
+        let mut empty = VecDeque::new();
+        let Some((QueuedAt::Runner(position), message)) =
+            take_for_parked_session(mission, false, &mut empty, &mut runners)
+        else {
+            panic!("the runner's plain message is taken");
+        };
+        assert_eq!((position, message.id), (1, plain));
+        assert_eq!(
+            runners[&mission].queue.front().map(|m| m.id),
+            Some(scheduled)
+        );
     }
 
     #[tokio::test]
@@ -40795,6 +41207,30 @@ Investigate <service/> failures.
         );
         assert!(follow_up_should_requeue_as_pending(MissionStatus::Failed));
         assert!(!follow_up_should_requeue_as_pending(MissionStatus::Pending));
+    }
+
+    #[test]
+    fn deferred_goal_keeps_operator_messages_still_waiting_on_a_non_pending_mission() {
+        // Two messages arrive at capacity while the mission is not Pending:
+        // the second must join the first, not replace it.
+        let first = deferred_messages::encode(Uuid::new_v4(), "first follow-up");
+        let second = deferred_messages::encode(Uuid::new_v4(), "second follow-up");
+        for status in [MissionStatus::Active, MissionStatus::Failed] {
+            let combined = deferred_goal_for_incoming_message(status, Some(&first), &second);
+            let (_, messages) = deferred_messages::decode(&combined);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|(_, content)| content.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first follow-up", "second follow-up"]
+            );
+            // A retry of a batch the goal already holds changes nothing.
+            assert_eq!(
+                deferred_goal_for_incoming_message(status, Some(&combined), &second),
+                combined
+            );
+        }
     }
 
     #[test]
