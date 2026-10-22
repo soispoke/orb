@@ -17132,6 +17132,15 @@ async fn update_mission_project_locked(
     Ok(Json(updated))
 }
 
+/// Drop a usage-limit wait's start date so the scheduler runs the chat's held
+/// resume (and any messages appended to it) now. The held text is kept.
+async fn lift_usage_limit_wait(store: &Arc<dyn MissionStore>, mission: &Mission) {
+    let mut scheduling = mission.scheduling.clone();
+    scheduling.not_before = None;
+    let lifted = store.set_mission_scheduling(mission.id, &scheduling).await.is_ok();
+    tracing::info!(mission_id = %mission.id, lifted, "A user message lifted a usage-limit wait");
+}
+
 /// A chat moved to another project keeps its folder, and with it the skill
 /// links Orb made there for the old project; every later launch then fails
 /// with "contains skills belonging to another project". Remove those links
@@ -24839,6 +24848,17 @@ async fn control_actor_loop(
                                     }
                                         .filter(|mission| mission.status == MissionStatus::Pending)
                                 } else { None };
+                                // The user's message to a chat waiting on a usage limit is the
+                                // retry the wait offers ("switch account or model to
+                                // continue now"), so it lifts the wait.
+                                // The message is still appended to the held resume below (in
+                                // order, nothing dropped); the scheduler runs it at once.
+                                if let Some(waiting) = pending_followup.as_ref().filter(|m| {
+                                    !m.is_dispatchable_at(chrono::Utc::now())
+                                        && m.terminal_reason.as_deref() == Some(usage_limit_wait::USAGE_LIMIT_WAIT_REASON)
+                                }) {
+                                    lift_usage_limit_wait(&mission_store, waiting).await;
+                                }
                                 let queued_followup = queued_followup && pending_followup.as_ref()
                                     .is_none_or(|mission| !mission.is_dispatchable_at(chrono::Utc::now()));
                                 if queued_followup {
@@ -25129,23 +25149,16 @@ async fn control_actor_loop(
                                                 // model to continue now": the user's message is
                                                 // that retry, so it lifts the wait instead of
                                                 // being held until the reset.
-                                                let m = if m.status == MissionStatus::Pending
+                                                // The message still joins the held resume below, so
+                                                // nothing queued earlier is lost; the scheduler then
+                                                // runs it at once instead of at the reset.
+                                                if m.status == MissionStatus::Pending
                                                     && !m.is_dispatchable_at(now)
                                                     && m.terminal_reason.as_deref()
                                                         == Some(usage_limit_wait::USAGE_LIMIT_WAIT_REASON)
                                                 {
-                                                    let mut scheduling = m.scheduling.clone();
-                                                    scheduling.not_before = None;
-                                                    let lifted = mission_store
-                                                        .set_mission_scheduling(tid, &scheduling)
-                                                        .await
-                                                        .is_ok()
-                                                        && mission_store.set_deferred_goal(tid, None).await.is_ok();
-                                                    tracing::info!(mission_id = %tid, lifted, "A user message lifted a usage-limit wait");
-                                                    mission_store.get_mission(tid).await.ok().flatten().unwrap_or(m)
-                                                } else {
-                                                    m
-                                                };
+                                                    lift_usage_limit_wait(&mission_store, &m).await;
+                                                }
                                                 if m.status == MissionStatus::Pending
                                                     && !m.is_dispatchable_at(now)
                                                 {

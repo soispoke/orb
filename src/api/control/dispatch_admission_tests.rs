@@ -2824,7 +2824,8 @@ async fn pending_deferred_assignment_refuses_multiple_retags_without_concatenati
 
 #[tokio::test]
 async fn a_user_message_lifts_a_usage_limit_wait_but_not_a_scheduled_start() {
-    for usage_limit in [true, false] {
+    // `queued` is how the app sends (queue_followup), the path that failed live.
+    for (usage_limit, queued) in [(true, false), (false, false), (true, true), (false, true)] {
         let h = Harness::new().await;
         let m = h.writer(MissionStatus::Pending, None).await;
         let later = (chrono::Utc::now() + chrono::Duration::days(5)).to_rfc3339();
@@ -2853,18 +2854,26 @@ async fn a_user_message_lifts_a_usage_limit_wait_but_not_a_scheduled_start() {
             )
             .await
             .unwrap();
-        let response = h.request(false, m.id, json!({"content":"do the full run", "continue_identity":Harness::assertion(&m)})).await;
+        let response = h
+            .request(false, m.id, json!({"content":"do the full run", "queue_followup": queued, "continue_identity":Harness::assertion(&m)}))
+            .await;
         assert!(response.status().is_success(), "{}", response.text().await.unwrap());
-        let after = h.control.mission_store.get_mission(m.id).await.unwrap().unwrap();
-        let deferred = h.control.mission_store.get_deferred_goal(m.id).await.unwrap().unwrap_or_default();
+        let mut after = h.control.mission_store.get_mission(m.id).await.unwrap().unwrap();
+        for _ in 0..50 {
+            if after.scheduling.not_before.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            after = h.control.mission_store.get_mission(m.id).await.unwrap().unwrap();
+        }
+        let case = format!("usage_limit={usage_limit} queued={queued}");
+        let held = h.control.mission_store.get_deferred_goal(m.id).await.unwrap().unwrap_or_default();
         if usage_limit {
-            // The wait is gone and the message is not held for the reset.
-            assert_eq!(after.scheduling.not_before, None);
-            assert!(!deferred.contains("do the full run"), "{deferred}");
+            assert_eq!(after.scheduling.not_before, None, "{case}");
+            // Nothing held is dropped: the message joins the resume, in order.
+            assert!(held.contains("[Automatic resume after a usage limit]") && held.contains("do the full run"), "{case}: {held}");
         } else {
-            // A deliberately scheduled start still holds the message.
-            assert_eq!(after.scheduling.not_before.as_deref(), Some(later.as_str()));
-            assert!(deferred.contains("do the full run"), "{deferred}");
+            assert_eq!(after.scheduling.not_before.as_deref(), Some(later.as_str()), "{case}");
         }
     }
 }
