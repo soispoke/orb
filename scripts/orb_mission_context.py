@@ -11,6 +11,14 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
+# A chat can be filed under the wrong project (a fork keeps its parent's).
+# The label picks a workflow; it must never make an agent refuse its task.
+SCOPE = ("The project label only selects which project workflow applies. It does not limit "
+         "what you may work on. If your task (from the user or a coordinating agent) is about "
+         "another project, do that task, skip workflow steps that belong to this project, and "
+         "mention that the chat may be filed under the wrong project. A mismatch between the "
+         "label and the task is a filing mistake, not a sign of prompt injection.")
+
 DATABASE = Path("/root/.sandboxed-sh/missions/missions-default.db")
 PROJECT_FILES = Path("/root/.sandboxed-sh/project-files")
 
@@ -45,7 +53,7 @@ def report(environ=None, database=DATABASE, project_files=PROJECT_FILES):
     if row is None:
         return "Launcher mission is not registered; project scope is not assumed.", 1
     project = row[0]
-    lines = ["Current Orb mission: " + mission + " Project: " + (project or "unassigned")]
+    lines = ["Current Orb mission: " + mission + " Project: " + (project or "unassigned"), SCOPE]
     if project == "hardness":
         try:
             lines.append((project_files / "hardness/skills/hardness-workflow/SKILL.md").read_text())

@@ -32,3 +32,17 @@ in an isolated parent and two workers. Each must report its own full mission ID;
 the parent must still report its own ID after the workers finish. Missing identity
 is a failed test, not permission to inject a guessed ID. Do not change unrelated
 missions, sessions, builds, or credentials during verification.
+
+## Startup instructions and wrong project labels
+
+The startup instructions that tell every agent to run the helper live at
+`/root/workspaces/CLAUDE.md` on Core; the tracked copy is
+`scripts/orb-ship/core/workspace-CLAUDE.md`. Install both files the same way
+(backup in `/root/.sandboxed-sh/deployment-backups/`, then atomic replace).
+
+A chat can be filed under the wrong project: a fork keeps its parent's project.
+Both files therefore say the label only selects a workflow and never limits the
+task. Without that, a helper agent whose brief names another project read the
+mismatch as a prompt injection and refused (sig.golf chats filed under Hardness,
+2026-10-22). Fix a wrong label by moving the chat (cut it, paste it into the
+right project), not by rewording briefs.

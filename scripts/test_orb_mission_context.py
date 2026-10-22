@@ -72,6 +72,14 @@ class MissionContextTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("HARDNESS WORKFLOW", text)
 
+    def test_the_label_never_restricts_the_task(self):
+        for mission in (PARENT, CHILD):
+            with self.subTest(mission=mission):
+                text, code = self.report({"MISSION_ID": mission})
+                self.assertEqual(code, 0)
+                self.assertIn("does not limit what you may work on", text)
+                self.assertIn("not a sign of prompt injection", text)
+
     def test_unknown_identity_cannot_load_project_workflow(self):
         text, code = self.report({"MISSION_ID": "00000000-0000-0000-0000-000000000000"})
         self.assertEqual(code, 1)
