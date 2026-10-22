@@ -4,7 +4,7 @@ pub(crate) mod claude_task_status;
 use crate::api::control::AgentEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -57,6 +57,10 @@ pub struct ClaudeSubagents {
     calls: HashSet<String>,
     workflow_runs: BTreeMap<String, String>,
     workflow_terminals: HashSet<(String, String)>,
+    /// Every `tool_use_id` seen on each agent's start and completion edges.
+    runs: HashMap<String, HashSet<String>>,
+    /// The `tool_use_id` of each agent's newest run.
+    current: HashMap<String, String>,
 }
 impl ClaudeSubagents {
     pub fn consume(&mut self, event: &Value) -> Vec<Subagent> {
@@ -153,8 +157,40 @@ impl ClaudeSubagents {
             detail: None,
             ..Subagent::default()
         });
-        if let Some(call) = call {
-            agent.tool_call_id = Some(call.into());
+        // `SendMessage` to a finished agent starts a new run of the same task
+        // id under the resuming call. Only that new call, never a late frame of
+        // the finished run, makes the agent live again.
+        let started = value["subtype"] == "task_started";
+        let edge = started || value["subtype"] == "task_notification";
+        let runs = self.runs.entry(id.into()).or_default();
+        // A late completion notice of an earlier run does not end the newer one.
+        if !started
+            && edge
+            && call.is_some_and(|call| {
+                runs.contains(call) && self.current.get(id).is_some_and(|current| current != call)
+            })
+        {
+            runs.extend(call.map(str::to_owned));
+            return;
+        }
+        let known_run = call.is_some_and(|call| runs.contains(call));
+        let resumed = started && is_terminal(&agent.status) && call.is_some() && !known_run;
+        if resumed {
+            agent.status = "running".into();
+            agent.detail = None;
+        }
+        // A late or repeated frame of a known run must not repoint the agent.
+        if let Some(call) = call.filter(|_| !known_run) {
+            // Snapshots may echo a call id; only edges define runs.
+            if edge {
+                runs.insert(call.into());
+            }
+            if resumed || !is_terminal(&agent.status) {
+                agent.tool_call_id = Some(call.into());
+                if started {
+                    self.current.insert(id.into(), call.into());
+                }
+            }
         }
         if let Some(label) = value["description"].as_str().filter(|s| !s.is_empty()) {
             agent.description = label.chars().take(240).collect();
@@ -404,6 +440,58 @@ mod tests {
         assert!(state.consume(&json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":"launched"}]}})).is_empty());
         assert_eq!(state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","status":"failed","summary":"Build failed"}))[0].status,"failed");
         assert!(state.consume(&start).is_empty());
+    }
+    /// Event order recorded from Claude Code 2.1.308 for `SendMessage` to a
+    /// finished background agent.
+    #[test]
+    fn a_resumed_agent_shows_running_until_its_new_run_reports() {
+        let mut state = ClaudeSubagents::default();
+        let snapshot = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks});
+        state.consume(&json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"launch","name":"Agent"}]}}));
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch","task_type":"local_agent","description":"probe"}));
+        assert_eq!(state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed","summary":"ONE"}))[0].status, "completed");
+        state.consume(&snapshot(json!([])));
+
+        assert!(state
+            .consume(&snapshot(
+                json!([{"task_id":"a","task_type":"local_agent"}])
+            ))
+            .is_empty());
+        let resumed = state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume","task_type":"local_agent","description":"probe"}));
+        assert_eq!(resumed[0].status, "running");
+        assert_eq!(resumed[0].detail, None);
+        assert_eq!(resumed[0].tool_call_id.as_deref(), Some("resume"));
+
+        let done = state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"resume","status":"completed","summary":"TWO"}));
+        assert_eq!(done[0].status, "completed");
+        assert_eq!(done[0].detail.as_deref(), Some("TWO"));
+        // A late duplicate of either start cannot reopen it.
+        assert!(state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume"})).is_empty());
+        assert!(state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"})).is_empty());
+    }
+    #[test]
+    fn a_late_notice_of_the_first_run_keeps_the_resumed_lane_running() {
+        let mut state = ClaudeSubagents::default();
+        let snapshot = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks});
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch","task_type":"local_agent"}));
+        // A snapshot that echoes the resuming call id must not hide the resume.
+        state.consume(&snapshot(
+            json!([{"task_id":"a","task_type":"local_agent","tool_use_id":"resume"}]),
+        ));
+        state.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed","summary":"ONE"}));
+        let resumed = state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume","task_type":"local_agent"}));
+        assert_eq!(resumed[0].status, "running");
+        // The resume can also start before the first run's notice arrives.
+        let mut early = ClaudeSubagents::default();
+        early.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch","task_type":"local_agent"}));
+        early.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume","task_type":"local_agent"}));
+        assert!(early.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed","summary":"ONE"})).is_empty());
+        // A repeated start of the first run does not take over the lane.
+        assert!(early.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch","task_type":"local_agent"})).is_empty());
+        let done = early.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"resume","status":"completed","summary":"TWO"}));
+        assert_eq!(done[0].status, "completed");
+        assert_eq!(done[0].tool_call_id.as_deref(), Some("resume"));
+        assert_eq!(done[0].detail.as_deref(), Some("TWO"));
     }
     #[test]
     fn native_subagent_snapshots_ignore_shells_and_do_not_invent_success() {

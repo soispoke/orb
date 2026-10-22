@@ -38,6 +38,9 @@ pub struct Activity {
     pub thinking_tokens: Option<u64>,
     #[serde(skip)]
     confirmed_live: bool,
+    /// Every `tool_use_id` seen on this task's start and completion edges.
+    #[serde(skip)]
+    runs: std::collections::HashSet<String>,
 }
 fn activity_now() -> u64 {
     std::time::SystemTime::now()
@@ -63,7 +66,37 @@ impl Activity {
             finished_at: None,
             thinking_tokens: None,
             confirmed_live: false,
+            runs: Default::default(),
         }
+    }
+    /// A start edge. `SendMessage` to a finished agent starts a new run of the
+    /// same task id under the resuming call; only that new call reopens it.
+    fn start(&mut self, call: Option<&str>) {
+        if let Some(call) = call {
+            // A repeated start of a known run, live or finished, changes nothing.
+            if !self.runs.insert(call.into()) {
+                return;
+            }
+            if self.done {
+                self.done = false;
+                self.failed = false;
+                self.detail = None;
+                self.finished_at = None;
+                self.status = "running".into();
+            }
+            self.tool_use_id = Some(call.into());
+        }
+    }
+    /// A completion notice of an earlier run does not end the newer one.
+    fn is_earlier_run(&mut self, call: Option<&str>) -> bool {
+        let Some(call) = call else { return false };
+        // A notice from a call never seen before still ends the task.
+        let known = !self.runs.insert(call.into());
+        known
+            && self
+                .tool_use_id
+                .as_deref()
+                .is_some_and(|current| current != call)
     }
     fn live(&mut self) {
         if self.done {
@@ -132,8 +165,13 @@ fn upsert_task<'a>(
     if value["task_type"].is_string() || value["subagent_type"].is_string() {
         activity.kind = task_kind(value).into();
     }
-    if let Some(id) = value["tool_use_id"].as_str() {
-        activity.tool_use_id = Some(id.into());
+    // Later calls are assigned by start edges only, so a late frame of a
+    // finished run cannot repoint the activity.
+    if activity.tool_use_id.is_none() {
+        if let Some(call) = value["tool_use_id"].as_str() {
+            activity.tool_use_id = Some(call.into());
+            activity.runs.insert(call.into());
+        }
     }
     activity.updated_at = activity_now();
     Some(activity)
@@ -540,6 +578,9 @@ impl Output {
             match value["subtype"].as_str() {
                 Some("task_started" | "task_progress") => {
                     if let Some(activity) = upsert_task(&mut activities, value) {
+                        if value["subtype"] == "task_started" {
+                            activity.start(value["tool_use_id"].as_str());
+                        }
                         activity.live();
                         if let Some(tool) =
                             value["last_tool_name"].as_str().filter(|_| !activity.done)
@@ -569,9 +610,13 @@ impl Output {
                             }
                         }
                     } else if let Some(activity) = upsert_task(&mut activities, value) {
-                        activity.finish(value["status"].as_str().unwrap_or("finished"));
-                        if let Some(summary) = value["summary"].as_str().filter(|s| !s.is_empty()) {
-                            activity.detail = Some(summary.chars().take(8000).collect());
+                        if !activity.is_earlier_run(value["tool_use_id"].as_str()) {
+                            activity.finish(value["status"].as_str().unwrap_or("finished"));
+                            if let Some(summary) =
+                                value["summary"].as_str().filter(|s| !s.is_empty())
+                            {
+                                activity.detail = Some(summary.chars().take(8000).collect());
+                            }
                         }
                     }
                 }
@@ -1129,6 +1174,54 @@ mod tests {
         );
         assert!(!output.activities()[0].done);
         assert_eq!(output.activities()[0].status, "unknown");
+    }
+    /// Event order recorded from Claude Code 2.1.308 for `SendMessage` to a
+    /// finished background agent, plus a late notice of the first run.
+    #[test]
+    fn a_resumed_background_agent_is_running_again() {
+        let output = Output::default();
+        let event = |value: serde_json::Value| output.claude_activity(&value);
+        event(
+            json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch","task_type":"local_agent","description":"probe"}),
+        );
+        event(
+            json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed","summary":"ONE"}),
+        );
+        event(json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}));
+        assert!(output.activities()[0].done);
+        event(
+            json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"local_agent"}]}),
+        );
+        event(
+            json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume","task_type":"local_agent"}),
+        );
+        let resumed = &output.activities()[0];
+        assert!(!resumed.done);
+        assert_eq!(resumed.status, "running");
+        assert_eq!(resumed.tool_use_id.as_deref(), Some("resume"));
+        // Late frames of the first run change nothing.
+        event(
+            json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed","summary":"ONE"}),
+        );
+        event(
+            json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"}),
+        );
+        assert!(!output.activities()[0].done);
+        assert_eq!(
+            output.activities()[0].tool_use_id.as_deref(),
+            Some("resume")
+        );
+        event(
+            json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"resume","status":"completed","summary":"TWO"}),
+        );
+        let done = &output.activities()[0];
+        assert!(done.done);
+        assert_eq!(done.detail.as_deref(), Some("TWO"));
+        // A finished run's duplicate start does not reopen it.
+        event(
+            json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume"}),
+        );
+        assert!(output.activities()[0].done);
     }
     #[test]
     fn claude_activity_tracks_thinking_and_tool_results() {

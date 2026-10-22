@@ -151,10 +151,19 @@ impl Drop for SessionGuard {
 
 /// Background tasks the CLI reports as live. Prefer its authoritative
 /// snapshot; older CLIs expose only the edges.
+///
+/// A finished task stays finished against late or stale frames, but the CLI
+/// can start the same task id again: `SendMessage` to a finished agent emits a
+/// fresh `task_started` carrying the resuming call's `tool_use_id`. That new
+/// run is live, and ending the session under it kills the agent.
 #[derive(Default)]
 pub(crate) struct ClaudeBackground {
     tasks: HashSet<String>,
     terminal_tasks: HashSet<String>,
+    /// Every `tool_use_id` seen for each task's runs.
+    runs: HashMap<String, HashSet<String>>,
+    /// The `tool_use_id` of each task's newest run.
+    current: HashMap<String, String>,
 }
 
 impl ClaudeBackground {
@@ -192,9 +201,22 @@ impl ClaudeBackground {
             }
             Some("task_started") if event["ambient"] != true => {
                 if let Some(id) = event["task_id"].as_str() {
-                    if !self.terminal_tasks.contains(id) {
-                        self.tasks.insert(id.into());
+                    let call = event["tool_use_id"].as_str();
+                    let known = call.is_some_and(|call| {
+                        self.runs.get(id).is_some_and(|calls| calls.contains(call))
+                    });
+                    if self.terminal_tasks.contains(id) {
+                        if call.is_none() || known {
+                            return;
+                        }
+                        self.terminal_tasks.remove(id);
                     }
+                    // A repeated start of a known run does not make it current.
+                    if let Some(call) = call.filter(|_| !known) {
+                        self.record_run(id, Some(call));
+                        self.current.insert(id.into(), call.into());
+                    }
+                    self.tasks.insert(id.into());
                 }
             }
             Some("task_notification")
@@ -203,11 +225,28 @@ impl ClaudeBackground {
                 }) =>
             {
                 if let Some(id) = event["task_id"].as_str() {
+                    let call = event["tool_use_id"].as_str();
+                    // A late notice of an earlier run does not end the newer one;
+                    // a notice from a call never seen before still ends the task.
+                    let earlier_run = call.is_some_and(|call| {
+                        self.runs.get(id).is_some_and(|calls| calls.contains(call))
+                            && self.current.get(id).is_some_and(|current| current != call)
+                    });
+                    self.record_run(id, call);
+                    if earlier_run {
+                        return;
+                    }
                     self.tasks.remove(id);
                     self.terminal_tasks.insert(id.into());
                 }
             }
             _ => {}
+        }
+    }
+
+    fn record_run(&mut self, id: &str, call: Option<&str>) {
+        if let Some(call) = call {
+            self.runs.entry(id.into()).or_default().insert(call.into());
         }
     }
 
@@ -253,6 +292,86 @@ mod tests {
             ]}),
         );
         assert_eq!(background.running(), 1);
+    }
+
+    /// Event order recorded from Claude Code 2.1.308: a background agent
+    /// finishes, then `SendMessage` resumes it under the same task id. The
+    /// resumed run must keep the session parked until it reports back.
+    #[test]
+    fn a_resumed_agent_is_live_again_until_it_reports() {
+        let mut background = ClaudeBackground::default();
+        let snapshot = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks});
+        background.consume(&snapshot(
+            json!([{"task_id":"a","task_type":"local_agent"}]),
+        ));
+        background.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch","task_type":"local_agent"}));
+        assert_eq!(background.running(), 1);
+        background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed"}));
+        background.consume(&snapshot(json!([])));
+        assert_eq!(background.running(), 0);
+
+        // SendMessage to the finished agent: the snapshot lists it first, then
+        // the CLI emits a start edge under the resuming call.
+        background.consume(&snapshot(
+            json!([{"task_id":"a","task_type":"local_agent"}]),
+        ));
+        background.consume(&json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume","task_type":"local_agent"}));
+        assert_eq!(background.running(), 1);
+        background.consume(&snapshot(
+            json!([{"task_id":"a","task_type":"local_agent"}]),
+        ));
+        assert_eq!(background.running(), 1);
+
+        background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"resume","status":"completed"}));
+        background.consume(&snapshot(json!([])));
+        assert_eq!(background.running(), 0);
+        // Late duplicates of either run's start cannot reopen it.
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"}),
+        );
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume"}),
+        );
+        assert_eq!(background.running(), 0);
+    }
+
+    #[test]
+    fn a_late_notice_of_the_first_run_does_not_end_the_resumed_one() {
+        let mut background = ClaudeBackground::default();
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"}),
+        );
+        // The resume starts before the first run's completion notice arrives.
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"resume"}),
+        );
+        background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch","status":"completed"}));
+        background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}));
+        assert_eq!(background.running(), 1);
+        // A repeated start of the first run does not take over: the resumed
+        // run's own notice still ends the task.
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"}),
+        );
+        background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"resume","status":"completed"}));
+        assert_eq!(background.running(), 0);
+    }
+
+    #[test]
+    fn late_frames_of_a_finished_run_do_not_revive_it() {
+        let mut background = ClaudeBackground::default();
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"}),
+        );
+        background.consume(&json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"launch"}));
+        // A delayed duplicate of the original start, a start without a call id
+        // and a stale snapshot all belong to the finished run.
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"launch"}),
+        );
+        background.consume(&json!({"type":"system","subtype":"task_started","task_id":"a"}));
+        background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}));
+        assert_eq!(background.running(), 0);
     }
 
     #[test]
