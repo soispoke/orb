@@ -1132,8 +1132,17 @@ everything is truly done, report completion and stop."
 /// (a user-cancelled `Interrupted` coordinator, `Completed`, `Failed`, ...)
 /// are evidence that `Acknowledged` would erase. An `Acknowledged` mission is
 /// not terminal, so turning an `Interrupted` one into it made it wakeable.
-fn archive_cascade_promotes(status: MissionStatus) -> bool {
-    status == MissionStatus::AwaitingUser
+/// The exception is a mission interrupted by a server restart: boot recovery
+/// resumes those, so it is archived too (keeping its reason) or it would
+/// restart under its archived parent.
+fn archive_cascade_promotes(status: MissionStatus, terminal_reason: Option<&str>) -> bool {
+    match status {
+        MissionStatus::AwaitingUser => true,
+        MissionStatus::Interrupted => {
+            matches!(terminal_reason, Some("server_shutdown" | "service_restart"))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -2061,7 +2070,7 @@ mod archive_and_cancel_cascade_tests {
 
     #[test]
     fn archive_cascade_promotes_only_parked_children() {
-        assert!(archive_cascade_promotes(MissionStatus::AwaitingUser));
+        assert!(archive_cascade_promotes(MissionStatus::AwaitingUser, None));
         for status in [
             MissionStatus::Pending,
             MissionStatus::Active,
@@ -2074,7 +2083,7 @@ mod archive_and_cancel_cascade_tests {
             MissionStatus::Blocked,
             MissionStatus::NotFeasible,
         ] {
-            assert!(!archive_cascade_promotes(status), "{status}");
+            assert!(!archive_cascade_promotes(status, None), "{status}");
         }
     }
 
@@ -2126,6 +2135,71 @@ mod archive_and_cancel_cascade_tests {
         let w = get(store, worker).await;
         assert_eq!(w.status, MissionStatus::Acknowledged);
         assert_eq!(w.terminal_reason.as_deref(), Some("turn_complete"));
+    }
+
+    #[tokio::test]
+    async fn archiving_retires_restart_interrupted_workers_from_boot_recovery() {
+        // A worker interrupted by a server restart is resumed by boot
+        // recovery; left alone by the archive cascade it restarted under its
+        // archived boss. A user-cancelled sibling must stay exactly as it is.
+        assert!(!archive_cascade_promotes(
+            MissionStatus::Interrupted,
+            Some("cancelled")
+        ));
+        let s = session().await;
+        let store = &s.control.mission_store;
+        let boss = mk(store, None, MissionStatus::AwaitingUser, None).await;
+        let mut restarted = Vec::new();
+        for reason in ["server_shutdown", "service_restart"] {
+            restarted.push(mk(store, Some(boss), MissionStatus::Interrupted, Some(reason)).await);
+        }
+        let cancelled = mk(
+            store,
+            Some(boss),
+            MissionStatus::Interrupted,
+            Some("cancelled"),
+        )
+        .await;
+        let mut before = store
+            .get_recent_server_shutdown_mission_ids(24)
+            .await
+            .unwrap();
+        before.sort();
+        let mut expected = restarted.clone();
+        expected.sort();
+        assert_eq!(
+            before, expected,
+            "fixture must be recoverable before archiving"
+        );
+
+        let (tx, rx) = oneshot::channel();
+        s.control
+            .cmd_tx
+            .send(ControlCommand::SetMissionStatus {
+                id: boss,
+                status: MissionStatus::Acknowledged,
+                respond: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        assert!(store
+            .get_recent_server_shutdown_mission_ids(24)
+            .await
+            .unwrap()
+            .is_empty());
+        for (id, reason) in restarted
+            .into_iter()
+            .zip(["server_shutdown", "service_restart"])
+        {
+            let m = get(store, id).await;
+            assert_eq!(m.status, MissionStatus::Acknowledged);
+            assert_eq!(m.terminal_reason.as_deref(), Some(reason));
+        }
+        let c = get(store, cancelled).await;
+        assert_eq!(c.status, MissionStatus::Interrupted);
+        assert_eq!(c.terminal_reason.as_deref(), Some("cancelled"));
     }
 
     #[tokio::test]
@@ -27086,7 +27160,7 @@ async fn control_actor_loop(
                                                 else {
                                                     continue;
                                                 };
-                                                if !archive_cascade_promotes(child.status) {
+                                                if !archive_cascade_promotes(child.status, child.terminal_reason.as_deref()) {
                                                     continue;
                                                 }
                                                 // Keep the child's terminal_reason: the board
