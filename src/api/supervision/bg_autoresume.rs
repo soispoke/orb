@@ -257,6 +257,23 @@ fn terminal_status_discards_background_task(status: MissionStatus) -> bool {
     status.is_terminal() || status == MissionStatus::Acknowledged
 }
 
+/// Only a parked mission is woken with its background output.
+fn status_is_resumable(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::AwaitingUser | MissionStatus::WaitingBackground
+    )
+}
+
+/// Fresh status read just before the resume is sent. A failed read skips this
+/// pass; the task stays registered and is retried next tick.
+async fn mission_still_resumable(mission_store: &Arc<dyn MissionStore>, mission_id: Uuid) -> bool {
+    matches!(
+        mission_store.get_mission(mission_id).await,
+        Ok(Some(mission)) if status_is_resumable(mission.status)
+    )
+}
+
 /// Watcher that auto-resumes missions whose background shell tasks have finished.
 ///
 /// Uses an in-memory [`BackgroundTaskRegistry`] shared with the control actor.
@@ -335,10 +352,7 @@ pub(crate) async fn background_task_autoresume_loop(
                     continue;
                 }
             };
-            if !matches!(
-                mission.status,
-                MissionStatus::AwaitingUser | MissionStatus::WaitingBackground
-            ) {
+            if !status_is_resumable(mission.status) {
                 let terminal = terminal_status_discards_background_task(mission.status);
                 let age_secs = task.started_at.elapsed().as_secs();
                 let prev = watches.get(&(mission_id, task.id.clone()));
@@ -526,6 +540,17 @@ pub(crate) async fn background_task_autoresume_loop(
                     task.id, command_display, tail, note,
                 )
             };
+
+            // The probe and output read above can take seconds; a user Stop or
+            // archive in that window must win over this automatic resume.
+            if !mission_still_resumable(&mission_store, mission_id).await {
+                tracing::debug!(
+                    mission_id = %mission_id,
+                    task = %task.id,
+                    "bg-autoresume: mission left awaiting_user during the probe; not resuming"
+                );
+                continue;
+            }
 
             let _ = events_tx.send(AgentEvent::MissionActivity {
                 label: format!("Resuming: background task `{}` finished", task.id),
@@ -814,15 +839,16 @@ fn truncate_for_pgrep(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bg_decide_finished, demote_parked_if_jobs_gone, parse_probe_line, pgrep_pattern_for_task,
-        reconcile_parked_status, shell_single_quote, terminal_status_discards_background_task,
-        truncate_for_pgrep, BackgroundTask, BgProbe, BgWatch, MissionStatus, BG_IDLE_STABLE_SECS,
-        BG_START_GRACE_SECS,
+        bg_decide_finished, demote_parked_if_jobs_gone, mission_still_resumable, parse_probe_line,
+        pgrep_pattern_for_task, reconcile_parked_status, shell_single_quote,
+        terminal_status_discards_background_task, truncate_for_pgrep, BackgroundTask, BgProbe,
+        BgWatch, MissionStatus, BG_IDLE_STABLE_SECS, BG_START_GRACE_SECS,
     };
     use crate::api::mission_store::{InMemoryMissionStore, MissionStore};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::broadcast;
+    use uuid::Uuid;
 
     fn sample_task(id: &str, output_path: &str, command: &str) -> BackgroundTask {
         BackgroundTask {
@@ -1113,6 +1139,39 @@ mod tests {
             MissionStatus::Active,
             "a reactivated mission must not be demoted to AwaitingUser"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_probe_cancels_the_resume() {
+        // The watcher saw the mission parked, then probed the workspace; the
+        // user stopped it meanwhile. The pre-send re-read must see the stop.
+        let store: Arc<dyn MissionStore> = Arc::new(InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("bg stop race"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        store
+            .update_mission_status(mission.id, MissionStatus::WaitingBackground)
+            .await
+            .expect("set waiting_background");
+        assert!(mission_still_resumable(&store, mission.id).await);
+
+        for stopped in [
+            MissionStatus::Interrupted,
+            MissionStatus::Acknowledged,
+            MissionStatus::Paused,
+            MissionStatus::Active,
+        ] {
+            store
+                .update_mission_status(mission.id, stopped)
+                .await
+                .expect("stop");
+            assert!(
+                !mission_still_resumable(&store, mission.id).await,
+                "{stopped} must not be auto-resumed"
+            );
+        }
+        assert!(!mission_still_resumable(&store, Uuid::new_v4()).await);
     }
 
     #[tokio::test]

@@ -519,7 +519,10 @@ pub(crate) fn wakeup_supersession_key(
     match source? {
         // Wall-clock wakeups all represent the mission's next timer and may
         // supersede one another regardless of which helper created them.
-        "claude-builtin" | "automation-manager" | "orb-local" => Some("wall-clock".to_string()),
+        "claude-builtin"
+        | "automation-manager"
+        | "orb-local"
+        | continuations::STALL_GUARD_SOURCE => Some("wall-clock".to_string()),
         // Durable completions are independent. Only a replacement watcher for
         // the same job may supersede an older one.
         "durable-job-terminal" => match trigger {
@@ -1018,13 +1021,26 @@ everything is truly done, report completion and stop."
         "stall-guard auto-resume {}/{} (orchestrator parked with no wakeup armed)",
         count, STALL_GUARD_MAX_CONSECUTIVE_ARMS
     );
-    crate::api::mission_runner::spawn_claude_builtin_wakeup_automation(
+    // Its own source, not the agent's "claude-builtin": delivery drops it
+    // once the mission is archived (continuations::deliver).
+    crate::api::mission_runner::spawn_server_wakeup_automation(
         mission_id,
+        continuations::STALL_GUARD_SOURCE,
         STALL_GUARD_WAKEUP_SECONDS,
         prompt,
         reason,
     );
     true
+}
+
+/// Whether archiving a mission also archives this descendant. Only a parked
+/// `AwaitingUser` child is promoted. Running, pending and background-waiting
+/// children are live; a paused one is the operator's; and terminal statuses
+/// (a user-cancelled `Interrupted` coordinator, `Completed`, `Failed`, ...)
+/// are evidence that `Acknowledged` would erase. An `Acknowledged` mission is
+/// not terminal, so turning an `Interrupted` one into it made it wakeable.
+fn archive_cascade_promotes(status: MissionStatus) -> bool {
+    status == MissionStatus::AwaitingUser
 }
 
 #[cfg(test)]
@@ -1873,6 +1889,190 @@ mod campaign_guard_tests {
 }
 
 #[cfg(test)]
+mod archive_and_cancel_cascade_tests {
+    use super::*;
+
+    struct Session {
+        _dir: tempfile::TempDir,
+        control: ControlState,
+    }
+
+    async fn session() -> Session {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let config = Config::new(path.clone());
+        let root_agent: AgentRef = Arc::new(crate::agents::OpenCodeAgent::new(config.clone()));
+        let mcp = Arc::new(McpRegistry::new(&path).await);
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(path.clone()).await);
+        let library = Arc::new(RwLock::new(None));
+        let hub = ControlHub::new(
+            config.clone(),
+            root_agent.clone(),
+            mcp.clone(),
+            workspaces.clone(),
+            library.clone(),
+            None,
+        );
+        let store: Arc<dyn MissionStore> = Arc::new(
+            mission_store::SqliteMissionStore::new(path.join("missions"), "cascade-test")
+                .await
+                .unwrap(),
+        );
+        let control = spawn_control_session(
+            hub,
+            config,
+            root_agent,
+            mcp,
+            workspaces,
+            library,
+            store,
+            None,
+            None,
+            "cascade-test".into(),
+        );
+        Session { _dir: dir, control }
+    }
+
+    async fn mk(
+        store: &Arc<dyn MissionStore>,
+        parent: Option<Uuid>,
+        status: MissionStatus,
+        reason: Option<&str>,
+    ) -> Uuid {
+        let id = store
+            .create_mission_with_parent(
+                Some("m"),
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some("claudecode"),
+                None,
+                parent,
+                None,
+            )
+            .await
+            .expect("create")
+            .id;
+        store
+            .update_mission_status_with_reason(id, status, reason)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn get(store: &Arc<dyn MissionStore>, id: Uuid) -> Mission {
+        store.get_mission(id).await.unwrap().unwrap()
+    }
+
+    #[test]
+    fn archive_cascade_promotes_only_parked_children() {
+        assert!(archive_cascade_promotes(MissionStatus::AwaitingUser));
+        for status in [
+            MissionStatus::Pending,
+            MissionStatus::Active,
+            MissionStatus::WaitingBackground,
+            MissionStatus::Acknowledged,
+            MissionStatus::Paused,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::NotFeasible,
+        ] {
+            assert!(!archive_cascade_promotes(status), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn archiving_an_ancestor_keeps_a_cancelled_coordinator_cancelled() {
+        // Incident: root -> fork -> user-cancelled coordinator -> worker.
+        // Archiving the root turned the coordinator `acknowledged` (and wiped
+        // its terminal_reason), which the watchdog and stall-guard then woke.
+        let s = session().await;
+        let store = &s.control.mission_store;
+        let root = mk(store, None, MissionStatus::AwaitingUser, None).await;
+        let fork = mk(store, Some(root), MissionStatus::AwaitingUser, None).await;
+        let coordinator = mk(
+            store,
+            Some(fork),
+            MissionStatus::Interrupted,
+            Some("cancelled"),
+        )
+        .await;
+        let worker = mk(
+            store,
+            Some(coordinator),
+            MissionStatus::AwaitingUser,
+            Some("turn_complete"),
+        )
+        .await;
+        let paused = mk(store, Some(fork), MissionStatus::Paused, None).await;
+        let done = mk(store, Some(fork), MissionStatus::Completed, None).await;
+
+        let (tx, rx) = oneshot::channel();
+        s.control
+            .cmd_tx
+            .send(ControlCommand::SetMissionStatus {
+                id: root,
+                status: MissionStatus::Acknowledged,
+                respond: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let c = get(store, coordinator).await;
+        assert_eq!(c.status, MissionStatus::Interrupted);
+        assert_eq!(c.terminal_reason.as_deref(), Some("cancelled"));
+        assert_eq!(get(store, paused).await.status, MissionStatus::Paused);
+        assert_eq!(get(store, done).await.status, MissionStatus::Completed);
+        // Parked descendants are still archived, keeping their evidence.
+        assert_eq!(get(store, fork).await.status, MissionStatus::Acknowledged);
+        let w = get(store, worker).await;
+        assert_eq!(w.status, MissionStatus::Acknowledged);
+        assert_eq!(w.terminal_reason.as_deref(), Some("turn_complete"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_mission_stops_its_whole_subtree_and_their_goals() {
+        let s = session().await;
+        let store = &s.control.mission_store;
+        let boss = mk(store, None, MissionStatus::AwaitingUser, None).await;
+        let lead = mk(store, Some(boss), MissionStatus::AwaitingUser, None).await;
+        let worker = mk(store, Some(lead), MissionStatus::AwaitingUser, None).await;
+        for id in [lead, worker] {
+            store
+                .update_mission_goal(id, true, Some("ship it"))
+                .await
+                .unwrap();
+        }
+
+        let (tx, rx) = oneshot::channel();
+        s.control
+            .cmd_tx
+            .send(ControlCommand::CancelMission {
+                mission_id: boss,
+                min_idle: None,
+                respond: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        assert_eq!(get(store, boss).await.status, MissionStatus::Interrupted);
+        for id in [lead, worker] {
+            let m = get(store, id).await;
+            // The grandchild used to be missed (direct children only).
+            assert_eq!(m.status, MissionStatus::Interrupted, "{id}");
+            // A later message must not restart a stopped worker's goal loop.
+            assert!(!m.goal_mode, "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod stall_guard_tests {
     use super::*;
 
@@ -1920,6 +2120,18 @@ mod stall_guard_tests {
         reset_stall_guard(boss);
         assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
         reset_stall_guard(boss);
+    }
+
+    #[test]
+    fn stall_guard_arms_under_its_own_wakeup_source() {
+        // It must be told apart from the agent's own ScheduleWakeup
+        // ("claude-builtin") yet still supersede and be superseded by it.
+        assert_ne!(continuations::STALL_GUARD_SOURCE, "claude-builtin");
+        let interval = mission_store::TriggerType::Interval { seconds: 1200 };
+        assert_eq!(
+            wakeup_supersession_key(Some(continuations::STALL_GUARD_SOURCE), &interval),
+            wakeup_supersession_key(Some("claude-builtin"), &interval)
+        );
     }
 
     #[test]
@@ -26660,19 +26872,16 @@ async fn control_actor_loop(
                                                 else {
                                                     continue;
                                                 };
-                                                if matches!(
-                                                    child.status,
-                                                    MissionStatus::Active
-                                                        | MissionStatus::Pending
-                                                        | MissionStatus::WaitingBackground
-                                                        | MissionStatus::Acknowledged
-                                                ) {
+                                                if !archive_cascade_promotes(child.status) {
                                                     continue;
                                                 }
+                                                // Keep the child's terminal_reason: the board
+                                                // reads it to settle an archived worker.
                                                 if mission_store
-                                                    .update_mission_status(
+                                                    .update_mission_status_with_reason(
                                                         child_id,
                                                         MissionStatus::Acknowledged,
+                                                        child.terminal_reason.as_deref(),
                                                     )
                                                     .await
                                                     .is_ok()
@@ -27065,7 +27274,8 @@ async fn control_actor_loop(
                                     let _ = respond.send(Err(format!("Failed to fence mission wake-ups: {error}")));
                                     continue;
                                 }
-                                // Helper: cascade-cancel all child missions of the given parent.
+                                // Helper: cascade-cancel every descendant of the given
+                                // parent (the whole subtree, as archiving walks it).
                                 async fn cancel_child_missions(
                                     parent_id: Uuid,
                                     mission_store: &Arc<dyn MissionStore>,
@@ -27073,20 +27283,32 @@ async fn control_actor_loop(
                                     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
                                     working_dir: &std::path::Path,
                                 ) {
-                                    let children = match mission_store.get_child_missions(parent_id).await {
-                                        Ok(c) => c,
-                                        Err(e) => {
+                                    let child_ids = match collect_child_mission_ids(mission_store, parent_id).await {
+                                        Ok(ids) => ids,
+                                        Err((_, e)) => {
                                             tracing::warn!("Failed to fetch child missions for cascade cancel: {}", e);
                                             return;
                                         }
                                     };
-                                    for child in children {
+                                    for child_id in child_ids {
+                                        let child = match mission_store.get_mission(child_id).await {
+                                            Ok(Some(child)) => child,
+                                            Ok(None) => continue,
+                                            Err(e) => {
+                                                tracing::warn!(mission_id = %child_id, "Failed to load child mission for cascade cancel: {}", e);
+                                                continue;
+                                            }
+                                        };
                                         if matches!(child.status, MissionStatus::Completed | MissionStatus::Failed | MissionStatus::Interrupted | MissionStatus::NotFeasible) {
                                             continue;
                                         }
                                         if let Err(error) = continuations::stop_for_mission(mission_store, child.id).await {
                                             tracing::error!(mission_id = %child.id, %error, "Failed to revoke child wake-ups during cascade cancellation");
                                         }
+                                        // Stop ends a child's goal as it does the target's
+                                        // (cancel endpoint); otherwise the next message to
+                                        // the stopped worker restarts its goal loop.
+                                        goal_continuation::clear_on_user_stop(mission_store.as_ref(), events_tx, child.id).await;
                                         // Cancel runner if running
                                         if let Some(runner) = parallel_runners.get_mut(&child.id) {
                                             runner.cancel();

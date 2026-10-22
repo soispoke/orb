@@ -670,6 +670,27 @@ pub(crate) async fn register_claude_builtin_wakeup(
     prompt: String,
     reason: String,
 ) -> Result<serde_json::Value, String> {
+    register_wakeup_from_source(
+        mission_id,
+        "claude-builtin",
+        request_id,
+        delay_seconds,
+        prompt,
+        reason,
+    )
+    .await
+}
+
+/// `source` becomes the wake-up's `__wakeup_source`, which tells an agent's
+/// own ScheduleWakeup (`claude-builtin`) apart from one the server armed.
+async fn register_wakeup_from_source(
+    mission_id: Uuid,
+    source: &str,
+    request_id: String,
+    delay_seconds: u64,
+    prompt: String,
+    reason: String,
+) -> Result<serde_json::Value, String> {
     let api_base = localhost_api_base_url_from_env().ok_or("Wake-up unavailable: PORT is unset")?;
     let delay = delay_seconds.clamp(
         CLAUDE_BUILTIN_WAKEUP_MIN_SECONDS,
@@ -679,7 +700,7 @@ pub(crate) async fn register_claude_builtin_wakeup(
         "command_source": { "type": "inline", "content": prompt },
         "trigger": { "type": "interval", "seconds": delay },
         "stop_policy": { "type": "after_first_fire" }, "fresh_session": "keep",
-        "variables": {"__wakeup_reason":reason,"__wakeup_source":"claude-builtin","__wakeup_request_id":request_id},
+        "variables": {"__wakeup_reason":reason,"__wakeup_source":source,"__wakeup_request_id":request_id},
         "start_immediately": false,
     });
     let client = reqwest::Client::builder()
@@ -710,15 +731,18 @@ pub(crate) async fn register_claude_builtin_wakeup(
         .map_err(|e| format!("Invalid wake-up receipt: {e}"))
 }
 
-pub(crate) fn spawn_claude_builtin_wakeup_automation(
+/// Arm a one-shot wake-up on the server's own behalf (not the agent's).
+pub(crate) fn spawn_server_wakeup_automation(
     mission_id: Uuid,
+    source: &'static str,
     delay_seconds: u64,
     prompt: String,
     reason: String,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = register_claude_builtin_wakeup(
+        if let Err(error) = register_wakeup_from_source(
             mission_id,
+            source,
             Uuid::new_v4().to_string(),
             delay_seconds,
             prompt,

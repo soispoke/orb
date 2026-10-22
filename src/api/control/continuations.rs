@@ -28,6 +28,14 @@ pub async fn bind_turn(
     }
 }
 
+/// `__wakeup_source` of the fallback wake-up the server arms for an
+/// orchestrator that parked without one (see `maybe_arm_stall_guard_wakeup`).
+pub const STALL_GUARD_SOURCE: &str = "stall-guard";
+
+fn is_stall_guard(variables: &HashMap<String, String>) -> bool {
+    variables.get("__wakeup_source").map(String::as_str) == Some(STALL_GUARD_SOURCE)
+}
+
 pub fn lock(mission: Uuid) -> Arc<tokio::sync::Mutex<()>> {
     worker_location::dispatch_lock(&format!("continuation:{mission}"))
 }
@@ -196,6 +204,18 @@ pub async fn deliver(
             _ => false,
         };
         if paused_or_interrupted && !e.variables_used.contains_key("__delivery_manual") {
+            continue;
+        }
+        // The agent's own ScheduleWakeup still reaches an archived mission (it
+        // asked to be woken). The server's stall-guard did not: archiving says
+        // the orchestration is done, so retire that wake-up instead. A row
+        // already Running had an attempt whose admission is uncertain; its
+        // retry carries the same id and must stay idempotent.
+        if m.status == MissionStatus::Acknowledged
+            && e.status == ExecutionStatus::Pending
+            && is_stall_guard(&e.variables_used)
+        {
+            store.cancel_scheduled_delivery(e.automation_id).await?;
             continue;
         }
         if store
@@ -1074,6 +1094,43 @@ mod tests {
             store.get_automation_executions(a.id, None).await.unwrap()[0].variables_used
                 ["__delivery_accepted"],
             "true"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_archived_mission_drops_stall_guard_wakeup() {
+        // Incident: an orchestrator parked, the server armed its stall-guard,
+        // the user archived it, and the stall-guard un-archived it 20 minutes
+        // later. The agent's own wake-up still arrives (test above).
+        let (_dir, store, mut a) = fixture().await;
+        a.variables
+            .insert("__wakeup_source".into(), STALL_GUARD_SOURCE.into());
+        store.update_automation(a.clone()).await.unwrap();
+        store
+            .update_mission_status(a.mission_id, MissionStatus::Acknowledged)
+            .await
+            .unwrap();
+        stage(&store, &a, "stall-guard".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(8);
+        deliver(&store, &tx, &events, None).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "archived mission must stay archived"
+        );
+        assert!(store.list_scheduled_deliveries().await.unwrap().is_empty());
+        assert_eq!(
+            store.get_automation_executions(a.id, None).await.unwrap()[0].status,
+            ExecutionStatus::Cancelled
+        );
+        assert_eq!(
+            store
+                .get_mission(a.mission_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MissionStatus::Acknowledged
         );
     }
 

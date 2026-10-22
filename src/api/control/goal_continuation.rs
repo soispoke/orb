@@ -21,7 +21,9 @@ const LOOKBACK_EVENTS: usize = 800;
 /// after Codex reports a non-active goal status, which stops us below.
 const BACKENDS: [&str; 3] = ["claudecode", "opencode", "codex"];
 /// Coordinator-generated messages: neither a user reply nor our own nudge.
-const AUTOMATIC: [&str; 6] = ["background-task", "scheduler", "idle-worker-watchdog", "transport_auto_resume", "remote-build-terminal", "task-board"];
+/// `scheduled-continuation` is a fired wake-up (the agent's own ScheduleWakeup
+/// or the stall-guard), not the user steering the mission.
+const AUTOMATIC: [&str; 7] = ["background-task", "scheduler", "idle-worker-watchdog", "transport_auto_resume", "remote-build-terminal", "task-board", "scheduled-continuation"];
 
 pub fn prompt(objective: &str) -> String {
     format!(
@@ -257,5 +259,18 @@ mod tests {
         }
         assert!(!should_continue("claudecode", true, GOAL, &events));
         assert!(should_continue("claudecode", true, GOAL, &[user(None), user(Some(SOURCE)), user(Some("background-task")), tool()]));
+    }
+
+    #[test]
+    fn a_fired_wakeup_does_not_reset_the_goal_budget() {
+        // Stall-guard and ScheduleWakeup deliveries arrive as
+        // "scheduled-continuation". Counted as a user reply, each one reset
+        // the 40-turn budget, so a parked orchestrator never ran out of it.
+        assert!(is_automatic(Some("scheduled-continuation")));
+        let mut events = vec![user(None)];
+        for _ in 0..MAX_CONSECUTIVE {
+            events.extend([user(Some(SOURCE)), tool(), user(Some("scheduled-continuation")), tool()]);
+        }
+        assert!(!should_continue("claudecode", true, GOAL, &events));
     }
 }

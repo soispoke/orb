@@ -151,7 +151,7 @@ fn persisted_terminal_reason(reason: Option<&str>) -> Option<TerminalReason> {
         Some("cancelled") => Some(TerminalReason::Cancelled),
         Some("server_shutdown") => Some(TerminalReason::ServerShutdown),
         Some("llm_error") => Some(TerminalReason::LlmError),
-        Some("stalled") => Some(TerminalReason::Stalled),
+        Some("stalled") | Some("watchdog_stalled") => Some(TerminalReason::Stalled),
         Some("infinite_loop") => Some(TerminalReason::InfiniteLoop),
         Some("max_iterations") => Some(TerminalReason::MaxIterations),
         Some("rate_limited") => Some(TerminalReason::RateLimited),
@@ -3609,6 +3609,25 @@ mod tests {
             .map(|t| t.task_key.as_str())
             .collect();
         assert_eq!(ready, vec!["b"]);
+    }
+
+    #[test]
+    fn an_archived_worker_that_was_stopped_is_not_a_success() {
+        // The board settles an Acknowledged worker through
+        // classify_outcome(reason, true, ..). Its preserved terminal_reason
+        // must still say it was stopped, not delivered.
+        let last = "DELIVERED: Fixed the settle path; verified with cargo test.";
+        for reason in ["cancelled", "watchdog_stalled", "server_shutdown"] {
+            assert_eq!(
+                classify_outcome(persisted_terminal_reason(Some(reason)), true, last),
+                BoardTaskOutcome::Failed,
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            classify_outcome(persisted_terminal_reason(Some("turn_complete")), true, last),
+            BoardTaskOutcome::Success
+        );
     }
 
     #[test]
