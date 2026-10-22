@@ -9,7 +9,13 @@ export function messagePresentation(content: string): { text: string; attached: 
 
 /** Sent by the Resume button; shown collapsed so it doesn't read like a user turn. */
 export const resumePrompt='Your previous turn was interrupted before it finished. Check what is already done, then continue from there. Do not redo finished work.';
-export const isResumePrompt = (content: string) => content.trim() === resumePrompt;
+// Core uses a more explicit marker for automatic recovery. Keep both forms
+// collapsed so recovery instructions never look like a new user request.
+export const interruptedResumePrompt='[Resume interrupted work] Continue the existing task from its current state. Check the workspace and any background jobs before taking action. Do not redo completed work or duplicate running jobs; preserve the original objective, deadline, and any later user instructions.';
+export const isResumePrompt = (content: string) => {
+  const text = content.trim();
+  return text === resumePrompt || text === interruptedResumePrompt;
+};
 
 /** Exact coordinator markers; a user's normal request to resume stays a user turn. */
 export function isAutomaticRecovery(content: string): boolean {
