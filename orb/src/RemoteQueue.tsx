@@ -155,7 +155,9 @@ export function RemoteQueue(p: {
         return;
       }
       if (!current()) return;
-      setError("This run cannot accept a live message right now. Your message is still queued; it will be sent when the run is ready.");
+      setError(target.queue_error
+        ? `Not sent yet: ${target.queue_error.replace(/\.$/, "")}. It’s still queued.`
+        : "Not sent yet: this agent can’t take a message mid-turn. It’s still queued and goes in as soon as the current turn ends.");
     } catch (e) {
       if (!current()) return;
       const message = e instanceof Error ? e.message : String(e);
@@ -250,7 +252,7 @@ export function RemoteQueue(p: {
               </span>}><span class="queue-editing">Editing</span></Show>
             </Show>
           </div>
-          <Show when={row.queue_error}><small title={row.queue_error ?? undefined}>Delivery paused · {row.queue_error}</small></Show>
+          <Show when={row.queue_error}><small title={row.queue_error ?? undefined}>{row.source === "remote-queue" ? `Delivery paused · ${row.queue_error}` : row.queue_error}</small></Show>
         </li>;
       }}</For></ol></Show>
       <Show when={error()}><p role="alert">{error()}</p></Show>

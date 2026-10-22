@@ -582,6 +582,11 @@ pub enum ControlCommand {
     GetQueue {
         respond: oneshot::Sender<Vec<QueuedMessage>>,
     },
+    /// Run slots in use and the slot limit, counted exactly as the scheduler
+    /// counts them before it starts a deferred mission.
+    SlotUsage {
+        respond: oneshot::Sender<super::SlotUsage>,
+    },
     /// Remove a message from the queue
     RemoveFromQueue {
         message_id: Uuid,

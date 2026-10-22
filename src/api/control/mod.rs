@@ -6343,6 +6343,14 @@ pub async fn get_queue(
             }
         }
     }
+    let waiting_followups = queue
+        .iter()
+        .any(|entry| host_followup_source(entry.source.as_deref()) && !entry.inflight);
+    let usage = if waiting_followups {
+        slot_usage(&control).await
+    } else {
+        None
+    };
     let mut blockers = HashMap::new();
     for entry in &mut queue {
         if !host_followup_source(entry.source.as_deref()) || entry.inflight {
@@ -6360,7 +6368,8 @@ pub async fn get_queue(
                     .map_err(internal_error)?
                     && !message_requests_pr_writer(mission, &entry.content)
                 {
-                    entry.queue_error = None;
+                    entry.queue_error =
+                        usage.as_ref().and_then(|usage| usage.waiting_for_slot(mid));
                     continue;
                 }
             }
@@ -6379,10 +6388,87 @@ pub async fn get_queue(
                 };
                 slot.insert(error);
             }
-            entry.queue_error = blockers.get(&mid).cloned().flatten();
+            entry.queue_error = blockers
+                .get(&mid)
+                .cloned()
+                .flatten()
+                .or_else(|| usage.as_ref().and_then(|usage| usage.waiting_for_slot(mid)));
         }
     }
     Ok(Json(queue))
+}
+
+/// Run slots as the scheduler counts them: a turn in progress holds one of the
+/// `max_parallel_missions` slots, and a mission without a live turn waits for one.
+#[derive(Debug, Default)]
+pub(crate) struct SlotUsage {
+    pub busy: usize,
+    pub max: usize,
+    /// Missions whose turn is live (running or parked); their own runner
+    /// takes their messages.
+    pub with_runner: HashSet<Uuid>,
+}
+
+impl SlotUsage {
+    fn full(&self) -> bool {
+        self.busy >= self.max
+    }
+
+    fn full_reason(&self) -> String {
+        format!(
+            "Waiting for a free run slot ({} of {} in use); it starts automatically",
+            self.busy, self.max
+        )
+    }
+
+    /// Why a queued message for `mission` has not started, when the answer
+    /// is that every run slot is taken.
+    fn waiting_for_slot(&self, mission: Uuid) -> Option<String> {
+        (self.full() && !self.with_runner.contains(&mission)).then(|| self.full_reason())
+    }
+}
+
+/// Best effort: a slow or busy control loop must not fail or hide the queue.
+async fn slot_usage(control: &ControlState) -> Option<SlotUsage> {
+    let (tx, rx) = oneshot::channel();
+    control
+        .cmd_tx
+        .send(ControlCommand::SlotUsage { respond: tx })
+        .await
+        .ok()?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .ok()?
+        .ok()
+}
+
+#[cfg(test)]
+mod slot_usage_tests {
+    use super::SlotUsage;
+    use uuid::Uuid;
+
+    fn usage(busy: usize, max: usize, with_runner: &[Uuid]) -> SlotUsage {
+        SlotUsage {
+            busy,
+            max,
+            with_runner: with_runner.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn a_follow_up_without_a_live_turn_waits_for_a_free_slot() {
+        let idle = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        let full = usage(5, 5, &[live]);
+        assert_eq!(
+            full.waiting_for_slot(idle).as_deref(),
+            Some("Waiting for a free run slot (5 of 5 in use); it starts automatically")
+        );
+        // A live or parked turn takes the message itself.
+        assert_eq!(full.waiting_for_slot(live), None);
+        // A free slot is not a wait to explain.
+        assert_eq!(usage(4, 5, &[]).waiting_for_slot(idle), None);
+    }
 }
 
 /// Remove a message from the queue.
@@ -27980,6 +28066,29 @@ async fn control_actor_loop(
                                 }
 
                                 let _ = respond.send(interrupted_ids);
+                            }
+                            ControlCommand::SlotUsage { respond } => {
+                                let parallel_running = parallel_runners
+                                    .values()
+                                    .filter(|r| r.is_running())
+                                    .count();
+                                // An idle runner still waits for a slot like any
+                                // other mission; a live or parked turn does not.
+                                let mut with_runner: HashSet<Uuid> = parallel_runners
+                                    .iter()
+                                    .filter(|(_, r)| r.is_running())
+                                    .map(|(id, _)| *id)
+                                    .collect();
+                                if running.is_some() {
+                                    with_runner.extend(running_mission_id);
+                                }
+                                let _ = respond.send(SlotUsage {
+                                    busy: parallel_running + usize::from(running.is_some()),
+                                    max: crate::settings::max_parallel_missions_cached_or(
+                                        config.max_parallel_missions,
+                                    ),
+                                    with_runner,
+                                });
                             }
                             ControlCommand::GetQueue { respond } => {
                                 // Collect queued messages from main runner with their target mission IDs
