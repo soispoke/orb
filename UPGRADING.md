@@ -15,6 +15,7 @@ Do not build from copies in `/private/tmp`: macOS deletes them after a few days.
 | Core | Docker container `orb-sandboxed-sh-1` on `arch-fv-autoresearch-01` (SSH through Warpgate, as `thomas`), image pinned in `/home/thomas/orb/docker-compose.override.yml` |
 | Core build records | `/home/thomas/orb-build-<rev>/` (source, build and test logs) and `/home/thomas/orb-stage-<rev>/` (`VERIFIED.json`, `ACTIVATED.json`, rollback override) |
 | How Orb reaches Core | SSH tunnel `127.0.0.1:13000` → Core's `127.0.0.1:3000`, kept up by `~/Library/LaunchAgents/md.thomas.orb-core-tunnel.plist` (log `~/Library/Logs/orb-core-tunnel.log`). Devops policy: no Tailscale, all access through Warpgate. |
+| Shared agent instructions | `/root/workspaces/CLAUDE.md` and `AGENTS.md` on Core (identical), from `scripts/orb-ship/core/workspace-CLAUDE.md`; install notes in `docs/ORB_MISSION_CONTEXT.md`. They point every chat at the Yukon research stack (`/root/yukon-autoresearch`). |
 | Core database backups | `/root/.sandboxed-sh/deployment-backups/` inside the container's data volume |
 
 ## History

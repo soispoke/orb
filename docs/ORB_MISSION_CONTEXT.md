@@ -36,7 +36,8 @@ missions, sessions, builds, or credentials during verification.
 ## Startup instructions and wrong project labels
 
 The startup instructions that tell every agent to run the helper live at
-`/root/workspaces/CLAUDE.md` on Core; the tracked copy is
+`/root/workspaces/CLAUDE.md` (Claude) and `/root/workspaces/AGENTS.md` (Codex) on
+Core, both identical; the tracked copy is
 `scripts/orb-ship/core/workspace-CLAUDE.md`. Install both files the same way
 (backup in `/root/.sandboxed-sh/deployment-backups/`, then atomic replace).
 
