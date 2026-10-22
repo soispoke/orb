@@ -393,7 +393,9 @@ mod placement_tests {
             None
         );
         // A replaced directory is not the bound one, even at the same path.
-        std::fs::remove_dir_all(&home).unwrap();
+        // Move the old one aside rather than deleting it: Linux reuses a freed
+        // inode at once, which would make the new directory look like the old.
+        std::fs::rename(&home, dir.path().join("old-home")).unwrap();
         std::fs::create_dir_all(home.join(".codex")).unwrap();
         assert_eq!(
             intact_bound_placement(&path, mission, workspace, "acct"),
