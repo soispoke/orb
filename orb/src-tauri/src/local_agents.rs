@@ -1763,10 +1763,20 @@ fn spawn_claude(
                             }
                         }
                         if event["is_error"] == true || event["subtype"] == "error" {
-                            return Err(event["result"]
+                            let message = event["result"]
                                 .as_str()
                                 .unwrap_or("Claude ended with an error")
-                                .to_owned());
+                                .to_owned();
+                            // Ending the run would stop the background tasks that
+                            // still work: the failure is shown and the wait goes on.
+                            if !background.running() {
+                                return Err(message);
+                            }
+                            output.append(&format!("\n\n{}\n\n", message.trim()));
+                            live.result();
+                            answered = true;
+                            waiting(Some(&background));
+                            continue;
                         }
                         if let Some(piece) = claude_text.consume(&event) {
                             output.append(&piece);
@@ -4444,6 +4454,59 @@ printf '%s\n' '{"type":"result"}'
         assert_eq!(state.list().len(), 1);
         state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"c","patch":{"status":"killed"}}));
         assert!(!state.running());
+    }
+
+    /// A failed turn while a background agent works must not end the run:
+    /// that stops the agent. The failure shows and the run waits for it.
+    #[cfg(unix)]
+    #[test]
+    fn claude_error_result_with_a_live_agent_keeps_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-fixture");
+        let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '2.1.308 (Claude Code)\n'; exit; fi
+read -r init
+read -r prompt
+printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t1","task_type":"local_agent"}'
+printf '%s\n' '{"type":"result","is_error":true,"result":"API Error: 500 Internal server error"}'
+sleep 0.3
+printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"t1","status":"completed"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"The agent finished."}]}}'
+printf '%s\n' '{"type":"result","result":"The agent finished."}'
+"#;
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-error-agent-{}", uuid_like());
+        local_agents_start(StartRequest {
+            service_tier: None,
+            effort: None,
+            cyber_revision: None,
+            cyber_access: None,
+            id: id.clone(),
+            harness: "claudecode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "Start the agent".into(),
+            model: None,
+            session_id: None,
+            image_paths: vec![],
+            shared_cwd_with: None,
+        })
+        .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let state = loop {
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                break state;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(state.error.is_none(), "{:?}", state.error);
+        assert!(state.text.contains("API Error: 500"), "{}", state.text);
+        assert!(state.text.contains("The agent finished."), "{}", state.text);
+        runs().lock().unwrap().remove(&id);
     }
 
     #[test]
