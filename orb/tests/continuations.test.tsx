@@ -68,3 +68,17 @@ it('dismisses a rejected local request through native storage rather than the se
   await waitFor(()=>expect(screen.getByText('No pending wake-ups.')).toBeTruthy());
  } finally {vi.unstubAllGlobals();}
 });
+it('spins a parked coordinator while the missions it launched run',()=>{
+ const [live,setLive]=createSignal(3);
+ const {container}=render(()=><MissionGlyph status="awaiting_user" continuation={wake} liveChildren={live()}/>);
+ expect(container.querySelector('.mission-status-spin')).not.toBeNull();
+ expect(container.querySelector('.mission-glyph')?.getAttribute('title')).toBe('3 launched missions running');
+ setLive(0);
+ expect(container.querySelector('.mission-status-spin')).toBeNull();
+ expect(container.querySelector('.wake-clock-hand')).not.toBeNull();
+ expect(missionStatusPresentation('awaiting_user',undefined,undefined,1).label).toBe('1 launched mission running');
+ expect(missionStatusPresentation('awaiting_user',{id:'q',method:'question'},undefined,2).tone).toBe('attention');
+ for (const status of ['failed','interrupted','completed','paused','blocked']) {
+  expect(missionStatusPresentation(status,undefined,undefined,2).tone).not.toBe('running');
+ }
+});

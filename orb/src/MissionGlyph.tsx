@@ -8,9 +8,14 @@ import "./sidebar-status.css";
 import { pendingMissionInteraction, type PendingInteraction } from "./missionAttention";
 
 /** Preserve the backend status: idle is not success, and blocked is not failure. */
-export function missionStatusPresentation(status: string, request?: PendingInteraction, continuation?: ContinuationSummary | null) {
+export function missionStatusPresentation(status: string, request?: PendingInteraction, continuation?: ContinuationSummary | null, liveChildren = 0) {
   if (request && !["completed", "failed", "not_feasible", "interrupted", "cancelled", "canceled", "acknowledged"].includes(status)) {
     return { label: request.method === "permission" || request.method === "plan" ? "Approval requested" : "Waiting for your reply", tone: "attention", icon: Icon.MessageCircle };
+  }
+  // A coordinator parked between check-ins is still working while the
+  // missions it launched run.
+  if (liveChildren > 0 && ["awaiting_user", "waiting_user", "acknowledged", "idle"].includes(status)) {
+    return { label: `${liveChildren} launched mission${liveChildren === 1 ? "" : "s"} running`, tone: "running", icon: Icon.LoaderCircle };
   }
   if (continuation?.items.length && !["active", "running", "resuming", "starting", "waiting_background", "blocked", "failed", "not_feasible", "paused", "interrupted", "cancelled", "canceled"].includes(status)) {
     const failed = continuation.items.some(item => item.state === "error");
@@ -42,7 +47,7 @@ export function missionStatusPresentation(status: string, request?: PendingInter
   }
 }
 
-export function MissionGlyph(p: { status: string; missionId?: string; unread?: boolean; identity?: JSX.Element; continuation?: ContinuationSummary | null }) {
+export function MissionGlyph(p: { status: string; missionId?: string; unread?: boolean; identity?: JSX.Element; continuation?: ContinuationSummary | null; liveChildren?: number }) {
   const continuation = () => {
     const local = localContinuation(p.missionId);
     const items = [...(local?.items ?? []), ...(p.continuation?.items ?? [])];
@@ -54,7 +59,7 @@ export function MissionGlyph(p: { status: string; missionId?: string; unread?: b
   const [removed, setRemoved] = createSignal<string[]>([]);
   const [resumed, setResumed] = createSignal<string[]>([]);
   const items = () => continuation()?.items.filter(item => !removed().includes(item.id)).map(item => resumed().includes(item.id) ? { ...item, state: "queued" as const } : item) ?? [];
-  const state = () => missionStatusPresentation(p.status, pendingMissionInteraction(p.missionId), { count: items().length, items: items() });
+  const state = () => missionStatusPresentation(p.status, pendingMissionInteraction(p.missionId), { count: items().length, items: items() }, p.liveChildren);
   const act = async (id: string, action: "resume" | "cancel") => {
     setBusy(true); setError("");
     try {
