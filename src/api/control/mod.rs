@@ -2028,6 +2028,42 @@ mod archive_and_cancel_cascade_tests {
         assert_eq!(w.status, MissionStatus::Acknowledged);
         assert_eq!(w.terminal_reason.as_deref(), Some("turn_complete"));
     }
+
+    #[tokio::test]
+    async fn cancelling_a_mission_stops_its_whole_subtree_and_their_goals() {
+        let s = session().await;
+        let store = &s.control.mission_store;
+        let boss = mk(store, None, MissionStatus::AwaitingUser, None).await;
+        let lead = mk(store, Some(boss), MissionStatus::AwaitingUser, None).await;
+        let worker = mk(store, Some(lead), MissionStatus::AwaitingUser, None).await;
+        for id in [lead, worker] {
+            store
+                .update_mission_goal(id, true, Some("ship it"))
+                .await
+                .unwrap();
+        }
+
+        let (tx, rx) = oneshot::channel();
+        s.control
+            .cmd_tx
+            .send(ControlCommand::CancelMission {
+                mission_id: boss,
+                min_idle: None,
+                respond: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        assert_eq!(get(store, boss).await.status, MissionStatus::Interrupted);
+        for id in [lead, worker] {
+            let m = get(store, id).await;
+            // The grandchild used to be missed (direct children only).
+            assert_eq!(m.status, MissionStatus::Interrupted, "{id}");
+            // A later message must not restart a stopped worker's goal loop.
+            assert!(!m.goal_mode, "{id}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -27220,7 +27256,8 @@ async fn control_actor_loop(
                                     let _ = respond.send(Err(format!("Failed to fence mission wake-ups: {error}")));
                                     continue;
                                 }
-                                // Helper: cascade-cancel all child missions of the given parent.
+                                // Helper: cascade-cancel every descendant of the given
+                                // parent (the whole subtree, as archiving walks it).
                                 async fn cancel_child_missions(
                                     parent_id: Uuid,
                                     mission_store: &Arc<dyn MissionStore>,
@@ -27228,20 +27265,32 @@ async fn control_actor_loop(
                                     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
                                     working_dir: &std::path::Path,
                                 ) {
-                                    let children = match mission_store.get_child_missions(parent_id).await {
-                                        Ok(c) => c,
-                                        Err(e) => {
+                                    let child_ids = match collect_child_mission_ids(mission_store, parent_id).await {
+                                        Ok(ids) => ids,
+                                        Err((_, e)) => {
                                             tracing::warn!("Failed to fetch child missions for cascade cancel: {}", e);
                                             return;
                                         }
                                     };
-                                    for child in children {
+                                    for child_id in child_ids {
+                                        let child = match mission_store.get_mission(child_id).await {
+                                            Ok(Some(child)) => child,
+                                            Ok(None) => continue,
+                                            Err(e) => {
+                                                tracing::warn!(mission_id = %child_id, "Failed to load child mission for cascade cancel: {}", e);
+                                                continue;
+                                            }
+                                        };
                                         if matches!(child.status, MissionStatus::Completed | MissionStatus::Failed | MissionStatus::Interrupted | MissionStatus::NotFeasible) {
                                             continue;
                                         }
                                         if let Err(error) = continuations::stop_for_mission(mission_store, child.id).await {
                                             tracing::error!(mission_id = %child.id, %error, "Failed to revoke child wake-ups during cascade cancellation");
                                         }
+                                        // Stop ends a child's goal as it does the target's
+                                        // (cancel endpoint); otherwise the next message to
+                                        // the stopped worker restarts its goal loop.
+                                        goal_continuation::clear_on_user_stop(mission_store.as_ref(), events_tx, child.id).await;
                                         // Cancel runner if running
                                         if let Some(runner) = parallel_runners.get_mut(&child.id) {
                                             runner.cancel();
