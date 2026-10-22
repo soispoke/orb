@@ -42,6 +42,10 @@ pub(crate) struct UsageLimitWait {
     pub resume_at: DateTime<Utc>,
     /// Whether the provider announced the reset, or the default delay applies.
     pub announced: bool,
+    /// Another account still has quota: it only failed transiently (e.g.
+    /// "server overloaded"), so the mission retries soon instead of waiting
+    /// for the reset of the accounts that are used up.
+    pub other_account_usable: bool,
 }
 
 /// Provider id and product name of the accounts a backend runs on. Only the
@@ -113,6 +117,7 @@ fn wait_until_reset(
         resume_at: (reset + Duration::seconds(RESUME_MARGIN_SECS))
             .max(now + Duration::seconds(MIN_WAIT_SECS)),
         announced: was_announced,
+        other_account_usable: false,
     }
 }
 
@@ -122,6 +127,15 @@ fn resume_time(wait: &UsageLimitWait) -> String {
 
 /// What the operator reads under the failed turn.
 pub(crate) fn annotate_output(output: &str, wait: &UsageLimitWait) -> String {
+    if wait.other_account_usable {
+        return format!(
+            "{}\n\n{} reached on some accounts, but another account still has quota and only hit a \
+             temporary error. This mission retries automatically at {}.",
+            output.trim_end(),
+            wait.limit,
+            resume_time(wait),
+        );
+    }
     let basis = if wait.announced {
         "when the limit resets"
     } else {
@@ -138,6 +152,9 @@ pub(crate) fn annotate_output(output: &str, wait: &UsageLimitWait) -> String {
 
 /// One-line status for mission lists.
 pub(crate) fn status_summary(wait: &UsageLimitWait) -> String {
+    if wait.other_account_usable {
+        return format!("Another account hit a temporary error; retries at {}", resume_time(wait));
+    }
     format!(
         "Waiting for the {} to reset; resumes automatically at {}",
         wait.limit,
@@ -178,6 +195,62 @@ pub(crate) fn resume_prompt(mission: &Mission, wait: &UsageLimitWait, interrupte
     prompt
 }
 
+/// The proxy's live account list (with runtime cooldowns), when Core
+/// manages CLIProxyAPI. `None` when it is unavailable: the caller then keeps
+/// the conservative wait.
+async fn proxy_auth_files() -> Option<serde_json::Value> {
+    if !crate::api::oauth_owner::management_enabled() {
+        return None;
+    }
+    let endpoint = crate::api::oauth_owner::cli_proxy_endpoint()?;
+    let key = crate::api::oauth_owner::management_key()?;
+    let response = reqwest::Client::new()
+        .get(format!("{}/v0/management/auth-files", endpoint.base_url))
+        .bearer_auth(key)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+/// Whether an enabled proxy account of the backend's provider is not held
+/// back by an active quota cooldown. Transient cooldowns (overload, server
+/// errors) do not mean an account is used up.
+fn another_account_usable(backend: &str, files: &serde_json::Value, now: DateTime<Utc>) -> bool {
+    let kind = match backend {
+        "codex" => "codex",
+        "claudecode" => "claude",
+        "antigravity" => "antigravity",
+        _ => return false,
+    };
+    let list = files.get("files").unwrap_or(files);
+    list.as_array().into_iter().flatten().any(|file| {
+        file.get("type").and_then(|v| v.as_str()) == Some(kind)
+            && file.get("disabled").and_then(|v| v.as_bool()) != Some(true)
+            && !file
+                .get("cooldowns")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .any(|cooldown| {
+                    let quota = cooldown
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|reason| reason.contains("quota"));
+                    let active = cooldown
+                        .get("retry_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                        .is_none_or(|at| at.with_timezone(&Utc) > now);
+                    quota && active
+                })
+    })
+}
+
 /// Decide whether the mission of a finished turn waits for a usage limit.
 ///
 /// `None` keeps the previous outcome (the mission fails) when the store
@@ -206,13 +279,23 @@ pub(crate) async fn plan(
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return None,
     }
-    let wait = wait_for_result(
+    let mut wait = wait_for_result(
         &mission.backend,
         result,
         &account_limits::shared(),
         Utc::now(),
         Zone::system(),
     )?;
+    // The proxy reports the last account's error. When that was a usage
+    // limit but another account only failed transiently, the accounts are
+    // not all used up: retry soon rather than wait days for a reset.
+    if let Some(files) = proxy_auth_files().await {
+        if another_account_usable(&mission.backend, &files, Utc::now()) {
+            wait.other_account_usable = true;
+            wait.announced = false;
+            wait.resume_at = Utc::now() + Duration::seconds(MIN_WAIT_SECS);
+        }
+    }
     // Waiting past the deadline would only fail later with a less useful
     // reason.
     let past_deadline = mission
@@ -502,6 +585,7 @@ pub(crate) fn remote_wait_for_failure(
             limit: account_limits::describe_limit(account_kind, failure),
             resume_at: now + Duration::seconds(IMMEDIATE_REPLAY_SECS),
             announced: false,
+            other_account_usable: false,
         });
     }
     Some(wait_until_reset(
@@ -620,6 +704,7 @@ pub(crate) async fn plan_remote(
             limit: wait.limit.clone(),
             resume_at,
             announced: false,
+            other_account_usable: false,
         });
     }
     let mission = mission_store.get_mission(mission_id).await.ok().flatten();
@@ -672,6 +757,7 @@ pub(crate) async fn plan_remote(
                     limit: interruption.to_string(),
                     resume_at: now + Duration::seconds(delay),
                     announced: false,
+                    other_account_usable: false,
                 });
             }
         }
@@ -693,6 +779,7 @@ pub(crate) async fn plan_remote(
                 limit: "Inference connection interrupted".into(),
                 resume_at: now.checked_add_signed(Duration::try_seconds(delay)?)?,
                 announced: false,
+                other_account_usable: false,
             });
         }
         let (provider, _) = accounts_of_backend(&mission.backend)?;
@@ -823,6 +910,25 @@ pub(crate) fn after_replay_failure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_account_that_only_failed_transiently_is_still_usable() {
+        let now = DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z").unwrap().with_timezone(&Utc);
+        let used_up = serde_json::json!({"type":"codex","disabled":false,"cooldowns":[{"scope":"credential","reason":"credential_quota","retry_at":"2026-10-27T07:51:38Z"}]});
+        let overloaded = serde_json::json!({"type":"codex","disabled":false,"cooldowns":[{"scope":"model","model_key":"gpt-6.1-sol","reason":"transient_error","retry_at":"2026-10-22T05:18:21Z"}]});
+        let disabled = serde_json::json!({"type":"codex","disabled":true,"cooldowns":[]});
+        let claude = serde_json::json!({"type":"claude","disabled":false,"cooldowns":[]});
+        // The 2026-10-22 case: two accounts used up, one only overloaded.
+        let files = serde_json::json!({"files":[used_up.clone(), overloaded, used_up.clone()]});
+        assert!(another_account_usable("codex", &files, now));
+        // Every codex account used up (others are disabled or another provider).
+        let files = serde_json::json!({"files":[used_up.clone(), disabled, claude]});
+        assert!(!another_account_usable("codex", &files, now));
+        // An expired quota cooldown no longer holds an account back.
+        let later = DateTime::parse_from_rfc3339("2026-10-28T00:00:00Z").unwrap().with_timezone(&Utc);
+        assert!(another_account_usable("codex", &serde_json::json!({"files":[used_up]}), later));
+        assert!(!another_account_usable("opencode", &files, now));
+    }
+
     use super::*;
     use crate::account_limits::LimitCooldown;
     use crate::api::mission_store::{select_next_runnable_mission, SqliteMissionStore};
@@ -1163,6 +1269,7 @@ mod tests {
             limit: "Codex usage limit".to_string(),
             resume_at: utc("2026-09-29T15:00:00Z"),
             announced: true,
+            other_account_usable: false,
         };
         let memory = crate::api::mission_store::InMemoryMissionStore::new();
         let mut mission = memory
