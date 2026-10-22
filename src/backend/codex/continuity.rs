@@ -107,6 +107,41 @@ pub fn binding_path(working_dir: &Path, mission_id: Uuid) -> PathBuf {
         .join(format!("{mission_id}.json"))
 }
 
+/// Set aside a mission's native binding and tool journal so its next turn
+/// starts a fresh thread. Used once a machine transfer commits: the moved
+/// mission continues with the transfer's portable history, and the old binding
+/// would otherwise refuse every turn in the new folder. Renamed, never deleted,
+/// so the old rollout stays traceable.
+pub fn retire_binding(working_dir: &Path, mission_id: Uuid, reason: &str) -> anyhow::Result<()> {
+    let path = binding_path(working_dir, mission_id);
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .context("codex_continuity_busy: native thread still attached")?;
+    let _lock = LockedFile(lock);
+    for (from, to) in [
+        (path.clone(), format!("{mission_id}.retired-{reason}.json")),
+        (
+            path.with_extension("tools.json"),
+            format!("{mission_id}.retired-{reason}.tools.json"),
+        ),
+    ] {
+        if from.exists() {
+            std::fs::rename(&from, dir.join(to))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub path: PathBuf,
@@ -298,6 +333,27 @@ impl Lease {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+
+    #[test]
+    fn a_retired_binding_lets_the_next_turn_start_fresh_and_keeps_the_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission = Uuid::new_v4();
+        let path = binding_path(dir.path(), mission);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::write(path.with_extension("tools.json"), b"{}").unwrap();
+        retire_binding(dir.path(), mission, "transfer-1").unwrap();
+        assert!(read(&path).unwrap().is_none());
+        let kept = path.parent().unwrap();
+        assert!(kept
+            .join(format!("{mission}.retired-transfer-1.json"))
+            .exists());
+        assert!(kept
+            .join(format!("{mission}.retired-transfer-1.tools.json"))
+            .exists());
+        // Nothing bound: nothing to do.
+        retire_binding(dir.path(), Uuid::new_v4(), "transfer-1").unwrap();
+    }
 
     fn bind(dir: &Path, mission: Uuid, workspace: Uuid, account: &str) -> (PathBuf, PathBuf) {
         let home = dir.join("mission");

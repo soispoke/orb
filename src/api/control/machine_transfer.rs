@@ -1030,6 +1030,15 @@ pub async fn operate(
         .await
         .map_err(conflict)?;
     if a.phase == "activated" {
+        // The moved mission continues in a fresh native session with the
+        // transfer's history; its old Codex binding would refuse every turn.
+        if let Err(error) = crate::backend::codex::continuity::retire_binding(
+            &state.config.working_dir,
+            id,
+            &format!("transfer-{}", a.id),
+        ) {
+            tracing::warn!(mission_id = %id, %error, "Could not retire the Codex binding after a machine transfer");
+        }
         let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
             completion: None,
             execution: None,
