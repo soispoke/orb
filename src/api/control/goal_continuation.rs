@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 pub const SOURCE: &str = "goal-continue";
 /// Consecutive automatic turns allowed without a user message in between.
-pub const MAX_CONSECUTIVE: usize = 40;
+/// A busy lane takes about six an hour, so this lets a goal run unattended
+/// for a day; the no-progress rule below is what stops a looping model.
+pub const MAX_CONSECUTIVE: usize = 200;
 const LOOKBACK_EVENTS: usize = 800;
 /// Harnesses whose runs end at every final message. Grok and Antigravity
 /// drive their own goal loops; a Codex run with a native goal only completes

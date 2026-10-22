@@ -12878,7 +12878,7 @@ async fn automatic_turns_stop_at_the_cap() {
     let h = Harness::new().await;
     let id = scripted_goal_mission(&h, "opencode", &vec![true; goal_continuation::MAX_CONSECUTIVE + 10]).await;
     assert!(h.request(false, id, json!({"content": "/goal never ends"})).await.status().is_success());
-    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
         while scripted_prompts(id).len() < goal_continuation::MAX_CONSECUTIVE + 1 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
