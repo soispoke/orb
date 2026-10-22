@@ -175,10 +175,7 @@ impl ClaudeBackground {
             Some("background_tasks_changed") => {
                 if let Some(tasks) = event["tasks"].as_array() {
                     for task in tasks {
-                        if matches!(
-                            task["status"].as_str(),
-                            Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
-                        ) {
+                        if finished(&task["status"]) {
                             if let Some(id) = task["task_id"].as_str() {
                                 self.terminal_tasks.insert(id.into());
                             }
@@ -187,12 +184,7 @@ impl ClaudeBackground {
                     self.tasks = tasks
                         .iter()
                         .filter(|task| task["ambient"] != true)
-                        .filter(|task| {
-                            !matches!(
-                                task["status"].as_str(),
-                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
-                            )
-                        })
+                        .filter(|task| !finished(&task["status"]))
                         .filter_map(|task| task["task_id"].as_str())
                         .filter(|id| !self.terminal_tasks.contains(*id))
                         .map(str::to_owned)
@@ -236,12 +228,22 @@ impl ClaudeBackground {
                     if earlier_run {
                         return;
                     }
-                    self.tasks.remove(id);
-                    self.terminal_tasks.insert(id.into());
+                    self.finish(id);
+                }
+            }
+            // A stopped task is reported as a patch of its state, with no notice.
+            Some("task_updated") if finished(&event["patch"]["status"]) => {
+                if let Some(id) = event["task_id"].as_str() {
+                    self.finish(id);
                 }
             }
             _ => {}
         }
+    }
+
+    fn finish(&mut self, id: &str) {
+        self.tasks.remove(id);
+        self.terminal_tasks.insert(id.into());
     }
 
     fn record_run(&mut self, id: &str, call: Option<&str>) {
@@ -253,6 +255,14 @@ impl ClaudeBackground {
     pub(crate) fn running(&self) -> usize {
         self.tasks.len()
     }
+}
+
+/// The states in which the CLI reports a task as over.
+fn finished(status: &Value) -> bool {
+    matches!(
+        status.as_str(),
+        Some("completed" | "failed" | "stopped" | "killed" | "cancelled" | "canceled")
+    )
 }
 
 #[cfg(test)]
@@ -372,6 +382,29 @@ mod tests {
         background.consume(&json!({"type":"system","subtype":"task_started","task_id":"a"}));
         background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}));
         assert_eq!(background.running(), 0);
+    }
+
+    /// TaskStop reports a killed task only as a `task_updated` patch; the
+    /// session must not keep waiting for it.
+    #[test]
+    fn a_killed_task_is_over() {
+        let mut background = ClaudeBackground::default();
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t"}),
+        );
+        background.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"running"}}));
+        assert_eq!(background.running(), 1);
+        background.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"killed","end_time":5000}}));
+        assert_eq!(background.running(), 0);
+        // A stale snapshot cannot revive it.
+        background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}));
+        assert_eq!(background.running(), 0);
+        background.consume(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_id":"b","status":"killed"},{"task_id":"c","status":"running"}
+            ]}),
+        );
+        assert_eq!(background.running(), 1);
     }
 
     #[test]

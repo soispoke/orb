@@ -2773,13 +2773,31 @@ fn output_tail(path: &Path) -> Option<Vec<String>> {
     Some(lines)
 }
 
+/// The states in which the CLI reports a background task as over.
+fn background_task_over(status: &Value) -> bool {
+    matches!(
+        status.as_str(),
+        Some("completed" | "failed" | "stopped" | "killed" | "cancelled" | "canceled")
+    )
+}
+
 /// Prefer the CLI's authoritative live task snapshot; older CLIs expose edges.
+///
+/// Edges: a finished task stays finished against late or stale frames, but
+/// `SendMessage` to a finished agent starts the same task id again under the
+/// resuming call's `tool_use_id`. That run is live until its own notice.
 #[derive(Default)]
 struct ClaudeBackground {
     tasks: HashMap<String, BackgroundTask>,
     has_snapshot: bool,
     /// Commands the agent was already asked about.
     checked: std::collections::HashSet<String>,
+    /// Tasks whose edges reported them over.
+    finished: std::collections::HashSet<String>,
+    /// Every `tool_use_id` seen for each task's runs.
+    runs: HashMap<String, std::collections::HashSet<String>>,
+    /// The `tool_use_id` of each task's newest run.
+    current: HashMap<String, String>,
 }
 impl ClaudeBackground {
     fn consume(&mut self, event: &Value) {
@@ -2793,12 +2811,7 @@ impl ClaudeBackground {
                     self.tasks = tasks
                         .iter()
                         .filter(|t| t["ambient"] != true)
-                        .filter(|t| {
-                            !matches!(
-                                t["status"].as_str(),
-                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
-                            )
-                        })
+                        .filter(|t| !background_task_over(&t["status"]))
                         .filter_map(|t| {
                             let id = t["task_id"].as_str()?;
                             Some((id.into(), BackgroundTask::new(id, t, self.tasks.get(id))))
@@ -2808,8 +2821,26 @@ impl ClaudeBackground {
             }
             Some("task_started") if event["ambient"] != true => {
                 if let Some(id) = event["task_id"].as_str() {
-                    // A snapshot decides which tasks run; this only names them.
-                    if !self.has_snapshot || self.tasks.contains_key(id) {
+                    let call = event["tool_use_id"].as_str();
+                    let known = call.is_some_and(|call| {
+                        self.runs.get(id).is_some_and(|calls| calls.contains(call))
+                    });
+                    // A repeated start of a known run does not make it current.
+                    if let Some(call) = call.filter(|_| !known) {
+                        self.runs.entry(id.into()).or_default().insert(call.into());
+                        self.current.insert(id.into(), call.into());
+                    }
+                    let live = if self.has_snapshot {
+                        // A snapshot decides which tasks run; this only names them.
+                        self.tasks.contains_key(id)
+                    } else if self.finished.contains(id) {
+                        // Only a run from an unseen call reopens a finished task.
+                        call.is_some() && !known
+                    } else {
+                        true
+                    };
+                    if live {
+                        self.finished.remove(id);
                         let task = BackgroundTask::new(id, event, self.tasks.get(id));
                         self.tasks.insert(id.into(), task);
                     }
@@ -2822,7 +2853,27 @@ impl ClaudeBackground {
                     }) =>
             {
                 if let Some(id) = event["task_id"].as_str() {
+                    let call = event["tool_use_id"].as_str();
+                    // A late notice of an earlier run does not end the newer one;
+                    // a notice from a call never seen before still ends the task.
+                    let earlier_run = call.is_some_and(|call| {
+                        self.runs.get(id).is_some_and(|calls| calls.contains(call))
+                            && self.current.get(id).is_some_and(|current| current != call)
+                    });
+                    if let Some(call) = call {
+                        self.runs.entry(id.into()).or_default().insert(call.into());
+                    }
+                    if !earlier_run {
+                        self.tasks.remove(id);
+                        self.finished.insert(id.into());
+                    }
+                }
+            }
+            // A stopped task is reported as a patch of its state, with no notice.
+            Some("task_updated") if background_task_over(&event["patch"]["status"]) => {
+                if let Some(id) = event["task_id"].as_str() {
                     self.tasks.remove(id);
+                    self.finished.insert(id.into());
                 }
             }
             _ => {}
@@ -4332,6 +4383,67 @@ printf '%s\n' '{"type":"result"}'
             state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"pending","status":status}]}));
             assert!(state.running());
         }
+    }
+
+    /// Claude Code 2.1.308 order for `SendMessage` resuming a finished agent,
+    /// and the edge-only variants older CLIs (or a session before its first
+    /// snapshot) produce.
+    #[test]
+    fn claude_background_keeps_an_agent_resumed_with_send_message() {
+        let started = |call: &str| json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":call,"task_type":"local_agent"});
+        let notice = |call: &str| json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":call,"status":"completed"});
+        let snapshot = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks});
+
+        let mut state = ClaudeBackground::default();
+        state.consume(&started("t1"));
+        assert!(state.running());
+        state.consume(&notice("t1"));
+        state.consume(&snapshot(json!([])));
+        assert!(!state.running());
+        state.consume(&snapshot(
+            json!([{"task_id":"a","task_type":"local_agent"}]),
+        ));
+        state.consume(&started("t2"));
+        assert!(state.running());
+        state.consume(&notice("t2"));
+        assert!(state.running());
+        state.consume(&snapshot(json!([])));
+        assert!(!state.running());
+
+        // Edges only: the first run's late notice does not end the resumed run.
+        let mut state = ClaudeBackground::default();
+        state.consume(&started("t1"));
+        state.consume(&started("t2"));
+        state.consume(&notice("t1"));
+        assert!(state.running());
+        // A repeated start of the first run changes nothing.
+        state.consume(&started("t1"));
+        state.consume(&notice("t2"));
+        assert!(!state.running());
+        // Late starts of either run cannot reopen it; a new call can.
+        state.consume(&started("t1"));
+        state.consume(&started("t2"));
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a"}));
+        assert!(!state.running());
+        state.consume(&started("t3"));
+        assert!(state.running());
+    }
+
+    /// TaskStop reports a killed task only as a `task_updated` patch.
+    #[test]
+    fn claude_background_treats_a_killed_task_as_over() {
+        let mut state = ClaudeBackground::default();
+        state.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t"}),
+        );
+        state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"running"}}));
+        assert!(state.running());
+        state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"killed"}}));
+        assert!(!state.running());
+        state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b","status":"killed"},{"task_id":"c","status":"running"}]}));
+        assert_eq!(state.list().len(), 1);
+        state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"c","patch":{"status":"killed"}}));
+        assert!(!state.running());
     }
 
     #[test]
