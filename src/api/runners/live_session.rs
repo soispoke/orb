@@ -88,6 +88,39 @@ pub(crate) fn deliver_now(mission_id: Uuid, content: String) -> Result<(), Strin
     }
 }
 
+/// Stop taking messages for the mission's session and return those that
+/// reached it but were never read. The runner calls this as soon as its event
+/// loop ends: shutting the process down takes seconds, and a message handed
+/// over meanwhile would be lost. A delivery racing this call fails, so its
+/// caller keeps the message queued.
+pub(crate) fn close_inputs(
+    mission_id: Uuid,
+    parked: Option<oneshot::Receiver<String>>,
+    midturn: Option<mpsc::UnboundedReceiver<String>>,
+) -> Vec<String> {
+    let mut unread = Vec::new();
+    if let Some(mut slot) = parked {
+        slot.close();
+        unread.extend(slot.try_recv().ok());
+    }
+    let mut parked = PARKED.lock().unwrap();
+    if parked.get(&mission_id).is_some_and(|tx| tx.is_closed()) {
+        parked.remove(&mission_id);
+    }
+    drop(parked);
+    if let Some(mut messages) = midturn {
+        messages.close();
+        while let Ok(message) = messages.try_recv() {
+            unread.push(message);
+        }
+    }
+    let mut midturn = MIDTURN.lock().unwrap();
+    if midturn.get(&mission_id).is_some_and(|tx| tx.is_closed()) {
+        midturn.remove(&mission_id);
+    }
+    unread
+}
+
 static EFFORT: LazyLock<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Option<String>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -175,10 +208,7 @@ impl ClaudeBackground {
             Some("background_tasks_changed") => {
                 if let Some(tasks) = event["tasks"].as_array() {
                     for task in tasks {
-                        if matches!(
-                            task["status"].as_str(),
-                            Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
-                        ) {
+                        if finished(&task["status"]) {
                             if let Some(id) = task["task_id"].as_str() {
                                 self.terminal_tasks.insert(id.into());
                             }
@@ -187,12 +217,7 @@ impl ClaudeBackground {
                     self.tasks = tasks
                         .iter()
                         .filter(|task| task["ambient"] != true)
-                        .filter(|task| {
-                            !matches!(
-                                task["status"].as_str(),
-                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
-                            )
-                        })
+                        .filter(|task| !finished(&task["status"]))
                         .filter_map(|task| task["task_id"].as_str())
                         .filter(|id| !self.terminal_tasks.contains(*id))
                         .map(str::to_owned)
@@ -236,12 +261,22 @@ impl ClaudeBackground {
                     if earlier_run {
                         return;
                     }
-                    self.tasks.remove(id);
-                    self.terminal_tasks.insert(id.into());
+                    self.finish(id);
+                }
+            }
+            // A stopped task is reported as a patch of its state, with no notice.
+            Some("task_updated") if finished(&event["patch"]["status"]) => {
+                if let Some(id) = event["task_id"].as_str() {
+                    self.finish(id);
                 }
             }
             _ => {}
         }
+    }
+
+    fn finish(&mut self, id: &str) {
+        self.tasks.remove(id);
+        self.terminal_tasks.insert(id.into());
     }
 
     fn record_run(&mut self, id: &str, call: Option<&str>) {
@@ -253,6 +288,14 @@ impl ClaudeBackground {
     pub(crate) fn running(&self) -> usize {
         self.tasks.len()
     }
+}
+
+/// The states in which the CLI reports a task as over.
+fn finished(status: &Value) -> bool {
+    matches!(
+        status.as_str(),
+        Some("completed" | "failed" | "stopped" | "killed" | "cancelled" | "canceled")
+    )
 }
 
 #[cfg(test)]
@@ -374,6 +417,29 @@ mod tests {
         assert_eq!(background.running(), 0);
     }
 
+    /// TaskStop reports a killed task only as a `task_updated` patch; the
+    /// session must not keep waiting for it.
+    #[test]
+    fn a_killed_task_is_over() {
+        let mut background = ClaudeBackground::default();
+        background.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t"}),
+        );
+        background.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"running"}}));
+        assert_eq!(background.running(), 1);
+        background.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"killed","end_time":5000}}));
+        assert_eq!(background.running(), 0);
+        // A stale snapshot cannot revive it.
+        background.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a"}]}));
+        assert_eq!(background.running(), 0);
+        background.consume(
+            &json!({"type":"system","subtype":"background_tasks_changed","tasks":[
+                {"task_id":"b","status":"killed"},{"task_id":"c","status":"running"}
+            ]}),
+        );
+        assert_eq!(background.running(), 1);
+    }
+
     #[test]
     fn edges_track_tasks_for_older_clis() {
         let mut background = ClaudeBackground::default();
@@ -433,6 +499,31 @@ mod tests {
         drop(guard);
         assert!(!can_deliver_now(mission));
         assert_eq!(deliver_now(mission, "late".into()), Err("late".into()));
+    }
+
+    /// The event loop has ended but the process is still shutting down: a
+    /// message handed over in that window must come back, and later ones must
+    /// be refused so the queue keeps them.
+    #[test]
+    fn a_session_that_stopped_reading_returns_its_unread_messages() {
+        let mission = Uuid::new_v4();
+        let _guard = SessionGuard::attach(mission, true);
+        let midturn = midturn_messages(mission);
+        assert_eq!(deliver_now(mission, "send now".into()), Ok(()));
+        let slot = park(mission);
+        assert_eq!(deliver(mission, "parked".into()), Ok(()));
+        let unread = close_inputs(mission, Some(slot), Some(midturn));
+        assert_eq!(unread, vec!["parked".to_string(), "send now".to_string()]);
+        assert!(!can_deliver_now(mission));
+        assert_eq!(deliver_now(mission, "late".into()), Err("late".into()));
+
+        // A later session of the same mission keeps its own channel.
+        let mission = Uuid::new_v4();
+        let _stale = midturn_messages(mission);
+        let mut live = midturn_messages(mission);
+        assert!(close_inputs(mission, None, None).is_empty());
+        assert_eq!(deliver_now(mission, "next".into()), Ok(()));
+        assert_eq!(live.try_recv().unwrap(), "next");
     }
 
     #[test]

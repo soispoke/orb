@@ -1763,10 +1763,20 @@ fn spawn_claude(
                             }
                         }
                         if event["is_error"] == true || event["subtype"] == "error" {
-                            return Err(event["result"]
+                            let message = event["result"]
                                 .as_str()
                                 .unwrap_or("Claude ended with an error")
-                                .to_owned());
+                                .to_owned();
+                            // Ending the run would stop the background tasks that
+                            // still work: the failure is shown and the wait goes on.
+                            if !background.running() {
+                                return Err(message);
+                            }
+                            output.append(&format!("\n\n{}\n\n", message.trim()));
+                            live.result();
+                            answered = true;
+                            waiting(Some(&background));
+                            continue;
                         }
                         if let Some(piece) = claude_text.consume(&event) {
                             output.append(&piece);
@@ -2773,13 +2783,31 @@ fn output_tail(path: &Path) -> Option<Vec<String>> {
     Some(lines)
 }
 
+/// The states in which the CLI reports a background task as over.
+fn background_task_over(status: &Value) -> bool {
+    matches!(
+        status.as_str(),
+        Some("completed" | "failed" | "stopped" | "killed" | "cancelled" | "canceled")
+    )
+}
+
 /// Prefer the CLI's authoritative live task snapshot; older CLIs expose edges.
+///
+/// Edges: a finished task stays finished against late or stale frames, but
+/// `SendMessage` to a finished agent starts the same task id again under the
+/// resuming call's `tool_use_id`. That run is live until its own notice.
 #[derive(Default)]
 struct ClaudeBackground {
     tasks: HashMap<String, BackgroundTask>,
     has_snapshot: bool,
     /// Commands the agent was already asked about.
     checked: std::collections::HashSet<String>,
+    /// Tasks whose edges reported them over.
+    finished: std::collections::HashSet<String>,
+    /// Every `tool_use_id` seen for each task's runs.
+    runs: HashMap<String, std::collections::HashSet<String>>,
+    /// The `tool_use_id` of each task's newest run.
+    current: HashMap<String, String>,
 }
 impl ClaudeBackground {
     fn consume(&mut self, event: &Value) {
@@ -2793,12 +2821,7 @@ impl ClaudeBackground {
                     self.tasks = tasks
                         .iter()
                         .filter(|t| t["ambient"] != true)
-                        .filter(|t| {
-                            !matches!(
-                                t["status"].as_str(),
-                                Some("completed" | "failed" | "stopped" | "cancelled" | "canceled")
-                            )
-                        })
+                        .filter(|t| !background_task_over(&t["status"]))
                         .filter_map(|t| {
                             let id = t["task_id"].as_str()?;
                             Some((id.into(), BackgroundTask::new(id, t, self.tasks.get(id))))
@@ -2808,8 +2831,26 @@ impl ClaudeBackground {
             }
             Some("task_started") if event["ambient"] != true => {
                 if let Some(id) = event["task_id"].as_str() {
-                    // A snapshot decides which tasks run; this only names them.
-                    if !self.has_snapshot || self.tasks.contains_key(id) {
+                    let call = event["tool_use_id"].as_str();
+                    let known = call.is_some_and(|call| {
+                        self.runs.get(id).is_some_and(|calls| calls.contains(call))
+                    });
+                    // A repeated start of a known run does not make it current.
+                    if let Some(call) = call.filter(|_| !known) {
+                        self.runs.entry(id.into()).or_default().insert(call.into());
+                        self.current.insert(id.into(), call.into());
+                    }
+                    let live = if self.has_snapshot {
+                        // A snapshot decides which tasks run; this only names them.
+                        self.tasks.contains_key(id)
+                    } else if self.finished.contains(id) {
+                        // Only a run from an unseen call reopens a finished task.
+                        call.is_some() && !known
+                    } else {
+                        true
+                    };
+                    if live {
+                        self.finished.remove(id);
                         let task = BackgroundTask::new(id, event, self.tasks.get(id));
                         self.tasks.insert(id.into(), task);
                     }
@@ -2822,7 +2863,27 @@ impl ClaudeBackground {
                     }) =>
             {
                 if let Some(id) = event["task_id"].as_str() {
+                    let call = event["tool_use_id"].as_str();
+                    // A late notice of an earlier run does not end the newer one;
+                    // a notice from a call never seen before still ends the task.
+                    let earlier_run = call.is_some_and(|call| {
+                        self.runs.get(id).is_some_and(|calls| calls.contains(call))
+                            && self.current.get(id).is_some_and(|current| current != call)
+                    });
+                    if let Some(call) = call {
+                        self.runs.entry(id.into()).or_default().insert(call.into());
+                    }
+                    if !earlier_run {
+                        self.tasks.remove(id);
+                        self.finished.insert(id.into());
+                    }
+                }
+            }
+            // A stopped task is reported as a patch of its state, with no notice.
+            Some("task_updated") if background_task_over(&event["patch"]["status"]) => {
+                if let Some(id) = event["task_id"].as_str() {
                     self.tasks.remove(id);
+                    self.finished.insert(id.into());
                 }
             }
             _ => {}
@@ -4332,6 +4393,120 @@ printf '%s\n' '{"type":"result"}'
             state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"pending","status":status}]}));
             assert!(state.running());
         }
+    }
+
+    /// Claude Code 2.1.308 order for `SendMessage` resuming a finished agent,
+    /// and the edge-only variants older CLIs (or a session before its first
+    /// snapshot) produce.
+    #[test]
+    fn claude_background_keeps_an_agent_resumed_with_send_message() {
+        let started = |call: &str| json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":call,"task_type":"local_agent"});
+        let notice = |call: &str| json!({"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":call,"status":"completed"});
+        let snapshot = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks});
+
+        let mut state = ClaudeBackground::default();
+        state.consume(&started("t1"));
+        assert!(state.running());
+        state.consume(&notice("t1"));
+        state.consume(&snapshot(json!([])));
+        assert!(!state.running());
+        state.consume(&snapshot(
+            json!([{"task_id":"a","task_type":"local_agent"}]),
+        ));
+        state.consume(&started("t2"));
+        assert!(state.running());
+        state.consume(&notice("t2"));
+        assert!(state.running());
+        state.consume(&snapshot(json!([])));
+        assert!(!state.running());
+
+        // Edges only: the first run's late notice does not end the resumed run.
+        let mut state = ClaudeBackground::default();
+        state.consume(&started("t1"));
+        state.consume(&started("t2"));
+        state.consume(&notice("t1"));
+        assert!(state.running());
+        // A repeated start of the first run changes nothing.
+        state.consume(&started("t1"));
+        state.consume(&notice("t2"));
+        assert!(!state.running());
+        // Late starts of either run cannot reopen it; a new call can.
+        state.consume(&started("t1"));
+        state.consume(&started("t2"));
+        state.consume(&json!({"type":"system","subtype":"task_started","task_id":"a"}));
+        assert!(!state.running());
+        state.consume(&started("t3"));
+        assert!(state.running());
+    }
+
+    /// TaskStop reports a killed task only as a `task_updated` patch.
+    #[test]
+    fn claude_background_treats_a_killed_task_as_over() {
+        let mut state = ClaudeBackground::default();
+        state.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t"}),
+        );
+        state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"running"}}));
+        assert!(state.running());
+        state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"a","patch":{"status":"killed"}}));
+        assert!(!state.running());
+        state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b","status":"killed"},{"task_id":"c","status":"running"}]}));
+        assert_eq!(state.list().len(), 1);
+        state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"c","patch":{"status":"killed"}}));
+        assert!(!state.running());
+    }
+
+    /// A failed turn while a background agent works must not end the run:
+    /// that stops the agent. The failure shows and the run waits for it.
+    #[cfg(unix)]
+    #[test]
+    fn claude_error_result_with_a_live_agent_keeps_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude-fixture");
+        let script = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '2.1.308 (Claude Code)\n'; exit; fi
+read -r init
+read -r prompt
+printf '%s\n' '{"type":"system","subtype":"task_started","task_id":"a","tool_use_id":"t1","task_type":"local_agent"}'
+printf '%s\n' '{"type":"result","is_error":true,"result":"API Error: 500 Internal server error"}'
+sleep 0.3
+printf '%s\n' '{"type":"system","subtype":"task_notification","task_id":"a","tool_use_id":"t1","status":"completed"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"The agent finished."}]}}'
+printf '%s\n' '{"type":"result","result":"The agent finished."}'
+"#;
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = format!("claude-error-agent-{}", uuid_like());
+        local_agents_start(StartRequest {
+            service_tier: None,
+            effort: None,
+            cyber_revision: None,
+            cyber_access: None,
+            id: id.clone(),
+            harness: "claudecode".into(),
+            bin: bin.to_string_lossy().into_owned(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            prompt: "Start the agent".into(),
+            model: None,
+            session_id: None,
+            image_paths: vec![],
+            shared_cwd_with: None,
+        })
+        .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let state = loop {
+            let state = local_agents_poll(id.clone()).unwrap();
+            if state.done {
+                break state;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(state.error.is_none(), "{:?}", state.error);
+        assert!(state.text.contains("API Error: 500"), "{}", state.text);
+        assert!(state.text.contains("The agent finished."), "{}", state.text);
+        runs().lock().unwrap().remove(&id);
     }
 
     #[test]
