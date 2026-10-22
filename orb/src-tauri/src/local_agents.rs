@@ -2824,6 +2824,10 @@ impl ClaudeBackground {
                         .filter(|t| !background_task_over(&t["status"]))
                         .filter_map(|t| {
                             let id = t["task_id"].as_str()?;
+                            // A stale snapshot cannot revive a finished task.
+                            if self.finished.contains(id) {
+                                return None;
+                            }
                             Some((id.into(), BackgroundTask::new(id, t, self.tasks.get(id))))
                         })
                         .collect();
@@ -2840,12 +2844,12 @@ impl ClaudeBackground {
                         self.runs.entry(id.into()).or_default().insert(call.into());
                         self.current.insert(id.into(), call.into());
                     }
-                    let live = if self.has_snapshot {
-                        // A snapshot decides which tasks run; this only names them.
-                        self.tasks.contains_key(id)
-                    } else if self.finished.contains(id) {
+                    let live = if self.finished.contains(id) {
                         // Only a run from an unseen call reopens a finished task.
                         call.is_some() && !known
+                    } else if self.has_snapshot {
+                        // A snapshot decides which tasks run; this only names them.
+                        self.tasks.contains_key(id)
                     } else {
                         true
                     };
@@ -4454,6 +4458,16 @@ printf '%s\n' '{"type":"result"}'
         assert_eq!(state.list().len(), 1);
         state.consume(&json!({"type":"system","subtype":"task_updated","task_id":"c","patch":{"status":"killed"}}));
         assert!(!state.running());
+        // A stale snapshot still listing the killed task does not revive it.
+        state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"c","status":"running"}]}));
+        assert!(!state.running());
+        // SendMessage resuming it starts a new run, which the snapshot keeps.
+        state.consume(
+            &json!({"type":"system","subtype":"task_started","task_id":"c","tool_use_id":"resume"}),
+        );
+        assert!(state.running());
+        state.consume(&json!({"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"c","status":"running"}]}));
+        assert!(state.running());
     }
 
     /// A failed turn while a background agent works must not end the run:

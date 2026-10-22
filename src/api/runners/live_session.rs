@@ -526,6 +526,24 @@ mod tests {
         assert_eq!(live.try_recv().unwrap(), "next");
     }
 
+    /// Leaving the parked state returns a message already handed to the slot
+    /// and keeps the session's live-input channel open.
+    #[test]
+    fn closing_the_parked_slot_keeps_its_message_and_live_input() {
+        let mission = Uuid::new_v4();
+        let _guard = SessionGuard::attach(mission, true);
+        let mut midturn = midturn_messages(mission);
+        let slot = park(mission);
+        assert_eq!(deliver(mission, "parked".into()), Ok(()));
+        assert_eq!(
+            close_inputs(mission, Some(slot), None),
+            vec!["parked".to_string()]
+        );
+        assert_eq!(deliver(mission, "late".into()), Err("late".into()));
+        assert_eq!(deliver_now(mission, "send now".into()), Ok(()));
+        assert_eq!(midturn.try_recv().unwrap(), "send now");
+    }
+
     #[test]
     fn a_runner_that_left_takes_no_message() {
         let mission = Uuid::new_v4();
