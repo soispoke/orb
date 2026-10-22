@@ -30926,19 +30926,15 @@ async fn run_single_control_turn(
             return result;
         }
     }
-    // Forks must use the same workspace-aware dispatcher whether they become
-    // the main turn or a parallel turn. The legacy control path below prepares
-    // a new mission directory and ignores the fork's persisted source cwd.
-    let fork_workspace = if let Some(mid) = mission_id {
+    // Any mission with its own folder (a fork, a machine-transfer destination,
+    // a worker worktree) must use the same workspace-aware dispatcher whether
+    // it becomes the main turn or a parallel turn. The legacy control path below
+    // prepares the generated mission directory and ignores that folder, so one
+    // mission ran in two places depending on which path took the turn: Codex
+    // then refused every resume and Claude Code silently started blank.
+    let placed_workspace = if let Some(mid) = mission_id {
         match mission_store.get_mission(mid).await {
-            Ok(Some(mission)) => {
-                mission.working_directory.is_some()
-                    && mission
-                        .project
-                        .tags
-                        .iter()
-                        .any(|tag| tag.starts_with("fork-workspace:"))
-            }
+            Ok(Some(mission)) => mission.working_directory.is_some(),
             Ok(None) => false,
             Err(error) => return crate::agents::AgentResult::failure(error, 0),
         }
@@ -30946,7 +30942,7 @@ async fn run_single_control_turn(
         false
     };
     // Vibe also relies on this dispatcher for its native prompt/session path.
-    if backend_id.as_deref() == Some("vibe") || fork_workspace {
+    if backend_id.as_deref() == Some("vibe") || placed_workspace {
         let backend = backend_id.as_deref().unwrap_or("opencode");
         let mid = match require_mission_id(mission_id, backend, &events_tx) {
             Ok(id) => id,
