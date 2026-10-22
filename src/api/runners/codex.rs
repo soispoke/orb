@@ -205,6 +205,10 @@ pub(crate) fn codex_turn_requires_tool_activity(
 ) -> bool {
     let user_request = current_user_request_for_tool_activity(user_message);
     let user = user_request.to_ascii_lowercase();
+    // "End your work here" asks for no tools: acknowledging it is the result.
+    if user_asks_to_stop(&user) {
+        return false;
+    }
     let actionable_user = user_without_negated_tool_clauses(&user);
     let assistant = assistant_message.trim().to_ascii_lowercase();
 
@@ -336,6 +340,26 @@ pub(crate) fn codex_turn_requires_tool_activity(
 /// for `modify files` turns a correct text-only response into a false
 /// `Stalled` failure. A positive clause after "but" remains actionable:
 /// "Do not edit files, but run the tests" must still require tool activity.
+/// The request is to stop or wrap up, not to do more work.
+fn user_asks_to_stop(user_lower: &str) -> bool {
+    [
+        "end your work",
+        "stop your work",
+        "stop working",
+        "stop here",
+        "stop at the",
+        "you can stop",
+        "please stop",
+        "no further work",
+        "no further action",
+        "nothing further is needed",
+        "nothing more to do",
+        "wrap up now",
+    ]
+    .iter()
+    .any(|phrase| user_lower.contains(phrase))
+}
+
 fn user_without_negated_tool_clauses(user_lower: &str) -> String {
     let clause_separated = user_lower
         .replace(" but ", ". but ")
@@ -366,6 +390,8 @@ fn user_without_negated_tool_clauses(user_lower: &str) -> String {
             "kindly dont ",
             "no tool ",
             "no tools ",
+            "no further ",
+            "no more ",
             "without calling ",
             "without using ",
             "without running ",
@@ -2241,6 +2267,16 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acknowledging_a_request_to_stop_is_not_a_stall() {
+        use crate::api::runners::codex::codex_turn_requires_tool_activity;
+        // Recorded from mission 97fcd6dd: the parent closed the child's work.
+        let stop = "Parent has successfully read your final HANDOFF and all strict parity receipts via durable polling, and acknowledges both rejected variants. Delivery is accomplished; no need to retry parent send or wait for it. All permitted research is done. Parent retains frozen collector and will measure provenance-only. End your work at the verified checkpoint; no further builds/benchmarks or notifications are required. Thanks.";
+        assert!(!codex_turn_requires_tool_activity(stop, "Acknowledged. Stopped at the verified checkpoint; no further actions."));
+        // A real request still needs its tools.
+        assert!(codex_turn_requires_tool_activity("Run the benchmarks and report the timings.", "I'll run it."));
+    }
+
     #[test]
     fn a_full_answer_to_a_draft_with_action_words_is_not_a_stall() {
         use crate::api::runners::codex::{codex_reply_is_substantive, codex_turn_requires_tool_activity};
