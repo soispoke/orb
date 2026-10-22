@@ -490,6 +490,15 @@ fn user_has_imperative_execution_request(user_lower: &str) -> bool {
         .any(|phrase| user_lower.contains(phrase))
 }
 
+/// A long, finished answer is the turn's result even when the user's message
+/// contains action words: a draft to review that says "doesn't run in the
+/// EVM" is not a request to run anything. Short promises ("I'll run it.") and
+/// progress notes still count as stopping early.
+pub(crate) fn codex_reply_is_substantive(final_message: &str) -> bool {
+    let text = final_message.trim();
+    text.chars().count() >= 400 && !codex_final_message_looks_like_progress_update(text)
+}
+
 pub(crate) fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
     let assistant = assistant_message.trim().to_ascii_lowercase();
     if assistant.is_empty() {
@@ -2053,7 +2062,10 @@ pub(crate) async fn consume_codex_events(
 
     let tool_activity_required = native_goal_stop.is_none()
         && codex_turn_requires_tool_activity(user_message, &final_message);
-    let stopped_before_required_tools = success && tool_events_seen == 0 && tool_activity_required;
+    let stopped_before_required_tools = success
+        && tool_events_seen == 0
+        && tool_activity_required
+        && !codex_reply_is_substantive(&final_message);
     let stopped_on_progress_update = success
         && tool_activity_required
         && codex_final_message_looks_like_progress_update(&final_message);
@@ -2203,6 +2215,17 @@ Update it to the latest version (`npm install -g @openai/codex@latest`) and retr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_full_answer_to_a_draft_with_action_words_is_not_a_stall() {
+        use crate::api::runners::codex::{codex_reply_is_substantive, codex_turn_requires_tool_activity};
+        let draft = "is this a good tldr? leanR1CS is strictly better: it's 180x cheaper for onchain gas because the PIOP part doesn't run in the EVM, and we test it on a benchmark";
+        assert!(codex_turn_requires_tool_activity(draft, "Mostly, with changes."));
+        let review = "I'd change a few claims before sending. ".repeat(15);
+        assert!(codex_reply_is_substantive(&review));
+        assert!(!codex_reply_is_substantive("I'll run it."));
+        assert!(!codex_reply_is_substantive(&format!("I'm running the benchmark now. {}", "x".repeat(500))));
+    }
+
     use super::{codex_transport_failure_stage, codex_transport_reason_is_retryable};
     use crate::agents::TerminalReason;
 
