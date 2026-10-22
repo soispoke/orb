@@ -89,6 +89,134 @@ fn stale_resumed_result(
         && res.errors.is_empty()
 }
 
+/// How a parked session ends when its CLI exits under it.
+const PARKED_SESSION_LOST: &str =
+    "The Claude session ended while waiting for its background tasks; they were stopped.";
+
+/// Reported for a user message the control actor handed to the session (and
+/// so took off its queue) that the CLI never received.
+fn unread_message_error(content: &str) -> String {
+    let mut preview: String = content.chars().take(200).collect();
+    if preview.len() < content.len() {
+        preview.push('…');
+    }
+    format!("Claude's session did not receive your message; send it again: \"{preview}\"")
+}
+
+fn report_unread_messages(
+    events_tx: &broadcast::Sender<AgentEvent>,
+    mission_id: Uuid,
+    unread: Vec<String>,
+) {
+    for content in unread {
+        tracing::warn!(mission_id = %mission_id, "A message reached the Claude session after it stopped reading");
+        let _ = events_tx.send(AgentEvent::Error {
+            message: unread_message_error(&content),
+            mission_id: Some(mission_id),
+            resumable: true,
+        });
+    }
+}
+
+/// What a session kept after its turn still waits for. Live background tasks
+/// wake it by themselves; a follow-up or a question it was given needs an
+/// answer first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParkedWait {
+    background: usize,
+    follow_up: bool,
+    question: bool,
+}
+
+impl ParkedWait {
+    fn outstanding(self) -> bool {
+        self.background > 0 || self.follow_up || self.question
+    }
+
+    /// How long the parked session may stay quiet. Background tasks and the
+    /// user's answer can take hours; a follow-up the CLI has not answered gets
+    /// a turn's idle timeout; with nothing left it lingers briefly.
+    fn quiet_limit(
+        self,
+        parked_timeout: std::time::Duration,
+        idle_timeout: std::time::Duration,
+        linger: std::time::Duration,
+    ) -> std::time::Duration {
+        if self.background > 0 || self.question {
+            parked_timeout
+        } else if self.follow_up {
+            idle_timeout
+        } else {
+            linger
+        }
+    }
+
+    /// How the session ends once it stayed quiet past that limit, and whether
+    /// that was expected: only when nothing was left waiting.
+    fn ending(self) -> (bool, &'static str) {
+        if self.background > 0 {
+            (
+                false,
+                "Stopped waiting: the background tasks reported nothing for too long and were stopped.",
+            )
+        } else if self.question {
+            (
+                false,
+                "Stopped waiting for your answer to Claude's question; send it again.",
+            )
+        } else if self.follow_up {
+            (
+                false,
+                "Claude did not answer your follow-up before its session went quiet; send it again.",
+            )
+        } else {
+            (true, "The background tasks have ended.")
+        }
+    }
+}
+
+/// Whether the user's answer to a question from the main thread is written to
+/// the running session instead of restarting it: a restart would stop its
+/// live background tasks.
+fn answer_reaches_live_session(keep_alive: bool, has_stdin: bool, background: usize) -> bool {
+    keep_alive && has_stdin && background > 0
+}
+
+/// What a turn's result does to a session that can keep its process.
+#[derive(Debug, PartialEq)]
+enum AfterResult {
+    End,
+    Park,
+    /// The turn failed while background tasks still run. Ending the session
+    /// would kill them, so the failure is reported and the session parks.
+    ParkAfterError(String),
+}
+
+fn after_result(res: &crate::backend::shared::ResultEvent, wait: ParkedWait) -> AfterResult {
+    let message = res.error_message();
+    // A failed login needs a new process with other credentials.
+    if is_success_path_auth_error(&message) {
+        return AfterResult::End;
+    }
+    let failed = res.is_error
+        || res.subtype == "error"
+        || message.starts_with("API Error:")
+        || is_success_path_rate_limited_error(&message)
+        || is_success_path_provider_payload_error(&message);
+    if !failed {
+        return if wait.outstanding() {
+            AfterResult::Park
+        } else {
+            AfterResult::End
+        };
+    }
+    if wait.background > 0 && !is_auth_error(&message) {
+        AfterResult::ParkAfterError(message)
+    } else {
+        AfterResult::End
+    }
+}
+
 fn write_initial_prompt(
     stdin: &mut Option<Box<dyn std::io::Write + Send>>,
     frames: Option<String>,
@@ -1918,6 +2046,10 @@ pub fn run_claudecode_turn<'a>(
         // Unrelated assistant/tool activity must not retire a queued question.
         let mut pending_inputs = claude_followup::PendingInputs::default();
         let mut unanswered = claude_followup::UnansweredMessage::default();
+        // Questions the main thread put to the user while background tasks
+        // run. The session stays and receives each answer as a message:
+        // restarting it to deliver the answer would stop those tasks.
+        let mut questions = futures::stream::FuturesUnordered::new();
         // A turn the CLI started on its own (a background task reported back),
         // and the reply such a turn last posted.
         let mut woke_itself = false;
@@ -1985,6 +2117,33 @@ pub fn run_claudecode_turn<'a>(
             post_tool_result_idle_timeout,
             tool_timeout_override,
         );
+        macro_rules! parked_wait {
+            () => {
+                ParkedWait {
+                    background: background.running(),
+                    follow_up: !pending_inputs.is_empty(),
+                    question: !questions.is_empty(),
+                }
+            };
+        }
+        // The idle deadline after any activity, parked or not.
+        macro_rules! next_idle_deadline {
+            () => {
+                if parked {
+                    Instant::now()
+                        + parked_wait!().quiet_limit(parked_timeout, idle_timeout, parked_linger)
+                } else {
+                    claudecode_idle_deadline(
+                        turn_wait_state,
+                        Instant::now(),
+                        idle_timeout,
+                        tool_idle_timeout,
+                        post_tool_result_idle_timeout,
+                        tool_timeout_override,
+                    )
+                }
+            };
+        }
 
         // Monitor child process exit. When Claude Code exits mid-tool-execution
         // (e.g. while `gh` is still running), child processes can keep the PTY
@@ -2077,14 +2236,7 @@ pub fn run_claudecode_turn<'a>(
                             background_tasks = background.running(),
                             "Parked Claude session stayed quiet; retiring it"
                         );
-                        ended_parked = Some(if background.running() > 0 {
-                            (
-                                false,
-                                "Stopped waiting: the background tasks reported nothing for too long and were stopped.",
-                            )
-                        } else {
-                            (true, "The background tasks have ended.")
-                        });
+                        ended_parked = Some(parked_wait!().ending());
                         break;
                     }
                     tracing::warn!(
@@ -2123,11 +2275,7 @@ pub fn run_claudecode_turn<'a>(
                 _ = tokio::time::sleep_until(process_exit_grace_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))), if process_exited && line_rx.is_empty() => {
                     // Grace period expired after process exit — no `result` event arrived.
                     if parked {
-                        ended_parked =
-                            Some((
-                                false,
-                                "The Claude session ended while waiting for its background tasks; they were stopped.",
-                            ));
+                        ended_parked = Some((false, PARKED_SESSION_LOST));
                         reader_handle.abort();
                         break;
                     }
@@ -2179,7 +2327,6 @@ pub fn run_claudecode_turn<'a>(
                 }
                 Some(content) = async { midturn_messages.as_mut().expect("guarded by is_some").recv().await }, if midturn_messages.is_some() => {
                     let input_id = Uuid::new_v4().to_string();
-                    pending_inputs.insert(&input_id);
                     // Before the prompt is written the message joins the first turn as is.
                     let text = if pending_initial_prompt.is_some() { content.clone() } else { claude_followup::midturn_text(&content) };
                     let frame = serde_json::json!({
@@ -2196,7 +2343,15 @@ pub fn run_claudecode_turn<'a>(
                             writeln!(w, "{}", frame).and_then(|_| w.flush()).is_ok()
                         })
                     };
-                    if delivered {
+                    if !delivered {
+                        // The control actor already took it off the queue.
+                        let _ = events_tx.send(AgentEvent::Error {
+                            message: unread_message_error(&content),
+                            mission_id: Some(mission_id),
+                            resumable: true,
+                        });
+                    } else {
+                        pending_inputs.insert(&input_id);
                         tracing::info!(mission_id = %mission_id, "Injected user message mid-turn into running Claude session");
                         woke_itself = false;
                         last_wake_reply = None;
@@ -2235,7 +2390,7 @@ pub fn run_claudecode_turn<'a>(
                             idle_deadline = claudecode_idle_deadline(turn_wait_state, Instant::now(), idle_timeout, tool_idle_timeout, post_tool_result_idle_timeout, tool_timeout_override);
                         } else {
                             let _ = events_tx.send(AgentEvent::Error {
-                                message: "The parked Claude session could not receive the message; send it again.".to_string(),
+                                message: unread_message_error(&content),
                                 mission_id: Some(mission_id),
                                 resumable: true,
                             });
@@ -2246,6 +2401,57 @@ pub fn run_claudecode_turn<'a>(
                             break;
                         }
                     }
+                }
+                Some((id, name, waiting, answer)) = futures::StreamExt::next(&mut questions), if !questions.is_empty() => {
+                    drop(waiting);
+                    let answer: Result<serde_json::Value, _> = answer;
+                    let Ok(answer) = answer else {
+                        let _ = events_tx.send(AgentEvent::Error {
+                            message: "Your answer to Claude's question was lost; send it as a message.".to_string(),
+                            mission_id: Some(mission_id),
+                            resumable: true,
+                        });
+                        continue;
+                    };
+                    if let Some(ref status_ref) = status {
+                        set_control_state_for_mission(status_ref, &events_tx, mission_id, ControlRunState::Running).await;
+                    }
+                    let _ = events_tx.send(AgentEvent::ToolResult {
+                        tool_call_id: id,
+                        name,
+                        result: answer.clone(),
+                        mission_id: Some(mission_id),
+                    });
+                    let content = answer.get("answers").unwrap_or(&answer).to_string();
+                    let input_id = Uuid::new_v4().to_string();
+                    let frame = serde_json::json!({
+                        "type": "user",
+                        "uuid": input_id,
+                        "message": { "role": "user", "content": [{ "type": "text", "text": content }] }
+                    });
+                    let delivered = stdin_writer.as_mut().is_some_and(|w| {
+                        use std::io::Write as _;
+                        writeln!(w, "{}", frame).and_then(|_| w.flush()).is_ok()
+                    });
+                    if !delivered {
+                        let _ = events_tx.send(AgentEvent::Error {
+                            message: unread_message_error(&content),
+                            mission_id: Some(mission_id),
+                            resumable: true,
+                        });
+                        continue;
+                    }
+                    tracing::info!(mission_id = %mission_id, "Delivered the user's answer to the running Claude session");
+                    pending_inputs.insert(&input_id);
+                    woke_itself = false;
+                    last_wake_reply = None;
+                    if parked {
+                        parked = false;
+                        parked_slot = None;
+                        super::live_session::unpark(mission_id);
+                        turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
+                    }
+                    idle_deadline = next_idle_deadline!();
                 }
                 _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval), if parked => {
                     let _ = events_tx.send(AgentEvent::MissionActivity {
@@ -2344,7 +2550,11 @@ pub fn run_claudecode_turn<'a>(
                 }
                 line_opt = line_rx.recv() => {
                     let Some((read_at, raw_line)) = line_opt else {
-                        // EOF - PTY closed
+                        // EOF - PTY closed. A parked session already replied:
+                        // its end is not a failed turn to resume.
+                        if parked {
+                            ended_parked = Some((false, PARKED_SESSION_LOST));
+                        }
                         break;
                     };
                     if pending_initial_prompt.is_some()
@@ -2441,8 +2651,11 @@ pub fn run_claudecode_turn<'a>(
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
                         subagents.consume(&event);
                         // Nested model output belongs to its task, not to the
-                        // coordinator's buffers or turn completion state.
+                        // coordinator's buffers or turn completion state. It
+                        // is still activity: a streaming agent keeps the turn,
+                        // or the parked wait, alive.
                         if claude_stream_scope::is_child_message(&event) {
+                            idle_deadline = next_idle_deadline!();
                             continue;
                         }
                         if event["type"] == "user" {
@@ -2523,15 +2736,23 @@ pub fn run_claudecode_turn<'a>(
                                 woke_itself = false;
                                 last_wake_reply = None;
                                 let input_id = Uuid::new_v4().to_string();
-                                pending_inputs.insert(&input_id);
                                 let frame = serde_json::json!({
                                     "type": "user",
                                     "uuid": input_id,
                                     "message": { "role": "user", "content": [{ "type": "text", "text": content }] }
                                 });
-                                if let Some(w) = stdin_writer.as_mut() {
+                                let delivered = stdin_writer.as_mut().is_some_and(|w| {
                                     use std::io::Write as _;
-                                    let _ = writeln!(w, "{}", frame).and_then(|_| w.flush());
+                                    writeln!(w, "{}", frame).and_then(|_| w.flush()).is_ok()
+                                });
+                                if delivered {
+                                    pending_inputs.insert(&input_id);
+                                } else {
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: unread_message_error(&content),
+                                        mission_id: Some(mission_id),
+                                        resumable: true,
+                                    });
                                 }
                             }
                             turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
@@ -2790,6 +3011,31 @@ pub fn run_claudecode_turn<'a>(
                                                             FrontendToolHub::begin_waiting(&hub, mission_id);
                                                         let rx = hub.register(id.clone()).await;
 
+                                                        // Restarting the session to deliver the answer
+                                                        // would stop its background tasks: it stays, and
+                                                        // the answer reaches it as a message.
+                                                        if answer_reaches_live_session(
+                                                            keep_alive,
+                                                            stdin_writer.is_some(),
+                                                            background.running(),
+                                                        ) {
+                                                            let (id, name) = (id.clone(), name.clone());
+                                                            questions.push(async move {
+                                                                let answer = rx.await;
+                                                                (id, name, wait_guard, answer)
+                                                            });
+                                                            continue;
+                                                        }
+
+                                                        report_unread_messages(
+                                                            &events_tx,
+                                                            mission_id,
+                                                            super::live_session::close_inputs(
+                                                                mission_id,
+                                                                parked_slot.take(),
+                                                                midturn_messages.take(),
+                                                            ),
+                                                        );
                                                         pty.kill();
                                                         reader_handle.abort();
 
@@ -3062,29 +3308,35 @@ pub fn run_claudecode_turn<'a>(
                                         total_cost_usd = Some(cost);
                                     }
                                     pending_inputs.complete_result();
-                                    if keep_alive
-                                        && stdin_writer.is_some()
-                                        && !process_exited
-                                        && (background.running() > 0 || !pending_inputs.is_empty())
-                                        && !res.is_error
-                                        && res.subtype != "error"
-                                        && !res.error_message().starts_with("API Error:")
-                                        && !is_success_path_rate_limited_error(&res.error_message())
-                                        && !is_success_path_auth_error(&res.error_message())
-                                        && !is_success_path_provider_payload_error(
-                                            &res.error_message(),
-                                        )
-                                    {
-                                        let reply = res
-                                            .result
-                                            .filter(|text| !text.trim().is_empty())
-                                            .or_else(|| {
-                                                Some(std::mem::take(&mut final_result))
-                                                    .filter(|text| !text.trim().is_empty())
-                                            })
-                                            .unwrap_or_else(|| {
-                                                text_buffer.values().cloned().collect::<String>()
+                                    let after = if keep_alive && stdin_writer.is_some() && !process_exited {
+                                        after_result(&res, parked_wait!())
+                                    } else {
+                                        AfterResult::End
+                                    };
+                                    if after != AfterResult::End {
+                                        let reply = if let AfterResult::ParkAfterError(message) = after {
+                                            tracing::warn!(
+                                                mission_id = %mission_id,
+                                                background_tasks = background.running(),
+                                                "Claude turn failed while background tasks run; keeping the session"
+                                            );
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message,
+                                                mission_id: Some(mission_id),
+                                                resumable: true,
                                             });
+                                            String::new()
+                                        } else {
+                                            res.result
+                                                .filter(|text| !text.trim().is_empty())
+                                                .or_else(|| {
+                                                    Some(std::mem::take(&mut final_result))
+                                                        .filter(|text| !text.trim().is_empty())
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    text_buffer.values().cloned().collect::<String>()
+                                                })
+                                        };
                                         // A background notice that changed nothing must not
                                         // repeat the same line in the chat every minute.
                                         let repeat = woke_itself
@@ -3143,12 +3395,7 @@ pub fn run_claudecode_turn<'a>(
                                             mission_id: Some(mission_id),
                                         });
                                         last_heartbeat_at = Instant::now();
-                                        idle_deadline = Instant::now()
-                                            + if background.running() > 0 {
-                                                parked_timeout
-                                            } else {
-                                                parked_linger
-                                            };
+                                        idle_deadline = next_idle_deadline!();
                                         continue;
                                     }
                                     saw_terminal_result_event = true;
@@ -3189,23 +3436,7 @@ pub fn run_claudecode_turn<'a>(
                                     );
                                 }
                             }
-                    idle_deadline = if parked {
-                        Instant::now()
-                            + if background.running() > 0 {
-                                parked_timeout
-                            } else {
-                                parked_linger
-                            }
-                    } else {
-                        claudecode_idle_deadline(
-                            turn_wait_state,
-                            Instant::now(),
-                            idle_timeout,
-                            tool_idle_timeout,
-                            post_tool_result_idle_timeout,
-                            tool_timeout_override,
-                        )
-                    };
+                    idle_deadline = next_idle_deadline!();
                     // Emit a throttled liveness heartbeat so the stuck-mission
                     // watchdog (control.rs:stuck_mission_watchdog_loop) does not
                     // cancel us while Claude is producing CLI scaffolding events
@@ -3228,6 +3459,18 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         }
+
+        // Nothing reads the session's input from here on, and shutting the
+        // process down takes seconds: stop taking messages now.
+        report_unread_messages(
+            &events_tx,
+            mission_id,
+            super::live_session::close_inputs(
+                mission_id,
+                parked_slot.take(),
+                midturn_messages.take(),
+            ),
+        );
 
         // A session stopped by the restart itself is not a failed turn: report
         // it as interrupted by the shutdown, which startup recovery resumes.
@@ -4707,5 +4950,212 @@ mod mcp_launch_tests {
             .await
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod parked_session_tests {
+    use super::{after_result, answer_reaches_live_session, AfterResult, ParkedWait};
+    use crate::api::runners::live_session::ClaudeBackground;
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    fn system(subtype: &str, fields: Value) -> Value {
+        let mut event = json!({"type": "system", "subtype": subtype});
+        event
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        event
+    }
+
+    fn result_event(value: Value) -> crate::backend::shared::ResultEvent {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn waiting_on(background: &ClaudeBackground) -> ParkedWait {
+        ParkedWait {
+            background: background.running(),
+            follow_up: false,
+            question: false,
+        }
+    }
+
+    /// Claude Code 2.1.308 order for `SendMessage` resuming a finished
+    /// background agent. While either run is live, a question from the main
+    /// thread must not restart the session: that would kill the agent.
+    #[test]
+    fn a_question_while_an_agent_runs_keeps_the_session() {
+        let mut background = ClaudeBackground::default();
+        background.consume(&system(
+            "task_started",
+            json!({"task_id":"a","tool_use_id":"t1"}),
+        ));
+        assert!(answer_reaches_live_session(
+            true,
+            true,
+            background.running()
+        ));
+        background.consume(&system(
+            "task_notification",
+            json!({"task_id":"a","tool_use_id":"t1","status":"completed"}),
+        ));
+        background.consume(&system("background_tasks_changed", json!({"tasks":[]})));
+        // Nothing is left to stop: the restart path delivers the answer.
+        assert!(!answer_reaches_live_session(
+            true,
+            true,
+            background.running()
+        ));
+        background.consume(&system(
+            "background_tasks_changed",
+            json!({"tasks":[{"task_id":"a","task_type":"local_agent"}]}),
+        ));
+        background.consume(&system(
+            "task_started",
+            json!({"task_id":"a","tool_use_id":"t2"}),
+        ));
+        assert!(answer_reaches_live_session(
+            true,
+            true,
+            background.running()
+        ));
+        // A session that cannot take input still restarts.
+        assert!(!answer_reaches_live_session(
+            false,
+            true,
+            background.running()
+        ));
+        assert!(!answer_reaches_live_session(
+            true,
+            false,
+            background.running()
+        ));
+        background.consume(&system(
+            "task_notification",
+            json!({"task_id":"a","tool_use_id":"t2","status":"completed"}),
+        ));
+        background.consume(&system("background_tasks_changed", json!({"tasks":[]})));
+        assert!(!answer_reaches_live_session(
+            true,
+            true,
+            background.running()
+        ));
+    }
+
+    /// A failed turn while an agent works is reported, and the session parks
+    /// for the agent instead of ending under it.
+    #[test]
+    fn a_failed_turn_with_a_live_agent_parks_and_reports_the_error() {
+        let mut background = ClaudeBackground::default();
+        background.consume(&system(
+            "task_started",
+            json!({"task_id":"a","tool_use_id":"t1"}),
+        ));
+        let overloaded = result_event(json!({
+            "subtype": "success", "session_id": "s", "is_error": true,
+            "result": "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}"
+        }));
+        assert!(matches!(
+            after_result(&overloaded, waiting_on(&background)),
+            AfterResult::ParkAfterError(message) if message.starts_with("API Error: 529")
+        ));
+        let limited = result_event(json!({
+            "subtype": "success", "session_id": "s",
+            "result": "You\u{2019}ve hit your limit \u{b7} resets 9pm"
+        }));
+        assert!(matches!(
+            after_result(&limited, waiting_on(&background)),
+            AfterResult::ParkAfterError(_)
+        ));
+        let empty_error = result_event(json!({"subtype": "error", "session_id": "s"}));
+        assert!(matches!(
+            after_result(&empty_error, waiting_on(&background)),
+            AfterResult::ParkAfterError(message) if !message.trim().is_empty()
+        ));
+        // A failed login needs a new process.
+        let auth = result_event(json!({
+            "subtype": "success", "session_id": "s", "is_error": true,
+            "result": "Invalid authentication credentials."
+        }));
+        assert_eq!(
+            after_result(&auth, waiting_on(&background)),
+            AfterResult::End
+        );
+        let reply =
+            result_event(json!({"subtype": "success", "session_id": "s", "result": "Started."}));
+        assert_eq!(
+            after_result(&reply, waiting_on(&background)),
+            AfterResult::Park
+        );
+
+        background.consume(&system(
+            "task_notification",
+            json!({"task_id":"a","tool_use_id":"t1","status":"completed"}),
+        ));
+        // With nothing left running the failure ends the session as before.
+        assert_eq!(
+            after_result(&overloaded, waiting_on(&background)),
+            AfterResult::End
+        );
+        assert_eq!(
+            after_result(&reply, waiting_on(&background)),
+            AfterResult::End
+        );
+    }
+
+    /// Parked only for a follow-up the CLI has not acknowledged: the short
+    /// linger must not end the session as a success with it unanswered.
+    #[test]
+    fn a_parked_follow_up_waits_a_turn_and_ends_unanswered() {
+        let parked_timeout = Duration::from_secs(6 * 3600);
+        let idle_timeout = Duration::from_secs(600);
+        let linger = Duration::from_secs(60);
+        let follow_up = ParkedWait {
+            background: 0,
+            follow_up: true,
+            question: false,
+        };
+        assert_eq!(
+            follow_up.quiet_limit(parked_timeout, idle_timeout, linger),
+            idle_timeout
+        );
+        assert!(!follow_up.ending().0);
+        let reply =
+            result_event(json!({"subtype": "success", "session_id": "s", "result": "On it."}));
+        assert_eq!(after_result(&reply, follow_up), AfterResult::Park);
+
+        let question = ParkedWait {
+            follow_up: false,
+            question: true,
+            ..follow_up
+        };
+        assert_eq!(
+            question.quiet_limit(parked_timeout, idle_timeout, linger),
+            parked_timeout
+        );
+        assert!(!question.ending().0);
+        assert_eq!(after_result(&reply, question), AfterResult::Park);
+
+        let tasks = ParkedWait {
+            background: 1,
+            ..follow_up
+        };
+        assert_eq!(
+            tasks.quiet_limit(parked_timeout, idle_timeout, linger),
+            parked_timeout
+        );
+        assert!(!tasks.ending().0);
+
+        let done = ParkedWait {
+            background: 0,
+            follow_up: false,
+            question: false,
+        };
+        assert_eq!(
+            done.quiet_limit(parked_timeout, idle_timeout, linger),
+            linger
+        );
+        assert_eq!(done.ending(), (true, "The background tasks have ended."));
     }
 }

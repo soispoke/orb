@@ -88,6 +88,39 @@ pub(crate) fn deliver_now(mission_id: Uuid, content: String) -> Result<(), Strin
     }
 }
 
+/// Stop taking messages for the mission's session and return those that
+/// reached it but were never read. The runner calls this as soon as its event
+/// loop ends: shutting the process down takes seconds, and a message handed
+/// over meanwhile would be lost. A delivery racing this call fails, so its
+/// caller keeps the message queued.
+pub(crate) fn close_inputs(
+    mission_id: Uuid,
+    parked: Option<oneshot::Receiver<String>>,
+    midturn: Option<mpsc::UnboundedReceiver<String>>,
+) -> Vec<String> {
+    let mut unread = Vec::new();
+    if let Some(mut slot) = parked {
+        slot.close();
+        unread.extend(slot.try_recv().ok());
+    }
+    let mut parked = PARKED.lock().unwrap();
+    if parked.get(&mission_id).is_some_and(|tx| tx.is_closed()) {
+        parked.remove(&mission_id);
+    }
+    drop(parked);
+    if let Some(mut messages) = midturn {
+        messages.close();
+        while let Ok(message) = messages.try_recv() {
+            unread.push(message);
+        }
+    }
+    let mut midturn = MIDTURN.lock().unwrap();
+    if midturn.get(&mission_id).is_some_and(|tx| tx.is_closed()) {
+        midturn.remove(&mission_id);
+    }
+    unread
+}
+
 static EFFORT: LazyLock<Mutex<HashMap<Uuid, mpsc::UnboundedSender<Option<String>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -466,6 +499,31 @@ mod tests {
         drop(guard);
         assert!(!can_deliver_now(mission));
         assert_eq!(deliver_now(mission, "late".into()), Err("late".into()));
+    }
+
+    /// The event loop has ended but the process is still shutting down: a
+    /// message handed over in that window must come back, and later ones must
+    /// be refused so the queue keeps them.
+    #[test]
+    fn a_session_that_stopped_reading_returns_its_unread_messages() {
+        let mission = Uuid::new_v4();
+        let _guard = SessionGuard::attach(mission, true);
+        let midturn = midturn_messages(mission);
+        assert_eq!(deliver_now(mission, "send now".into()), Ok(()));
+        let slot = park(mission);
+        assert_eq!(deliver(mission, "parked".into()), Ok(()));
+        let unread = close_inputs(mission, Some(slot), Some(midturn));
+        assert_eq!(unread, vec!["parked".to_string(), "send now".to_string()]);
+        assert!(!can_deliver_now(mission));
+        assert_eq!(deliver_now(mission, "late".into()), Err("late".into()));
+
+        // A later session of the same mission keeps its own channel.
+        let mission = Uuid::new_v4();
+        let _stale = midturn_messages(mission);
+        let mut live = midturn_messages(mission);
+        assert!(close_inputs(mission, None, None).is_empty());
+        assert_eq!(deliver_now(mission, "next".into()), Ok(()));
+        assert_eq!(live.try_recv().unwrap(), "next");
     }
 
     #[test]
