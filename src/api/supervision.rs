@@ -1175,6 +1175,14 @@ fn idle_child_needs_parent_ping(status: MissionStatus, idle_seconds: u64, thresh
     ) && idle_seconds >= threshold
 }
 
+/// Whether a parent may be woken about an idle child. A terminal parent is
+/// finished, and an `Acknowledged` one was archived by the user: waking it
+/// would un-archive it. (An `Acknowledged` *child* is still a candidate; see
+/// [`idle_child_needs_parent_ping`].)
+fn idle_child_parent_accepts_ping(status: MissionStatus) -> bool {
+    !status.is_terminal() && status != MissionStatus::Acknowledged
+}
+
 /// Forks of a conversation carry the workspace they were forked from.
 fn is_conversation_fork(tags: &[String]) -> bool {
     tags.iter().any(|tag| tag.starts_with("fork-workspace:"))
@@ -1283,10 +1291,10 @@ async fn notify_parents_of_idle_children(
             continue;
         };
         // Never resurrect a finished orchestration over a leftover child; a
-        // terminal boss's stale workers are garbage-collection material, not
-        // an emergency.
+        // terminal or archived boss's stale workers are garbage-collection
+        // material, not an emergency.
         match mission_store.get_mission(parent_id).await {
-            Ok(Some(parent)) if !parent.status.is_terminal() => {}
+            Ok(Some(parent)) if idle_child_parent_accepts_ping(parent.status) => {}
             Ok(_) => continue,
             Err(e) => {
                 tracing::warn!(
@@ -1764,6 +1772,83 @@ mod tests {
             "disk-estimate-gib:64".to_string(),
         ]));
         assert!(!is_conversation_fork(&["pr-writer".to_string()]));
+    }
+
+    #[test]
+    fn idle_child_ping_skips_archived_or_terminal_parents() {
+        assert!(!idle_child_parent_accepts_ping(MissionStatus::Acknowledged));
+        assert!(!idle_child_parent_accepts_ping(MissionStatus::Interrupted));
+        assert!(!idle_child_parent_accepts_ping(MissionStatus::Completed));
+        assert!(idle_child_parent_accepts_ping(MissionStatus::AwaitingUser));
+        assert!(idle_child_parent_accepts_ping(MissionStatus::Active));
+    }
+
+    #[tokio::test]
+    async fn idle_child_watchdog_does_not_wake_an_archived_parent() {
+        // Incident: an archived (acknowledged) coordinator was un-archived by
+        // the watchdog pinging it about one of its parked workers.
+        let store: Arc<dyn MissionStore> =
+            Arc::new(crate::api::mission_store::InMemoryMissionStore::new());
+        let mk = |parent: Option<Uuid>| {
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .create_mission_with_parent(
+                        Some("m"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        parent,
+                        None,
+                    )
+                    .await
+                    .expect("create")
+                    .id
+            }
+        };
+        let boss = mk(None).await;
+        let worker = mk(Some(boss)).await;
+        store
+            .update_mission_status(worker, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        store
+            .update_mission_status(boss, MissionStatus::Acknowledged)
+            .await
+            .unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut notified = std::collections::HashMap::new();
+        notify_parents_of_idle_children(store.as_ref(), &cmd_tx, 0, &mut notified).await;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "archived parent must not be woken"
+        );
+
+        // Control: the same parked worker under a live parent is reported.
+        store
+            .update_mission_status(boss, MissionStatus::AwaitingUser)
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let Some(ControlCommand::UserMessage {
+                target_mission_id,
+                source,
+                respond,
+                ..
+            }) = cmd_rx.recv().await
+            else {
+                panic!("expected a watchdog message");
+            };
+            assert_eq!(target_mission_id, Some(boss));
+            assert_eq!(source.as_deref(), Some("idle-worker-watchdog"));
+            let _ = respond.send(UserMessageAck::Queued);
+        });
+        notify_parents_of_idle_children(store.as_ref(), &cmd_tx, 0, &mut notified).await;
+        responder.await.unwrap();
     }
 
     #[test]
