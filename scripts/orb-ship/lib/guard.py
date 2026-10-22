@@ -68,8 +68,16 @@ def descendants(rows, pid):
         ids |= more
 
 
+def detached_context_worker(pid):
+    """Project sync workers run in their own process group so they outlive a
+    window restart (orb/src-tauri/src/project_context.rs); quitting the window
+    leaves them running, so they do not block an install."""
+    out = subprocess.run(['ps', '-p', str(pid), '-o', 'pgid=,args='], text=True, capture_output=True).stdout.split(None, 1)
+    return len(out) == 2 and out[0] == str(pid) and ' --orb-context-worker ' in f' {out[1]} '
+
+
 def children_clear(rows, pid):
-    return all(rows[p]['state'].startswith('Z') for p in descendants(rows, pid))
+    return all(rows[p]['state'].startswith('Z') or detached_context_worker(p) for p in descendants(rows, pid))
 
 
 def verify_bundle(app):
