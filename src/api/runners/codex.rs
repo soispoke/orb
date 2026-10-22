@@ -1722,6 +1722,15 @@ impl NativeTextStream {
     }
 }
 
+/// Shown for a user message Codex took off the queue but no turn received.
+fn codex_undelivered_input_notice(content: &str) -> String {
+    let mut preview: String = content.chars().take(200).collect();
+    if preview.len() < content.len() {
+        preview.push('…');
+    }
+    format!("Codex did not receive your message; send it again: \"{preview}\"")
+}
+
 /// Drain the native driver before classifying its result. Shared with transcript
 /// regressions so stopped-goal tests exercise the production final-response path.
 pub(crate) async fn consume_codex_events(
@@ -1948,6 +1957,19 @@ pub(crate) async fn consume_codex_events(
                         break;
                     }
                     ExecutionEvent::Error { message } => {
+                        // Input no native turn received goes back to the user;
+                        // it is not an outcome of this run.
+                        if let Some(input) =
+                            message.strip_prefix(crate::backend::codex::UNDELIVERED_INPUT_PREFIX)
+                        {
+                            tracing::warn!(mission_id = %mission_id, "A message never reached the Codex turn");
+                            let _ = events_tx.send(AgentEvent::Error {
+                                message: codex_undelivered_input_notice(input),
+                                mission_id: Some(mission_id),
+                                resumable: true,
+                            });
+                            continue;
+                        }
                         // Codex CLI emits two kinds of post-response errors we
                         // want to treat as non-fatal:
                         //   1. Internal hiccups like "Failed to shutdown rollout
@@ -2383,6 +2405,88 @@ mod tests {
                 Some(result.output.as_str())
             );
         }
+    }
+
+    async fn consume_with_undelivered_input(
+        before: Vec<crate::backend::events::ExecutionEvent>,
+    ) -> (
+        crate::agents::AgentResult,
+        Vec<crate::api::control::AgentEvent>,
+    ) {
+        use crate::backend::events::ExecutionEvent;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in before {
+            tx.send(event).await.unwrap();
+        }
+        tx.send(ExecutionEvent::Error {
+            message: format!(
+                "{}send this now",
+                crate::backend::codex::UNDELIVERED_INPUT_PREFIX
+            ),
+        })
+        .await
+        .unwrap();
+        tx.send(ExecutionEvent::MessageComplete {
+            session_id: "native".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let (events, mut output) = tokio::sync::broadcast::channel(64);
+        let result = super::consume_codex_events(
+            rx,
+            events,
+            tokio_util::sync::CancellationToken::new(),
+            uuid::Uuid::new_v4(),
+            "Say hello",
+            None,
+        )
+        .await;
+        let mut seen = Vec::new();
+        while let Ok(event) = output.try_recv() {
+            seen.push(event);
+        }
+        (result, seen)
+    }
+
+    fn handed_back(events: &[crate::api::control::AgentEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                crate::api::control::AgentEvent::Error {
+                    message,
+                    resumable: true,
+                    ..
+                } if message.contains("send this now")
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn undelivered_input_at_run_end_leaves_a_completed_run_successful() {
+        use crate::backend::events::ExecutionEvent;
+        let (result, events) = consume_with_undelivered_input(vec![ExecutionEvent::TextDelta {
+            content: "Hello there.".into(),
+        }])
+        .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::TurnComplete));
+        assert!(handed_back(&events), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn undelivered_input_never_replaces_an_earlier_usage_limit() {
+        use crate::backend::events::ExecutionEvent;
+        let limit = "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Apr 28th, 2026 10:03 PM.";
+        let (result, events) = consume_with_undelivered_input(vec![ExecutionEvent::Error {
+            message: limit.into(),
+        }])
+        .await;
+        assert!(!result.success);
+        assert_eq!(result.terminal_reason, Some(TerminalReason::RateLimited));
+        assert!(result.output.contains("usage limit"), "{}", result.output);
+        assert!(!result.output.contains("codex_"), "{}", result.output);
+        assert!(handed_back(&events), "{events:?}");
     }
 
     #[test]

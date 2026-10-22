@@ -676,6 +676,7 @@ async fn send_message_streaming_app_server(
         }
         if let Some(hint) = pending_hint {
             steer.hold(hint);
+            steer.holds_hint = true;
         }
         let mut recovered_notifications = pre_activation_messages;
         let mut terminal = false;
@@ -811,9 +812,15 @@ async fn send_message_streaming_app_server(
                             std::future::pending::<()>().await;
                         }
                     } => {
-                        let held = steer.held.take().unwrap_or_default();
-                        let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: no native turn started within 30s; this input was not delivered and must be sent again: {held}") }).await;
-                        break 'outer;
+                        let holds_hint = steer.holds_hint;
+                        let held = steer.release().unwrap_or_default();
+                        if holds_hint {
+                            let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: native goal did not expose a new turn; current hint was not delivered: {held}") }).await;
+                            break 'outer;
+                        }
+                        // The run goes on; only this input is handed back.
+                        let _ = tx.send(ExecutionEvent::Error { message: format!("{UNDELIVERED_INPUT_PREFIX}{held}") }).await;
+                        continue;
                     }
                     _ = async {
                         if let Some((deadline, _)) = pending_tool_reconciliation.as_ref() {
@@ -839,6 +846,7 @@ async fn send_message_streaming_app_server(
                 match msg {
                     InboundMessage::Notification { method, params } => {
                         if method == "turn/started" && params["threadId"] == thread_id {
+                            let holds_hint = steer.holds_hint;
                             if let Some(hint) = steer.turn_started(params["turn"]["id"].as_str()) {
                                 let turn_id = params["turn"]["id"].as_str().ok_or_else(|| {
                                     anyhow::anyhow!("native started turn has no id")
@@ -848,8 +856,16 @@ async fn send_message_streaming_app_server(
                                     Err(error) => Err(error),
                                 };
                                 if let Err(error) = result {
-                                    let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: {error}; this input was not delivered and must be sent again: {hint}") }).await;
-                                    break 'outer;
+                                    if holds_hint {
+                                        let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: {error}; hint was not replayed: {hint}") }).await;
+                                        break 'outer;
+                                    }
+                                    tracing::warn!(thread_id = %thread_id, %error, "Codex turn/steer of held user input failed");
+                                    let _ = tx
+                                        .send(ExecutionEvent::Error {
+                                            message: format!("{UNDELIVERED_INPUT_PREFIX}{hint}"),
+                                        })
+                                        .await;
                                 }
                             }
                         } else if method == "turn/completed" && params["threadId"] == thread_id {
@@ -1264,8 +1280,14 @@ async fn send_message_streaming_app_server(
             tracing::info!("codex app-server reconnected via thread/resume");
         }
 
+        let holds_hint = steer.holds_hint;
         if let Some(held) = steer.close(midturn_messages.as_mut()) {
-            let _ = tx.send(ExecutionEvent::Error { message: format!("codex_continuity_steer_unconfirmed: the native run stopped before this input was delivered; send it again: {held}") }).await;
+            let message = if holds_hint {
+                format!("codex_continuity_steer_unconfirmed: current hint was not delivered before the native run stopped: {held}")
+            } else {
+                format!("{UNDELIVERED_INPUT_PREFIX}{held}")
+            };
+            let _ = tx.send(ExecutionEvent::Error { message }).await;
         }
         if stream_closed_unexpectedly {
             let interrupted_ids = translator.pending_tool_ids();
@@ -1328,6 +1350,10 @@ fn elicitation_auto_approve(method: &str) -> serde_json::Value {
 /// How long input held for the next native turn may wait for `turn/started`.
 const STEER_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Prefix of an `ExecutionEvent::Error` that hands back user input no native
+/// turn received. It is a notice for the user to resend, not a run failure.
+pub(crate) const UNDELIVERED_INPUT_PREFIX: &str = "codex_undelivered_input: ";
+
 /// The native turn that can take a `turn/steer`, and input waiting for one.
 /// The wait is measured from the moment input is held, never from run start.
 #[derive(Default)]
@@ -1335,6 +1361,9 @@ struct SteerSlot {
     turn_id: Option<String>,
     held: Option<String>,
     deadline: Option<tokio::time::Instant>,
+    /// The held input includes the continuity hint of a resumed native
+    /// thread; failing to deliver that one needs reconciliation.
+    holds_hint: bool,
 }
 
 impl SteerSlot {
@@ -1355,6 +1384,7 @@ impl SteerSlot {
     fn turn_started(&mut self, turn_id: Option<&str>) -> Option<String> {
         self.turn_id = turn_id.map(str::to_string);
         self.deadline = None;
+        self.holds_hint = false;
         self.held.take()
     }
 
@@ -1377,7 +1407,13 @@ impl SteerSlot {
                 self.hold(text);
             }
         }
+        self.release()
+    }
+
+    /// Stop waiting and hand back what is held.
+    fn release(&mut self) -> Option<String> {
         self.deadline = None;
+        self.holds_hint = false;
         self.held.take()
     }
 }
@@ -2972,6 +3008,30 @@ mod tests {
         );
         assert_eq!(steer.turn_id.as_deref(), Some("turn-2"));
         assert_eq!(steer.close(None), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_continuity_hint_makes_undelivered_input_a_continuity_failure() {
+        // A user message whose wait expires is handed back; the run goes on.
+        let mut steer = SteerSlot::default();
+        steer.turn_started(Some("turn-1"));
+        steer.turn_completed(Some("turn-1"));
+        steer.hold("between turns".into());
+        assert!(!steer.holds_hint);
+        assert_eq!(steer.release().as_deref(), Some("between turns"));
+        assert!(steer.deadline.is_none());
+        let undelivered = format!("{UNDELIVERED_INPUT_PREFIX}between turns");
+        assert!(!undelivered.starts_with("codex_continuity_"));
+
+        // The resumed thread's hint still needs reconciliation until a turn takes it.
+        let mut steer = SteerSlot::default();
+        steer.hold("current hint".into());
+        steer.holds_hint = true;
+        assert_eq!(
+            steer.turn_started(Some("turn-2")).as_deref(),
+            Some("current hint")
+        );
+        assert!(!steer.holds_hint);
     }
 
     #[test]
