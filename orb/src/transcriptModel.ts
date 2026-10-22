@@ -38,6 +38,11 @@ export class TranscriptReducer {
   // question splits that response into two chronological display segments.
   private segments = new Map<string, {prefix: string; full: string}>();
   private seen = new Set<string>();
+  /** Long finished thinking already shown in this chat. The live stream can
+   * repeat an older block after a later tool call, across a mid-run message;
+   * a long block never recurs by chance (short ones, like an ETA, may). */
+  private shownThinking = new Set<string>();
+  private static readonly REPEATABLE_THINKING = 200;
   private seq = new Map<string, number>();
   private revisions = new Map<string, number>();
   private next = 0;
@@ -313,14 +318,17 @@ export class TranscriptReducer {
         // A block's final copy can arrive after the tool call that followed it
         // (Claude finalizes at the end of the assistant message). Complete the
         // streamed copy in place, and never repeat a finished block in this turn.
+        const long=text.trim().length>=TranscriptReducer.REPEATABLE_THINKING;
+        if(done&&long&&this.shownThinking.has(text.trim()))return;
         for(let i=this.items.length-1;i>=0;i--){
           const item=this.items[i];
           if(item.kind==="user"&&!item.queued)break;
           if(item.kind!=="think")continue;
           if(item.done&&item.text===text)return;
-          if(done&&!item.done&&(text.startsWith(item.text)||item.text.startsWith(text))){this.put(i,{...item,text,done});return;}
+          if(done&&!item.done&&(text.startsWith(item.text)||item.text.startsWith(text))){this.put(i,{...item,text,done});if(long)this.shownThinking.add(text.trim());return;}
         }
         this.items.push({kind:"think",key:this.key("think"),text,done});
+        if(done&&long)this.shownThinking.add(text.trim());
         return;
       }
       case "tool_call":

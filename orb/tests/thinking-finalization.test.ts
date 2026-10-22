@@ -34,4 +34,20 @@ describe('thinking blocks', () => {
     ]);
     expect(items.map(item => item.text)).toEqual([answer, later, answer]);
   });
+
+  it('does not repeat a long block the live stream resends after a mid-run message', () => {
+    const optimizing = '**Optimizing recorder capacity**\n\n' + 'I am thinking about a separate high-level operation DAG for the recorder. '.repeat(4);
+    const clarifying = '**Clarifying implementation tasks**\n\n' + 'I need to implement a tracing operation graph with macro and module tests. '.repeat(4);
+    const items = thinks([
+      ev('user_message', {id: 'go', content: 'go'}),
+      ev('thinking', {content: optimizing, done: true}),
+      ev('tool_call', {tool_call_id: 't1', name: 'Bash', args: {}}),
+      ev('user_message', {id: 'emile', content: 'emile said: recursion needs batching'}),
+      ev('thinking', {content: clarifying, done: true}),
+      ev('tool_call', {tool_call_id: 't2', name: 'Bash', args: {}}),
+      ev('thinking', {content: optimizing, done: true}),
+      ev('thinking', {content: clarifying, done: true}),
+    ]);
+    expect(items.map(item => item.text)).toEqual([optimizing, clarifying]);
+  });
 });
