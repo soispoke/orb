@@ -430,23 +430,28 @@ async fn codex_continuity_reconnect_missing_turn_receipt_requires_reconciliation
 }
 
 #[tokio::test]
-async fn codex_continuity_unresolved_tool_stays_fenced_across_outer_restart() {
+async fn codex_continuity_unresolved_tool_is_named_to_the_next_turn_and_never_replayed() {
     let f = Fixture::new();
     f.run("crash-tool", "execute once").await;
     let journal = ToolCallJournal::at(f.config.path.with_extension("tools.json"));
     assert_eq!(journal.pending().await.unwrap().len(), 1);
-    let count = f.requests("initialize").len();
-    let error = f
-        .start(
-            f.backend_config("normal", CancellationToken::new()),
-            "try again",
-        )
-        .await
-        .err()
-        .unwrap();
-    assert!(error.to_string().contains("unresolved_tools"));
-    assert_eq!(f.requests("initialize").len(), count);
-    assert_eq!(f.requests("turn/start").len(), 1);
+    // The next turn starts on the same native thread and is told which command
+    // was cut off; Orb itself replays nothing.
+    f.run("normal", "try again").await;
+    let turns = f.requests("turn/start");
+    assert_eq!(turns.len(), 2);
+    let text = turns[1]["input"][0]["text"].as_str().unwrap();
+    // A resumed thread sends only the current input (the fixture's "new input only").
+    assert!(
+        text.starts_with("new input only\n\nContinuity reconciliation: "),
+        "{text}"
+    );
+    assert!(text.contains("synthetic-do-once"), "{text}");
+    assert!(journal.pending().await.unwrap().is_empty());
+    // Settled once: a later turn carries no note.
+    f.run("normal", "next").await;
+    let turns = f.requests("turn/start");
+    assert_eq!(turns[2]["input"][0]["text"], "new input only");
 }
 
 #[tokio::test]

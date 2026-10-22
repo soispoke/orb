@@ -308,14 +308,28 @@ async fn send_message_streaming_app_server(
         Some(config) => Some(continuity::Lease::acquire(config).await?),
         None => None,
     };
-    if let Some(lease) = &native_lease {
-        if !ToolCallJournal::at(lease.journal_path())
-            .pending()
-            .await?
-            .is_empty()
-        {
-            return Err(anyhow::anyhow!("codex_continuity_unresolved_tools: previous tool outcome needs reconciliation; no command was replayed"));
+    // Commands a previous turn started but never finished (a Core restart or a
+    // crash cut them off) have no known outcome. They are never replayed: the
+    // next turn tells the agent which ones, and only after that turn starts are
+    // they settled. A goal objective cannot carry that note, so it still stops.
+    let unresolved = match &native_lease {
+        Some(lease) => {
+            let journal = ToolCallJournal::at(lease.journal_path());
+            let pending = journal.pending().await?;
+            (!pending.is_empty()).then_some((journal, pending))
         }
+        None => None,
+    };
+    if unresolved.is_some()
+        && parse_goal_prefix(
+            cfg.continuity
+                .as_ref()
+                .map(|c| c.current_message.as_str())
+                .unwrap_or(message),
+        )
+        .0
+    {
+        return Err(anyhow::anyhow!("codex_continuity_unresolved_tools: previous tool outcome needs reconciliation; no command was replayed"));
     }
     let session_arc = AppServerSession::spawn(app_cfg, &session.directory, workspace_exec).await?;
     let session_arc = Arc::new(session_arc);
@@ -601,13 +615,18 @@ async fn send_message_streaming_app_server(
                 collaboration_mode: planning.then(||collaboration_mode(true, &plan_model)),
                 thread_id: thread_id.clone(),
                 input: vec![UserInputItem::Text {
-                    text: plan_body.unwrap_or(&user_payload).to_owned(),
+                    text: with_reconciliation_note(
+                        plan_body.unwrap_or(&user_payload),
+                        unresolved.as_ref().map(|(_, pending)| pending.as_slice()),
+                    ),
                 }],
             })
             .await
         {
             let _ = session_arc.shutdown().await;
             return Err(anyhow::anyhow!("codex turn/start failed: {}", e));
+        } else if let Some((journal, _)) = &unresolved {
+            journal.settle_completed_turn().await?;
         } }
 
         let initial_objective = if is_goal_mission {
@@ -1470,6 +1489,31 @@ struct TranslateOutcome {
     terminal: bool,
 }
 
+/// The turn's text, followed by the commands a previous turn left with no
+/// known outcome. The desktop recognises the `\n\nContinuity reconciliation:`
+/// suffix and shows the retry as the original prompt.
+fn with_reconciliation_note(text: &str, unresolved: Option<&[PendingToolCall]>) -> String {
+    let Some(calls) = unresolved.filter(|calls| !calls.is_empty()) else {
+        return text.to_owned();
+    };
+    let mut note = format!(
+        "{text}\n\nContinuity reconciliation: your previous turn was cut off (a Core restart or crash) while these commands were running, so their outcome is unknown and none was run again:"
+    );
+    for call in calls {
+        let command = call.start_payload["command"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| call.name.clone());
+        let command: String = command.chars().take(400).collect();
+        match call.start_payload["cwd"].as_str() {
+            Some(cwd) => note.push_str(&format!("\n- `{command}` (in {cwd})")),
+            None => note.push_str(&format!("\n- `{command}`")),
+        }
+    }
+    note.push_str("\nCheck what they left behind (files, logs, running processes) before deciding whether to run any of them again.");
+    note
+}
+
 fn reconcile_pending_before_terminal(
     translator: &mut AppServerEventTranslator,
     pending: &mut Option<(tokio::time::Instant, std::collections::HashSet<String>)>,
@@ -2099,6 +2143,22 @@ pub fn registry_entry() -> Arc<dyn Backend> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turn_after_an_interrupted_command_names_it_instead_of_refusing() {
+        use super::{with_reconciliation_note, PendingToolCall};
+        assert_eq!(with_reconciliation_note("go on", None), "go on");
+        assert_eq!(with_reconciliation_note("go on", Some(&[])), "go on");
+        let cut = PendingToolCall {
+            id: "exec-1".into(),
+            name: "bash".into(),
+            start_payload: serde_json::json!({"command": "cargo build --release", "cwd": "/root/w"}),
+        };
+        let text = with_reconciliation_note("go on", Some(&[cut]));
+        assert!(text.starts_with("go on\n\nContinuity reconciliation: "));
+        assert!(text.contains("- `cargo build --release` (in /root/w)"));
+        assert!(text.contains("none was run again"));
+    }
+
     use super::*;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
