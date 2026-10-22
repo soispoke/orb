@@ -971,7 +971,8 @@ mod tests {
             super::super::pop_next_runnable_control_queue(
                 &mut queue,
                 &store,
-                &mut Default::default()
+                &mut Default::default(),
+                &Default::default()
             )
             .await
             .unwrap()
@@ -1005,7 +1006,8 @@ mod tests {
             super::super::pop_next_runnable_control_queue(
                 &mut queue,
                 &store,
-                &mut Default::default()
+                &mut Default::default(),
+                &Default::default()
             )
             .await
             .unwrap()

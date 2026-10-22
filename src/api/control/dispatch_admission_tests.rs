@@ -13102,6 +13102,113 @@ async fn a_message_to_the_idle_main_session_leaves_a_desktop_followup_to_its_own
 }
 
 #[tokio::test]
+async fn a_delivery_that_cannot_activate_leaves_the_main_session_on_its_mission() {
+    let h = Harness::new().await;
+    // B is a PR writer, and another writer (in the session's own store) holds
+    // its PR, so B cannot be activated.
+    let blocker = h.writer(MissionStatus::Paused, Some("org/repo#11")).await;
+    let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+    let t = store
+        .create_mission(None, None, None, None, None, None, None)
+        .await
+        .unwrap()
+        .id;
+    let b = store
+        .create_mission(None, None, None, None, None, None, None)
+        .await
+        .unwrap()
+        .id;
+    store
+        .update_mission_project(
+            b,
+            MissionProjectPatch {
+                github_pr: Some(Some("org/repo#11".into())),
+                tags: Some(vec!["pr-writer".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_status(b, MissionStatus::AwaitingUser)
+        .await
+        .unwrap();
+    let current = Arc::new(RwLock::new(Some(t)));
+    let mut history = vec![("user".to_string(), "T earlier".to_string())];
+    let (events_tx, _) = broadcast::channel(16);
+    let entry = (Uuid::new_v4(), "B next".to_string(), None, Some(b), None);
+    let error = prepare_main_delivery(
+        &h.state.control,
+        &store,
+        &events_tx,
+        &current,
+        &mut history,
+        &entry,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains(&blocker.id.to_string()), "{error}");
+    assert_eq!(*current.read().await, Some(t));
+    assert_eq!(history, vec![("user".to_string(), "T earlier".to_string())]);
+}
+
+#[tokio::test]
+async fn a_message_that_still_waits_in_the_queue_is_acknowledged_as_queued() {
+    // The main mission is held by a detached remote wait: its message stays
+    // queued, so the reply must not say it was delivered.
+    let h = Harness::new().await;
+    let store = h.control.mission_store.clone();
+    let mission = store
+        .create_mission(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("test-no-execution"),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .update_mission_status(mission.id, MissionStatus::Active)
+        .await
+        .unwrap();
+    let run = store
+        .begin_mission_run(mission.id, "remote-build:test", None)
+        .await
+        .unwrap();
+    store
+        .heartbeat_mission_run(
+            run.run_id,
+            run.generation,
+            MissionExecutionState::WaitingRemoteJob,
+            None,
+        )
+        .await
+        .unwrap();
+    load_main_mission(&h, mission.id).await;
+    let mut events = h.control.events_tx.subscribe();
+    let id = Uuid::new_v4();
+    assert_eq!(
+        send_to_actor(&h, id, mission.id, "after the remote job").await,
+        UserMessageAck::Queued
+    );
+    let mut queue_len = None;
+    while let Ok(event) = events.try_recv() {
+        if let AgentEvent::Status { queue_len: len, .. } = event {
+            queue_len = Some(len);
+        }
+    }
+    assert_eq!(queue_len, Some(1), "the status counts the waiting message");
+    assert!(store
+        .load_control_queue(&h.user.id)
+        .await
+        .unwrap()
+        .contains(&id.to_string()));
+}
+
+#[tokio::test]
 async fn a_dequeued_message_for_another_mission_runs_on_that_missions_history() {
     let h = Harness::new().await;
     let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
