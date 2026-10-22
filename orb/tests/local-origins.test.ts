@@ -218,3 +218,18 @@ it('restoring invalidates a cached archive when Core omits the chat from its lis
  await reopenMission('done');
  expect(await listMissions()).toMatchObject([{id:'done',status:'paused',title:done.title}]);
 });
+it('keeps Core chats visible when the local runner is down after a reboot',async()=>{
+ setConnection('http://core.test','token');
+ const core={id:'core-chat',title:'sig.golf',status:'awaiting_user',history:[],tags:null,backend:'claudecode'};
+ const invoke=vi.fn(async()=>{throw new Error('Execution worker unavailable; the run may still be active. Reconnect before retrying.');});
+ (window as any).__TAURI_INTERNALS__={invoke};
+ vi.stubGlobal('fetch',vi.fn(async input=>Response.json(String(input).includes('/missions/core-chat')?core:[core])));
+ const {localOriginsProblem}=await import('../src/localOrigins');
+ expect(await listMissions()).toEqual([core]);
+ expect(await listProjectMissions('labyrinth-sig-gold')).toEqual([]);
+ expect(await getMission('core-chat')).toEqual(core);
+ expect(localOriginsProblem()).toContain('Execution worker unavailable');
+ invoke.mockImplementation(async()=>[]);
+ await listMissions();
+ expect(localOriginsProblem()).toBeNull();
+});

@@ -62,6 +62,7 @@ import { ProjectPicker, ProjectCreation } from "./ProjectPicker";
 import { hasOverlay } from "./overlayLayer";
 import { Lightbox } from "./Lightbox";
 import { For, Show, Switch, Match, lazy, createMemo, createSignal, createEffect, on, onCleanup, onMount, batch } from "solid-js";
+import { localOriginsProblem } from "./localOrigins";
 import { createStore, produce } from "solid-js/store";
 import type { JSX } from "solid-js";
 import { projects as seed, LOREM_REPLY, type Agent, type Block, type Turn } from "./data";
@@ -2100,6 +2101,9 @@ export default function App() {
                   <span class="row-label">Providers</span><kbd aria-hidden="true">{shortcutLabel("providers")}</kbd>
                 </button>
 
+                <Show when={isConnected() && localOriginsProblem()}>
+                  {problem => <div class="sb-empty" role="status" title={problem()}>Chats run on this computer are hidden: its local runner is not responding. Core chats are unaffected.</div>}
+                </Show>
                 <Show
                   when={isConnected()}
                   fallback={

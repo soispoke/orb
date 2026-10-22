@@ -1,5 +1,9 @@
 import {getApiUrl,getJwt,connectionVersion,type Mission} from './api';
 import {nativeInvoke} from './clientRuns';
+import {createSignal} from 'solid-js';
+/** Why this computer's chats are missing from the lists, if they are. Core
+ * chats never depend on the local runner, so its failure only hides local ones. */
+export const [localOriginsProblem,setLocalOriginsProblem]=createSignal<string|null>(null);
 // Concurrent list, queue and transcript reads share one native journal scan.
 // Never cache settled rows: launches and synchronization can change them immediately.
 const reads=new Map<number,Promise<Mission[]>>();
@@ -20,8 +24,13 @@ export async function localOrigins(missionId?:string):Promise<Mission[]>{
  let read=reads.get(version);
  if(!read){
   read=(async()=>{
-   try{const rows=await invoke('local_origin_list',{connection:{api_url:getApiUrl(),token:getJwt()}});if(version!==connectionVersion())throw new Error("Connection changed while reading local missions");return Array.isArray(rows)?rows as Mission[]:[];}
-   catch(error){if(/unknown command|not found/i.test(String(error)))return [];throw error;}
+   try{const rows=await invoke('local_origin_list',{connection:{api_url:getApiUrl(),token:getJwt()}});if(version!==connectionVersion())throw new Error("Connection changed while reading local missions");setLocalOriginsProblem(null);return Array.isArray(rows)?rows as Mission[]:[];}
+   catch(error){
+    if(/unknown command|not found/i.test(String(error)))return [];
+    if(version!==connectionVersion())throw error;
+    setLocalOriginsProblem(String(error instanceof Error?error.message:error));
+    return [];
+   }
   })().finally(()=>reads.delete(version));
   reads.set(version,read);
  }

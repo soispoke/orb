@@ -123,6 +123,24 @@ fn connect_at(root: &Path) -> Result<UnixStream, String> {
     }
     Ok(stream)
 }
+/// Set aside the record and socket of a worker that no longer runs; the
+/// caller holds owner.lock. The record is kept for diagnosis.
+fn retire_dead_owner_files(root: &Path) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    if root.join("owner.json").exists() {
+        std::fs::rename(root.join("owner.json"), root.join(format!("owner.json.dead-{stamp}")))
+            .map_err(|e| e.to_string())?;
+    }
+    match std::fs::remove_file(root.join("owner.sock")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn pin_executable(root: &Path) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let image = root.join(format!("image-{}", uuid::Uuid::new_v4()));
@@ -167,19 +185,30 @@ fn connection() -> Result<UnixStream, String> {
     let root = root()?;
     private_root(&root)?;
     if root.join("owner.sock").exists() {
-        return connect_at(&root);
+        // Only an unreachable socket may be stale; any other answer is final.
+        match connect_at(&root) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if error != UNCERTAIN => return Err(error),
+            Err(_) => {}
+        }
     }
     let boot = lock(&root.join("boot.lock"))?;
     boot.lock_exclusive().map_err(|e| e.to_string())?;
     if root.join("owner.sock").exists() {
-        return connect_at(&root);
+        // Only an unreachable socket may be stale; any other answer is final.
+        match connect_at(&root) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if error != UNCERTAIN => return Err(error),
+            Err(_) => {}
+        }
     }
     let owner = lock(&root.join("owner.lock"))?;
     owner.try_lock_exclusive().map_err(|_| UNCERTAIN)?;
-    // Never silently replace a lost worker: its children may have survived.
-    if root.join("owner.json").exists() {
-        return Err(UNCERTAIN.into());
-    }
+    // A live worker holds owner.lock for its whole life, so a free lock means
+    // the worker is gone (a crash, or every reboot). Its record and socket are
+    // then stale. Children that might have survived still block a new worker:
+    // each holds its run lock, checked below.
+    retire_dead_owner_files(&root)?;
     FileExt::unlock(&owner).map_err(|e| e.to_string())?;
     let run_locks = root
         .parent()
@@ -751,6 +780,26 @@ printf '%s\n' '{"type":"result"}'
         let symlink = dir.path().join("link");
         std::os::unix::fs::symlink(dir.path(), &symlink).unwrap();
         assert!(private_root(&symlink).is_err());
+    }
+    #[test]
+    fn a_worker_lost_in_a_reboot_leaves_files_a_new_worker_can_replace() {
+        let dir = tempfile::Builder::new().prefix("orb-dead-").tempdir_in("/tmp").unwrap();
+        // What a reboot leaves: the record and a socket nobody listens on.
+        std::fs::write(dir.path().join("owner.json"), r#"{"protocol":1,"pid":90812}"#).unwrap();
+        drop(UnixListener::bind(dir.path().join("owner.sock")).unwrap());
+        assert_eq!(connect_at(dir.path()).unwrap_err(), UNCERTAIN, "an unreachable socket is the only fall-through case");
+        // A live worker holds owner.lock; then nothing is retired.
+        let live = lock(&dir.path().join("owner.lock")).unwrap();
+        live.lock_exclusive().unwrap();
+        assert!(lock(&dir.path().join("owner.lock")).unwrap().try_lock_exclusive().is_err());
+        FileExt::unlock(&live).unwrap();
+        retire_dead_owner_files(dir.path()).unwrap();
+        assert!(!dir.path().join("owner.json").exists());
+        assert!(!dir.path().join("owner.sock").exists());
+        let kept = std::fs::read_dir(dir.path()).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("owner.json.dead-")).count();
+        assert_eq!(kept, 1, "the old record is kept for diagnosis");
+        retire_dead_owner_files(dir.path()).unwrap();
     }
     #[test]
     fn wrong_protocol_sends_no_mutation() {
