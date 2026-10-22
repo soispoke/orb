@@ -157,7 +157,7 @@ export function RemoteQueue(p: {
       if (!current()) return;
       setError(target.queue_error
         ? `Not sent yet: ${target.queue_error.replace(/\.$/, "")}. It’s still queued.`
-        : "Not sent yet: this agent can’t take a message mid-turn. It’s still queued and goes in as soon as the current turn ends.");
+        : "Not sent yet: it’s still queued and goes in as soon as this chat can start its next turn.");
     } catch (e) {
       if (!current()) return;
       const message = e instanceof Error ? e.message : String(e);
