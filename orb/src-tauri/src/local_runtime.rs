@@ -697,7 +697,12 @@ printf '%s\n' '{"type":"result"}'
             .status()
             .unwrap();
         assert!(status.success());
-        wait_for(|| dir.path().join("build.pid").exists());
+        // The fixture creates each file before writing it; wait for the number.
+        let written = |name: &str| {
+            std::fs::read_to_string(dir.path().join(name))
+                .is_ok_and(|text| text.trim().parse::<i32>().is_ok())
+        };
+        wait_for(|| written("build.pid") && written("agent.pid"));
         let build: i32 = std::fs::read_to_string(dir.path().join("build.pid"))
             .unwrap()
             .trim()
