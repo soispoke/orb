@@ -5539,6 +5539,42 @@ impl MissionStore for SqliteMissionStore {
                     .optional()
                     .unwrap_or(None);
 
+                // Claude's text snapshot restarts with each assistant message.
+                // Once work followed the stored text, a snapshot that does not
+                // extend it is the next message: keep the earlier paragraph as a
+                // checkpoint at its own position instead of overwriting it.
+                let existing = match existing {
+                    Some(row_id) if event_type == "text_delta" => {
+                        let (old_content, old_file, old_sequence): (Option<String>, Option<String>, i64) = conn
+                            .query_row(
+                                "SELECT content, content_file, sequence FROM mission_events WHERE id = ?1",
+                                params![row_id],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let old = SqliteMissionStore::load_content(old_content.as_deref(), old_file.as_deref());
+                        let work_since: bool = conn
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM mission_events WHERE mission_id = ?1 AND sequence > ?2
+                                 AND event_type IN ('tool_call', 'tool_result', 'thinking'))",
+                                params![&mid, old_sequence],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(false);
+                        if work_since && !old.trim().is_empty() && !content.starts_with(&old) {
+                            conn.execute(
+                                "UPDATE mission_events SET event_id = 'text_delta_checkpoint:' || sequence WHERE id = ?1",
+                                params![row_id],
+                            )
+                            .map_err(|e| e.to_string())?;
+                            None
+                        } else {
+                            Some(row_id)
+                        }
+                    }
+                    other => other,
+                };
+
                 if let Some(row_id) = existing {
                     let (content_inline, content_file) = SqliteMissionStore::store_content(
                         &content_dir,
@@ -16302,6 +16338,53 @@ mod tests {
         assert_eq!(replay[0].event_type, "text_delta");
         assert_eq!(replay[0].content, "final useful draft");
         assert_eq!(replay[0].sequence, final_seq);
+    }
+
+    #[tokio::test]
+    async fn next_claude_message_keeps_the_previous_paragraph() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("streaming"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        let text = |content: &str| AgentEvent::TextDelta {
+            content: content.to_string(),
+            mission_id: Some(mission.id),
+        };
+        for event in [
+            text("I'll check"),
+            text("I'll check both lanes."),
+            AgentEvent::ToolCall {
+                tool_call_id: "tool-1".to_string(),
+                name: "bash".to_string(),
+                args: json!({ "command": "true" }),
+                mission_id: Some(mission.id),
+            },
+            text("I'll"),
+            text("I'll steer lane B."),
+        ] {
+            store.log_event(mission.id, &event).await.expect("log");
+        }
+        let events = store
+            .get_events_since(mission.id, 0, None, None)
+            .await
+            .expect("events");
+        let shown: Vec<_> = events
+            .iter()
+            .map(|e| (e.event_type.as_str(), e.content.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("text_delta", "I'll check both lanes."),
+                ("tool_call", "{\"command\":\"true\"}"),
+                ("text_delta", "I'll steer lane B."),
+            ]
+        );
+        assert_eq!(events[2].event_id.as_deref(), Some("text_delta_latest"));
     }
 
     #[tokio::test]
