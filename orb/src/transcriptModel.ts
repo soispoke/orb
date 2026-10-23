@@ -61,6 +61,8 @@ export class TranscriptReducer {
     return fallback;
   }
   private put(index: number, item: StreamItem) { this.items[index] = item; }
+  /** A tool call or thought followed this bubble: the producer moved on to its next message. */
+  private workSince(index: number) { return this.items.some((item, i) => i > index && (item.kind === "tool" || item.kind === "think")); }
   private placeText(bubble:string,item:Extract<StreamItem,{kind:'text'}>):number {
     let index=this.items.length;
     item={...item,key:this.textKey(bubble,item.key)};
@@ -257,6 +259,16 @@ export class TranscriptReducer {
           else if(segment.prefix.startsWith(text))return; // late unchanged prefix
           else {segment.prefix="";segment.full=text;} // a new producer response
         }
+        // Claude's snapshot restarts with each assistant message, so after a
+        // tool call the next message's text does not extend the shown one.
+        // Never erase or shrink what the reader sees: a new message continues
+        // in its own bubble, below the work that preceded it.
+        if (bubble === "text_delta_latest" && snapshot != null && previous?.kind === "text" && previous.text && index != null && this.workSince(index) && !text.startsWith(previous.text)) {
+          if (previous.text.startsWith(text)) return;
+          if (previous.live) this.put(index, { ...previous, live: false });
+          this.segments.delete(bubble);
+          index = undefined; live = true; this.response++;
+        }
         if (index == null && bubble === "text_delta_latest" && this.lastFinal != null) {
           const finalized = this.items[this.lastFinal];
           if (finalized?.kind === "text" && !finalized.live && snapshot != null && finalized.text.startsWith(snapshot)) {
@@ -307,8 +319,11 @@ export class TranscriptReducer {
           return;
         }
         if(isNativeReceipt) return;
-        if(previous?.kind === "text" && index != null){this.put(index,{...previous,text:text||previous.text,live:false,sourceEventId:ev.eventId??previous.sourceEventId});this.lastFinal=index;}
- else if(text){this.lastFinal=this.items.length;this.items.push({kind:"text",key:finalKey,text,live:false,sourceEventId:ev.eventId});}
+        // Claude's result is its last message only; an earlier message's
+        // paragraph stays, and the result reads after the work since then.
+        const earlier=finalBubble==="text_delta_latest"&&previous?.kind==="text"&&index!=null&&this.workSince(index)&&text.trim()&&!text.includes(previous.text.trim())&&!previous.text.startsWith(text.trim());
+        if(previous?.kind === "text" && index != null && !earlier){this.put(index,{...previous,text:text||previous.text,live:false,sourceEventId:ev.eventId??previous.sourceEventId});this.lastFinal=index;}
+ else if(text){this.lastFinal=this.items.length;this.items.push({kind:"text",key:earlier?this.textKey(finalBubble,this.key("text")):finalKey,text,live:false,sourceEventId:ev.eventId});}
         return;
       }
       case "thinking": {

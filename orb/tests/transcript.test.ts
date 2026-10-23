@@ -13,7 +13,8 @@ describe("producer transcript contract",()=>{
   const replay=buildTranscript(events);
   let live=buildTranscript([]);for(const e of events)live=applyStreamEvent(live,e);
   expect(live).toEqual(replay);expect(texts(live)).toHaveLength(1);expect(texts(live)[0].text).toBe("Inspect file. Fix guard.");
-  live=applyStreamEvent(live,final("Done."));expect(texts(live)).toMatchObject([{text:"Done.",live:false}]);
+  // The final follows the work after the shown text, which stays.
+  live=applyStreamEvent(live,final("Done."));expect(texts(live)).toMatchObject([{text:"Inspect file. Fix guard.",live:false},{text:"Done.",live:false}]);
  });
  it("keys independent bubbles and uses Unicode scalar offsets for true operations",()=>{
   let items=buildTranscript([ev("text_op",{bubble_id:"one",ops:[{type:"insert",pos:0,text:"A😀B"}]}),tool,ev("text_op",{bubble_id:"two",ops:[{type:"insert",pos:0,text:"Other"}]})]);
@@ -63,7 +64,10 @@ it("replays the supplied 328-event redacted production fixture and updates its l
  items=applyStreamEvent(items,ev("tool_call",{tool_call_id:"next",name:"read"}));
  items=applyStreamEvent(items,ev("text_op",{bubble_id:"text_delta_latest",ops:[{type:"replace",range:[0,9999],text:"Updated response after next tool"}]}));
  expect(items.filter(x=>x.kind==="tool")).toHaveLength(163);
- expect(items.filter(x=>x.kind==="text")).toHaveLength(before);
+ // Text that does not extend the shown response after a tool is the next
+ // message: it reads below the tool, and the earlier paragraph stays.
+ expect(items.filter(x=>x.kind==="text")).toHaveLength(before+1);
+ expect(items.at(-1)).toMatchObject({kind:"text",text:"Updated response after next tool",live:true});
  expect(items.filter(x=>x.kind==="text"&&x.live)).toHaveLength(1);
 });
 
@@ -116,7 +120,7 @@ it("ignores live remote status without finalizing the agent response",()=>{
  expect(texts(items)).toMatchObject([{text:"Je vérifie.",live:true}]);
  expect(items.find(x=>x.kind==="tool")).toMatchObject({done:false});
  items=applyStreamEvent(items,final("Voici le résultat.","answer"));
- expect(texts(items)).toMatchObject([{text:"Voici le résultat.",live:false}]);
+ expect(texts(items)).toMatchObject([{text:"Je vérifie.",live:false},{text:"Voici le résultat.",live:false}]);
  expect(buildTranscript([ev("assistant_message",{content:status,success:false})])[0].kind).toBe("error");
 });
 
