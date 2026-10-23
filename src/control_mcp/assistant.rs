@@ -2624,10 +2624,40 @@ impl AssistantMcp {
             let text = response.text().await.unwrap_or_default();
             return Err(format!("Failed to send message: {text}"));
         }
-        response
+        let mut receipt: Value = response
             .json()
             .await
-            .map_err(|error| format!("Failed to parse send result: {error}"))
+            .map_err(|error| format!("Failed to parse send result: {error}"))?;
+        self.deliver_queued_now(&mut receipt).await;
+        Ok(receipt)
+    }
+
+    /// A follow-up queued behind a running turn waits for that turn to end,
+    /// which for a Codex goal can be hours. Ask Core to hand it to the running
+    /// turn now, as the desktop does for the user's own messages. Core leaves
+    /// the message queued in place when no live turn can take it.
+    async fn deliver_queued_now(&self, receipt: &mut Value) {
+        if receipt.get("queued").and_then(Value::as_bool) != Some(true) {
+            return;
+        }
+        let Some(id) = receipt.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            return;
+        };
+        let delivered = match self
+            .api_post(&format!("/api/control/queue/{id}/send-now"), json!({}))
+            .await
+        {
+            Ok(response) if response.status().is_success() => response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|value| value.get("delivered").and_then(Value::as_bool))
+                .unwrap_or(false),
+            _ => false,
+        };
+        if let Some(receipt) = receipt.as_object_mut() {
+            receipt.insert("delivered_now".into(), json!(delivered));
+        }
     }
 
     async fn ask_mission(&self, params: AskMissionParams) -> Result<Value, String> {
@@ -4908,7 +4938,9 @@ mod tests {
                 );
             }
         }
-        let value = if path == "/api/control/missions" {
+        let value = if path.ends_with("/send-now") {
+            json!({"ok": true, "delivered": true})
+        } else if path == "/api/control/missions" {
             json!([state.mission.clone()])
         } else if path.ends_with("/events") || path.ends_with("/running") {
             json!([])
@@ -4969,11 +5001,37 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result, reply);
+        let mut expected = reply.clone();
+        expected["delivered_now"] = json!(true);
+        assert_eq!(result, expected);
         let requests = state.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].0, "/api/control/message");
         assert_eq!(requests[0].1["mission_id"], mission_id);
+        // A queued follow-up is handed to the running turn right away.
+        assert_eq!(
+            requests[1].0,
+            format!(
+                "/api/control/queue/{}/send-now",
+                reply["id"].as_str().unwrap()
+            )
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_message_started_at_once_needs_no_send_now() {
+        let mission_id = Uuid::new_v4().to_string();
+        let reply = json!({"id": Uuid::new_v4(), "mission_id": mission_id, "queued": false});
+        let (mcp, state, server) = mock_assistant(reply.clone(), false).await;
+        let result = mcp
+            .send_message(
+                parse_params(json!({"mission_id": mission_id, "content": "Start"})).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, reply);
+        assert_eq!(state.requests.lock().unwrap().len(), 1);
         server.abort();
     }
 

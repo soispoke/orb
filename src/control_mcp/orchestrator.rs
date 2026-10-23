@@ -1398,10 +1398,37 @@ impl OrchestratorMcp {
             return Err(format!("Failed to send message: {}", text));
         }
 
-        let result: Value = response
+        let mut result: Value = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // A follow-up queued behind a running turn waits for that turn to end,
+        // which for a Codex goal can be hours. Hand it to the running turn now,
+        // as the desktop does for the user's own messages; Core leaves it
+        // queued in place when no live turn can take it.
+        if result.get("queued").and_then(Value::as_bool) == Some(true) {
+            if let Some(queued_id) = result.get("id").and_then(Value::as_str).map(str::to_owned) {
+                let delivered = match self
+                    .api_post(
+                        &format!("/api/control/queue/{queued_id}/send-now"),
+                        json!({}),
+                    )
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .and_then(|value| value.get("delivered").and_then(Value::as_bool))
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if let Some(result) = result.as_object_mut() {
+                    result.insert("delivered_now".into(), json!(delivered));
+                }
+            }
+        }
 
         Ok(result)
     }
