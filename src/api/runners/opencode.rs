@@ -402,7 +402,7 @@ pub async fn run_opencode_turn(
     // argument splitting issues when multi-line messages go through
     // systemd-nspawn or nsenter shell wrappers.
     let prompt_file_host = work_dir.join(".sandboxed-sh-prompt.txt");
-    if let Err(e) = std::fs::write(&prompt_file_host, message) {
+    if let Err(e) = std::fs::write(&prompt_file_host, opencode_prompt_text(message)) {
         let err_msg = format!("Failed to write prompt file: {}", e);
         tracing::error!("{}", err_msg);
         return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
@@ -847,7 +847,9 @@ pub async fn run_opencode_turn(
     let mut final_result = String::new();
     let mut had_error = false;
     let mut final_result_from_nonzero_exit = false;
-    let mut tool_call_step_count: u32 = 0;
+    let mut silent_tool_call_steps: u32 = 0;
+    let mut tool_call_steps: u32 = 0;
+    let mut silent_step_limit_hit = false;
     let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stderr_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let stderr_recent_lines: Arc<Mutex<VecDeque<String>>> =
@@ -1559,6 +1561,10 @@ pub async fn run_opencode_turn(
                                         let clean_text = clean_text.trim();
                                         if !clean_text.is_empty() {
                                             final_result = clean_text.to_string();
+                                            // The runaway guard below counts only
+                                            // tool steps taken without telling the user
+                                            // anything.
+                                            silent_tool_call_steps = 0;
                                             let _ = text_output_tx.send(true);
                                             sse_emitted_text.store(
                                                 true,
@@ -1581,7 +1587,7 @@ pub async fn run_opencode_turn(
                                 tracing::info!(
                                     mission_id = %mission_id,
                                     reason = %reason,
-                                    tool_call_steps = tool_call_step_count,
+                                    silent_tool_call_steps,
                                     "OpenCode JSON step_finish event"
                                 );
                                 // Match the shared SSE parser: an empty reason
@@ -1591,15 +1597,25 @@ pub async fn run_opencode_turn(
                                 if reason == "stop" || reason.is_empty() {
                                     let _ = sse_complete_tx.send(true);
                                 } else {
-                                    // Track consecutive tool-call steps to detect runaway loops
-                                    tool_call_step_count += 1;
-                                    const MAX_TOOL_CALL_STEPS: u32 = 40;
-                                    if tool_call_step_count >= MAX_TOOL_CALL_STEPS {
+                                    // Track tool-call steps taken without any text to
+                                    // detect runaway loops. Long autonomous turns that
+                                    // keep the user informed are not loops.
+                                    silent_tool_call_steps += 1;
+                                    tool_call_steps += 1;
+                                    if tool_call_steps >= MAX_TOOL_CALL_STEPS {
                                         tracing::warn!(
                                             mission_id = %mission_id,
-                                            steps = tool_call_step_count,
+                                            steps = tool_call_steps,
                                             "OpenCode tool-call step limit reached, forcing completion"
                                         );
+                                        let _ = sse_complete_tx.send(true);
+                                    } else if silent_tool_call_steps >= MAX_SILENT_TOOL_CALL_STEPS {
+                                        tracing::warn!(
+                                            mission_id = %mission_id,
+                                            steps = silent_tool_call_steps,
+                                            "OpenCode silent tool-call step limit reached, forcing completion"
+                                        );
+                                        silent_step_limit_hit = true;
                                         let _ = sse_complete_tx.send(true);
                                     }
                                 }
@@ -2127,8 +2143,11 @@ pub async fn run_opencode_turn(
     // sending runner logs as model response (fixes #151).
     if !had_error && opencode_output_needs_fallback(&final_result) {
         had_error = true;
-        final_result =
-            "OpenCode produced no assistant output (only runner status lines or empty). The model may not have responded.".to_string();
+        final_result = if silent_step_limit_hit {
+            silent_step_limit_message()
+        } else {
+            "OpenCode produced no assistant output (only runner status lines or empty). The model may not have responded.".to_string()
+        };
     }
 
     // Detect tool-call-only output: the model emitted tool calls but never
@@ -2269,6 +2288,30 @@ pub async fn run_opencode_turn(
     let _ = std::fs::remove_file(&prompt_file_host);
 
     result
+}
+
+/// Tool-call steps a turn may take in a row without writing any text before
+/// the runner treats it as a runaway loop and ends the turn.
+const MAX_SILENT_TOOL_CALL_STEPS: u32 = 200;
+
+/// Backstop for a turn that narrates but never stops: no turn takes more tool
+/// steps than this (long Codex turns run a few hundred commands).
+const MAX_TOOL_CALL_STEPS: u32 = 1000;
+
+/// Codex and Claude Code tell their models to narrate their work; OpenCode's
+/// own prompt asks for terse output, so some models (Gemini) work through a
+/// whole turn without a word. Appended to every message the CLI receives; the
+/// stored mission history and goal objective keep the original text.
+const PROGRESS_UPDATES_NOTE: &str = "\n\n<orb-progress-updates>\nKeep the user informed while you work: before each group of tool calls, write one short sentence saying what you are about to do and why, and when you learn something important, say it in one line. Keep these updates brief and keep working after them; they are not a reason to end your turn.\n</orb-progress-updates>";
+
+fn opencode_prompt_text(message: &str) -> String {
+    format!("{message}{PROGRESS_UPDATES_NOTE}")
+}
+
+fn silent_step_limit_message() -> String {
+    format!(
+        "The model made {MAX_SILENT_TOOL_CALL_STEPS} tool calls in a row without writing anything, so Orb ended the turn as a possible runaway loop. Its work so far is kept; resume or send a follow-up to continue."
+    )
 }
 
 /// OpenCode treats the first path segment as its provider id and sends only
@@ -2649,5 +2692,29 @@ mod path_tests {
         assert!(linux_pid_is_alive(pid));
         assert!(!linux_pid_is_alive(u32::MAX - 1));
         let _ = linux_pid_has_children(pid);
+    }
+
+    #[test]
+    fn prompt_keeps_the_message_first_and_asks_for_progress_updates() {
+        let message = "/goal Improve the pipeline\n\nRead state.json first.";
+        let prompt = super::opencode_prompt_text(message);
+        assert!(prompt.starts_with(message));
+        assert_eq!(prompt.matches("<orb-progress-updates>").count(), 1);
+        assert!(prompt.contains("before each group of tool calls"));
+        // The goal objective is parsed from the original message, which the
+        // note never changes.
+        assert_eq!(
+            super::parse_opencode_goal_objective(message).as_deref(),
+            Some("Improve the pipeline\n\nRead state.json first.")
+        );
+    }
+
+    #[test]
+    fn silent_step_limit_is_generous_and_explained() {
+        assert!(super::MAX_SILENT_TOOL_CALL_STEPS >= 200);
+        assert!(super::MAX_TOOL_CALL_STEPS > super::MAX_SILENT_TOOL_CALL_STEPS);
+        let message = super::silent_step_limit_message();
+        assert!(message.contains(&super::MAX_SILENT_TOOL_CALL_STEPS.to_string()));
+        assert!(!super::opencode_output_needs_fallback(&message));
     }
 }
