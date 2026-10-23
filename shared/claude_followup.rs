@@ -1,7 +1,7 @@
 //! Shared follow-up policy and consumption tracking for Core and desktop Claude.
 use std::collections::HashMap;
 
-pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read and address it at the next tool boundary. Answer direct questions in this chat before continuing unrelated edits or waits. Automatic reminders and worker notices do not take precedence over an unanswered user question. A status question does not cancel the ongoing objective: answer briefly, then continue authorized work. Preserve existing agents and builds. For long jobs, use the native background-task mechanism and completion notifications; do not block the conversation with foreground sleep/poll loops waiting on a background job. Do not restart, duplicate, or stop a job merely to answer a question. When a background notification (an interim agent notice, a monitor tick) changes nothing the user needs to know, end the turn without writing any text: no \"still waiting\" updates. Do not leave monitors running that only report progress.";
+pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read and address it at the next tool boundary. Answer direct questions in this chat before continuing unrelated edits or waits. In a turn that starts from or receives a user message, your last visible text must directly answer that message (for a status or ETA question: what is done, what is running, what comes next and when), not only report the last action you took; the user cannot see your thinking, so an answer given only there is lost.Automatic reminders and worker notices do not take precedence over an unanswered user question. A status question does not cancel the ongoing objective: answer briefly, then continue authorized work. Preserve existing agents and builds. For long jobs, use the native background-task mechanism and completion notifications; do not block the conversation with foreground sleep/poll loops waiting on a background job. Do not restart, duplicate, or stop a job merely to answer a question. When a background notification (an interim agent notice, a monitor tick) changes nothing the user needs to know, end the turn without writing any text: no \"still waiting\" updates. Do not leave monitors running that only report progress.";
 
 /// A message typed while Claude works arrives between tool calls. A terse
 /// "eta" or "status" there reads as background unless it is marked as a
@@ -79,6 +79,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_user_turn_ends_with_a_visible_answer_but_ticks_stay_silent() {
+        assert!(INSTRUCTIONS.contains("your last visible text must directly answer that message"));
+        assert!(INSTRUCTIONS.contains("cannot see your thinking"));
+        // The rule is scoped to user messages, so a background tick does not
+        // make Claude repeat its last answer.
+        assert!(INSTRUCTIONS.contains("starts from or receives a user message"));
+        assert!(INSTRUCTIONS.contains("end the turn without writing any text"));
+    }
+
+    #[test]
     fn midturn_messages_keep_the_user_text_and_ask_for_a_reply() {
         let text = midturn_text("eta");
         assert!(text.starts_with("eta\n\n<system-reminder>"));
@@ -92,7 +102,9 @@ mod tests {
         assert_eq!(waiting.tool_result(), None, "nothing was asked");
         waiting.asked("status");
         assert_eq!(waiting.tool_result(), None);
-        let nudge = waiting.tool_result().expect("reminder after two tool results");
+        let nudge = waiting
+            .tool_result()
+            .expect("reminder after two tool results");
         assert!(nudge.contains("\"status\""));
         assert_eq!(waiting.tool_result(), None, "only one reminder");
         assert_eq!(waiting.tool_result(), None);
