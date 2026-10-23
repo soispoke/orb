@@ -311,7 +311,8 @@ async fn send_message_streaming_app_server(
     // Commands a previous turn started but never finished (a Core restart or a
     // crash cut them off) have no known outcome. They are never replayed: the
     // next turn tells the agent which ones, and only after that turn starts are
-    // they settled. A goal objective cannot carry that note, so it still stops.
+    // they settled. A goal's turn gets the note as a steer, since its objective
+    // must stay unchanged.
     let unresolved = match &native_lease {
         Some(lease) => {
             let journal = ToolCallJournal::at(lease.journal_path());
@@ -320,17 +321,6 @@ async fn send_message_streaming_app_server(
         }
         None => None,
     };
-    if unresolved.is_some()
-        && parse_goal_prefix(
-            cfg.continuity
-                .as_ref()
-                .map(|c| c.current_message.as_str())
-                .unwrap_or(message),
-        )
-        .0
-    {
-        return Err(anyhow::anyhow!("codex_continuity_unresolved_tools: previous tool outcome needs reconciliation; no command was replayed"));
-    }
     let session_arc = AppServerSession::spawn(app_cfg, &session.directory, workspace_exec).await?;
     let session_arc = Arc::new(session_arc);
 
@@ -629,6 +619,12 @@ async fn send_message_streaming_app_server(
             journal.settle_completed_turn().await?;
         } }
 
+        if is_goal_mission {
+            if let Some((journal, pending)) = &unresolved {
+                pending_steer = Some(with_reconciliation_note(pending_steer.as_deref().unwrap_or(""), Some(pending)));
+                journal.settle_completed_turn().await?;
+            }
+        }
         let initial_objective = if is_goal_mission {
             existing_objective.unwrap_or_else(|| user_payload.clone())
         } else {
@@ -1497,7 +1493,8 @@ fn with_reconciliation_note(text: &str, unresolved: Option<&[PendingToolCall]>) 
         return text.to_owned();
     };
     let mut note = format!(
-        "{text}\n\nContinuity reconciliation: your previous turn was cut off (a Core restart or crash) while these commands were running, so their outcome is unknown and none was run again:"
+        "{}Continuity reconciliation: your previous turn was cut off (a Core restart or crash) while these commands were running, so their outcome is unknown and none was run again:",
+        if text.is_empty() { String::new() } else { format!("{text}\n\n") }
     );
     for call in calls {
         let command = call.start_payload["command"]

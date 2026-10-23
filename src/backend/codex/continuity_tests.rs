@@ -455,6 +455,25 @@ async fn codex_continuity_unresolved_tool_is_named_to_the_next_turn_and_never_re
 }
 
 #[tokio::test]
+async fn codex_continuity_goal_resume_names_an_interrupted_command_in_a_steer() {
+    let mut f = Fixture::new();
+    f.run("crash-tool", "/goal synthetic objective").await;
+    let journal = ToolCallJournal::at(f.config.path.with_extension("tools.json"));
+    assert_eq!(journal.pending().await.unwrap().len(), 1);
+    // Resuming the same goal keeps its objective and tells its first turn
+    // which command was cut off, instead of refusing the resume.
+    f.config.current_message = "/goal synthetic objective".into();
+    f.run("hint", "/goal synthetic objective").await;
+    let hints = f.state()["hints"].clone();
+    let hint = hints[0].as_str().unwrap();
+    assert!(hint.starts_with("Continuity reconciliation: "), "{hint}");
+    assert!(hint.contains("synthetic-do-once"), "{hint}");
+    assert_eq!(f.state()["goal"]["objective"], "synthetic objective");
+    assert!(journal.pending().await.unwrap().is_empty());
+    assert!(f.requests("turn/start").is_empty());
+}
+
+#[tokio::test]
 async fn codex_continuity_creation_ambiguity_identity_loss_and_double_attachment_refuse_fresh_thread(
 ) {
     let mut f = Fixture::new();
