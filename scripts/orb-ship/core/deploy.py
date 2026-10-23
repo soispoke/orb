@@ -29,7 +29,10 @@ if sys.argv[2] == 'strict':
 else:
     # Only Core-owned runs are recovered by Core; a desktop-owned run must stop on its computer.
     assert all(o.startswith('control:') for _, o in open_runs), 'A desktop-owned run is open'
-pending = c.execute("select count(*) from control_queue q, json_each(q.payload) j where q.id=1 and coalesce(json_extract(j.value,'$.inflight'),0)=0").fetchone()[0]
+# Watchdog notices are excluded: a mission whose native goal never ends its turn
+# holds them forever, Core re-drives them after the restart, and the watchdog
+# would resend them anyway.
+pending = c.execute("select count(*) from control_queue q, json_each(q.payload) j where q.id=1 and coalesce(json_extract(j.value,'$.inflight'),0)=0 and coalesce(json_extract(j.value,'$.source'),'') != 'idle-worker-watchdog'").fetchone()[0]
 assert not pending, 'A queued delivery is pending'
 assert c.execute("select count(*) from machine_transfers where phase not in ('activated','cancelled')").fetchone()[0] == 0, 'A machine transfer is in progress'
 record = {'live': live, 'missions': c.execute('select count(*) from missions').fetchone()[0],
