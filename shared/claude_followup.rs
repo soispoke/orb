@@ -6,7 +6,7 @@ pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read 
 /// Every mid-turn message follows the same native conversation path. Remind
 /// the coordinator to respond visibly, without classifying the user's wording.
 pub fn midturn_text(text: &str) -> String {
-    format!("{text}\n\n<system-reminder>The user sent this while you were working and is waiting for an answer. The user cannot see your thinking. Before your next tool call, answer it in plain visible text then continue the task.</system-reminder>")
+    format!("{text}\n\n<system-reminder>The user sent this while you were working and is waiting for an answer. The user cannot see your thinking. Before your next tool call, answer every question in this message in plain visible text, including questions alongside instructions, then continue the task. A plan or progress report alone does not answer those questions.</system-reminder>")
 }
 
 /// Tool results after a mid-turn message before Claude is reminded once more.
@@ -86,13 +86,16 @@ impl UnansweredMessage {
             message.tool_results += 1;
             if message.tool_results >= NUDGE_AFTER_TOOL_RESULTS {
                 message.reminded = true;
-                waiting.push(message.text.chars().take(200).collect::<String>());
+                // A display preview is not sufficient input: the question may
+                // follow a long quotation or instruction. Keep the complete
+                // message, including its trailing questions and constraints.
+                waiting.push(message.text.clone());
             }
         }
         if waiting.is_empty() {
             return None;
         }
-        Some(format!("<system-reminder>The user is still waiting for a visible reply to these messages: {}. They cannot see your thinking. Address their messages in plain visible text before unrelated tool calls, then continue the task.</system-reminder>",
+        Some(format!("<system-reminder>The user is still waiting for a visible reply to these messages: {}. They cannot see your thinking. Answer every question in these messages in plain visible text before unrelated tool calls, including questions alongside instructions. A plan or progress report alone does not answer those questions. Then continue the task.</system-reminder>",
             waiting.iter().map(|text| format!("\"{text}\"")).collect::<Vec<_>>().join("; ")))
     }
 }
@@ -160,6 +163,49 @@ mod tests {
         assert!(nudge.contains("\"status\""));
         assert_eq!(waiting.tool_result(), None, "only one reminder");
         assert_eq!(waiting.tool_result(), None);
+    }
+
+    #[test]
+    fn reminder_preserves_the_question_after_a_long_instruction() {
+        let question = "Can we iterate locally quickly and still validate the final judge build?";
+        let text = format!(
+            "Please implement the proposed change.\n\n{}\n\n{question}",
+            "Background and constraints for the change. ".repeat(30)
+        );
+        let mut waiting = UnansweredMessage::default();
+        waiting.asked("long-message", &text);
+        waiting.acknowledge("long-message");
+        waiting.response_started("after-input");
+        assert!(waiting.tool_result().is_none());
+        let reminder = waiting.tool_result().unwrap();
+        assert!(
+            reminder.contains(&text),
+            "preserve every part, not just a preview"
+        );
+        assert!(reminder.contains(question));
+        assert!(
+            waiting.tool_result().is_none(),
+            "do not repeat long reminders"
+        );
+    }
+
+    #[test]
+    fn reminder_preserves_all_pending_messages_including_unicode_and_newlines() {
+        let texts = [
+            format!("{}\nWhy?", "背景🙂 ".repeat(250)),
+            format!("{}\nAnd the tradeoff?", "More context. ".repeat(50)),
+        ];
+        let mut waiting = UnansweredMessage::default();
+        for (index, text) in texts.iter().enumerate() {
+            let id = index.to_string();
+            waiting.asked(&id, text);
+            waiting.acknowledge(&id);
+        }
+        waiting.tool_result();
+        let reminder = waiting.tool_result().unwrap();
+        for text in texts {
+            assert!(reminder.contains(&text));
+        }
     }
 
     #[test]
