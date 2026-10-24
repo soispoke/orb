@@ -2444,7 +2444,7 @@ pub fn run_claudecode_turn<'a>(
                         woke_itself = false;
                         last_wake_reply = None;
                         if pending_initial_prompt.is_none() {
-                            unanswered.asked(&content);
+                            unanswered.asked(&input_id, &content);
                         }
                         if parked {
                             parked = false;
@@ -2730,9 +2730,15 @@ pub fn run_claudecode_turn<'a>(
                             idle_deadline = next_idle_deadline!();
                             continue;
                         }
+                        if event["type"] == "stream_event" && event["event"]["type"] == "message_start" {
+                            if let Some(id) = event["event"]["message"]["id"].as_str() {
+                                unanswered.response_started(id);
+                            }
+                        }
                         if event["type"] == "user" {
                             if let Some(id) = event["uuid"].as_str() {
                                 pending_inputs.acknowledge(id);
+                                unanswered.acknowledge(id);
                             }
                         }
                     }

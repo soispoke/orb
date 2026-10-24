@@ -26,14 +26,15 @@ test("cumulative live text across tools renders once and preserves open tool det
  await expect(page.locator(".st-caret")).toHaveCount(0);
  await expect(page.locator(".st-work-body")).toBeVisible();await expect(page.locator(".st-tool-detail")).toBeVisible();
  await page.evaluate(()=> (window as any).transcriptHarness.apply({type:"assistant_message",data:{id:"final",content:"Fixed the guard."}}));
- await expect(page.locator(".st-text")).toHaveCount(1);await expect(page.locator(".st-caret")).toHaveCount(0);
+ await expect(page.locator(".st-text")).toHaveText(["Inspect file. Fix guard.", "Fixed the guard."]);await expect(page.locator(".st-caret")).toHaveCount(0);
  await expect(page.locator(".st-tool-detail")).toBeVisible();
  await page.evaluate(()=> (window as any).transcriptHarness.reset([
+  {type:"text_delta",data:{content:"Inspect file. Fix guard."}},
   {type:"tool_call",data:{tool_call_id:"a",name:"read",args:{path:"guard.ts"}}},
   {type:"tool_result",data:{tool_call_id:"a",result:"Complete"}},
   {type:"assistant_message",data:{id:"final",content:"Fixed the guard."}}
  ]));
- await expect(page.locator(".st-text")).toHaveCount(1);
+ await expect(page.locator(".st-text")).toHaveText(["Inspect file. Fix guard.", "Fixed the guard."]);
  await expect(page.locator(".st-work-body")).toBeVisible();await expect(page.locator(".st-tool-detail")).toBeVisible();
   await page.screenshot({path:"test-results/orb-stream-reconciled.png"});
 });
@@ -305,4 +306,69 @@ test('stored local final and native snapshot render once across completion, stee
  await show(next,'next-run',reply,[cut]);
  await expect(page.locator('.st-text')).toHaveCount(3);
  await expect(page.locator('.st-text table')).toHaveCount(2);
+});
+
+for (const harness of ['claude', 'codex', 'opencode', 'grok', 'antigravity']) {
+ test(`${harness}: a public reply stays in the main transcript across tool updates and replay`, async ({page}) => {
+  await page.goto('/tests/transcript.html');
+  await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+  const events:any[] = [
+   {type:'user_message',eventId:'followup',data:{id:'followup',content:'Explain the current state and remaining uncertainty.'}},
+   {type:'thinking',data:{content:'Reasoning about remaining work.',done:true}},
+   {type:'tool_call',data:{tool_call_id:'read',name:'Read',args:{path:'receipt.json'}}},
+   {type:'tool_result',data:{tool_call_id:'read',name:'Read',result:'running'}},
+   {type:'assistant_message',eventId:'visible-reply',data:{id:'visible-reply',...(['codex','antigravity'].includes(harness)?{canonical:true,bubble_id:`${harness}:session:message`,revision:1}:{}),content:'The check is running. The remaining duration is uncertain.'}},
+   {type:'tool_call',data:{tool_call_id:'next',name:'Bash',args:{command:'next step'}}},
+  ];
+  for(let pass=0;pass<2;pass++) {
+   if(pass){await page.reload();await page.waitForFunction(()=>!!(window as any).transcriptHarness);}
+   await page.evaluate(events => (window as any).transcriptHarness.reset(events),events);
+   const reply=page.locator('.st-text').filter({hasText:'The check is running.'});
+   await expect(reply).toBeVisible();
+   expect(await reply.evaluate(el=>!!el.closest('.st-work-body'))).toBe(false);
+   await page.evaluate(() => (window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'next',name:'Bash',result:'done'}}));
+   await expect(reply).toBeVisible();
+   const question=await page.locator('.user').filter({hasText:'Explain the current state'}).boundingBox();
+   const answer=await reply.boundingBox();
+   expect(answer!.y).toBeGreaterThan(question!.y);
+  }
+ });
+}
+
+test('finalizing a displayed thought does not collapse its text', async ({page}) => {
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(() => (window as any).transcriptHarness.reset([
+  {type:'user_message',data:{id:'question',content:'Explain the result.'}},
+  {type:'thinking',data:{content:'Examining the evidence.',done:false}},
+ ]));
+ const thought=page.locator('.st-think-body');
+ await expect(thought).toBeVisible();
+ await page.evaluate(() => (window as any).transcriptHarness.apply({type:'thinking',data:{content:'Examining the evidence.',done:true}}));
+ await expect(thought).toBeVisible();
+ await page.locator('.st-think-head').click();
+ await expect(thought).toBeHidden();
+});
+
+test('streamed reasoning remains visible through history and tool regrouping', async ({page}) => {
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(() => (window as any).transcriptHarness.reset([
+  {type:'thinking',data:{content:'First displayed thought.',done:false}},
+ ]));
+ await expect(page.locator('.st-think-body').filter({hasText:'First displayed thought.'})).toBeVisible();
+ await page.evaluate(() => {
+  const h=(window as any).transcriptHarness;
+  h.apply({type:'thinking',data:{content:'First displayed thought.',done:true}});
+  h.apply({type:'thinking',data:{content:'Next displayed thought.',done:false}});
+ });
+ await expect(page.locator('.st-think-body').filter({hasText:'First displayed thought.'})).toBeVisible();
+ await expect(page.locator('.st-think-body').filter({hasText:'Next displayed thought.'})).toBeVisible();
+ await page.evaluate(() => (window as any).transcriptHarness.apply({type:'tool_call',data:{tool_call_id:'check',name:'Read',args:{path:'receipt'}}}));
+ await expect(page.locator('.st-work-body .st-think-body').filter({hasText:'First displayed thought.'})).toBeVisible();
+ await expect(page.locator('.st-work-body .st-think-body').filter({hasText:'Next displayed thought.'})).toBeVisible();
+ await expect(page.locator('.st-tool-name')).toHaveText('Read');
+ await page.locator('.st-work-head').click();
+ await page.evaluate(() => (window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'check',result:'checked'}}));
+ await expect(page.locator('.st-think-body')).toHaveCount(0);
 });

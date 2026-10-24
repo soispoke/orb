@@ -155,3 +155,28 @@ Delivered input freezes the already visible part of a cumulative answer; new
 text renders below that input using the producer's original Unicode offsets.
 This does not close running tools or change agent execution. Queued-only input
 is not a delivered turn boundary. Chromium/WebKit regressions cover both.
+
+## Follow-up response boundaries and stable disclosure
+
+Claude follow-ups retain their individual native input IDs. Only the matching
+coordinator input echo marks one consumed. Visible output from a response that
+started before consumption cannot retire that input, even if the response
+finishes afterward. Replayed response starts do not change that boundary.
+Child-model output and child tool results cannot acknowledge coordinator input.
+Multiple follow-ups retain independent, bounded reminder budgets; no question
+keywords select a different assistant, model, or conversation.
+
+This tracks consumption and subsequent visible output, not whether arbitrary
+prose actually answers a question. Thinking is never promoted to a public
+answer. The shared policy requests a visible reply before unrelated work;
+model compliance still requires live evaluation. These runner changes take
+effect in a new Core process or safely replaced desktop worker, not inside an
+already-running harness.
+
+The transcript preserves a displayed thought through completion and regrouping
+with later thoughts or tools. Manual collapses remain authoritative. Historical
+thoughts initially load collapsed, and reasoning inside work details is labelled
+Thinking. Public assistant text stays outside work details. Browser regressions
+exercise completion, grouping, manual collapse, turn order and replay in
+Chromium and WebKit. Synthetic harness event cases validate renderer contracts;
+they are not evidence that every live provider answers follow-ups correctly.

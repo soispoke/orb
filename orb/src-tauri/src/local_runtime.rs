@@ -732,6 +732,17 @@ printf '%s\n' '{"type":"result"}'
         assert_eq!(unsafe { libc::kill(agent, 0) }, 0);
         assert_eq!(unsafe { libc::kill(build, 0) }, 0);
         assert_eq!(unsafe { libc::kill(build, libc::SIGSTOP) }, 0);
+        let stopped = || {
+            let state = Command::new("ps")
+                .args(["-o", "stat=", "-p", &build.to_string()])
+                .output()
+                .unwrap();
+            assert!(state.status.success(), "cannot inspect fixture build state");
+            String::from_utf8_lossy(&state.stdout).contains('T')
+        };
+        // Signal delivery is asynchronous. Establish the pause before testing
+        // that reconnect preserves it, rather than racing the kernel here.
+        wait_for(stopped);
         let get = |method: &str, args| request(connect_at(&root).unwrap(), method, args).unwrap();
         let mut question = Value::Null;
         wait_for(|| {
@@ -762,12 +773,8 @@ printf '%s\n' '{"type":"result"}'
             .unwrap()
             .contains("Before reconnect"));
         while receive(&mut stream).unwrap().get("result").is_none() {}
-        let state = Command::new("ps")
-            .args(["-o", "stat=", "-p", &build.to_string()])
-            .output()
-            .unwrap();
         assert!(
-            String::from_utf8_lossy(&state.stdout).contains('T'),
+            stopped(),
             "reconnect must not resume a memory-paused build"
         );
         assert_eq!(unsafe { libc::kill(build, libc::SIGCONT) }, 0);

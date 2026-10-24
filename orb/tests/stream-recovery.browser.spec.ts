@@ -26,7 +26,10 @@ test('legacy stream corruption cannot repeat paragraphs or remove initial charac
   h.send('assistant_message',{id:'final',content:'Final answer.',success:true});
  });
  await expect(page.getByText('Final answer.',{exact:true})).toBeVisible();
- await expect(page.getByText(/I prepared the coverage/)).toHaveCount(0);
+ // A distinct final answer does not retract the earlier progress paragraph.
+ await expect(page.getByText('I prepared the coverage update.',{exact:true})).toHaveCount(1);
+ await expect(page.locator('.st-text')).toHaveCount(2);
+ await expect(page.locator('.st-text').last()).toHaveText('Final answer.');
 });
 
 test('independently identified native text bubbles still stream without a history round trip',async({page})=>{

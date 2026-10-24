@@ -408,8 +408,14 @@ function ToolRow(p: { item: Extract<StreamItem, { kind: "tool" }> }) {
 }
 
 export function ThinkBlock(p: { item: Extract<StreamItem, { kind: "think" }> }) {
-  const [open, setOpen, isExplicit] = disclosure(`think:${p.item.key}`, !p.item.done);
-  const shown = () => isExplicit() ? open() : !p.item.done;
+  // Completion is not a user collapse. Preserve the initial open state across
+  // token updates, finalization and row recycling so text does not disappear
+  // while it is being read.
+  const key = `think:${p.item.key}`;
+  const state = useContext(DisclosureState);
+  if (state && !state.has(key)) state.set(key, !p.item.done);
+  const [open, setOpen] = disclosure(key, !p.item.done);
+  const shown = open;
   return (
     <div class={`st-think ${shown() ? "open" : ""}`}>
       <button class="st-think-head" aria-expanded={shown()} onClick={() => setOpen(!shown())}>
@@ -456,7 +462,13 @@ function groupWork(input: StreamItem[], previous: Grouped[] = []): Grouped[] {
 
 function WorkFold(p: { items: WorkItem[] }) {
   const running = createMemo(() => p.items.some((t) => (t.kind === "tool" ? !t.done : !t.done)));
-  const [open, setOpen] = disclosure(`work:${p.items[0]?.key}`,false);
+  const state = useContext(DisclosureState);
+  const key = `work:${p.items[0]?.key}`;
+  // When an already displayed thought gains a tool, do not hide the thought
+  // merely because its container changes from ThoughtSequence to WorkFold.
+  const initial = p.items.some(item => item.kind === "think" && state?.get(`think:${item.key}`) === true);
+  if (state && !state.has(key)) state.set(key, initial);
+  const [open, setOpen] = disclosure(key, initial);
   const anchored=anchoredDisclosure();
   let toggle!:HTMLButtonElement;
   const current = () => {
@@ -495,7 +507,7 @@ function WorkFold(p: { items: WorkItem[] }) {
         <div class="st-work-body">
           <For each={p.items}>
             {(t) => (t.kind === "tool" ? <ToolRow item={t} /> : (
-              <Show when={t.text}><div class="st-think-body">{thinkInline(t.text)}</div></Show>
+              <Show when={t.text}><div class="st-think-entry" role="note" aria-label="Thinking"><span class="dim">Thinking</span><div class="st-think-body">{thinkInline(t.text)}</div></div></Show>
             ))}
           </For>
         </div>
@@ -507,7 +519,12 @@ function WorkFold(p: { items: WorkItem[] }) {
 }
 
 function ThinkFold(p: { items: Array<Extract<StreamItem, { kind: "think" }>> }) {
-  const [open, setOpen] = disclosure(`think-fold:${p.items[0]?.key}`, false);
+  const state = useContext(DisclosureState);
+  const key = `think-fold:${p.items[0]?.key}`;
+  // Moving a displayed thought into the history fold must not collapse it.
+  const initial = p.items.some(item => state?.get(`think:${item.key}`) === true);
+  if (state && !state.has(key)) state.set(key, initial);
+  const [open, setOpen] = disclosure(key, initial);
   const anchored = anchoredDisclosure();
   let toggle!: HTMLButtonElement;
   const label = () => `${p.items.length} ${p.items.length === 1 ? "thought" : "thoughts"}`;
@@ -535,7 +552,7 @@ export function ThoughtSequence(p: { items: Array<Extract<StreamItem, { kind: "t
       <Show when={folded().length}>
         <ThinkFold items={folded()} />
       </Show>
-      <Show when={latest()}>{(t) => <ThinkBlock item={t()} />}</Show>
+      <Show when={latest()} keyed>{(t) => <ThinkBlock item={t} />}</Show>
     </>
   );
 }
@@ -627,14 +644,9 @@ export function Transcript(p: { prepareSearch?:(signal:AbortSignal)=>Promise<voi
         {(item) => {
           switch (item.kind) {
             case "work":
-              if (!item.items.some((t) => t.kind === "tool")) {
-                return (
-                  <ThoughtSequence
-                    items={item.items.filter((t): t is Extract<StreamItem, { kind: "think" }> => t.kind === "think")}
-                  />
-                );
-              }
-              return <WorkFold items={item.items} />;
+              return <Show when={item.items.some((t) => t.kind === "tool")} fallback={
+                <ThoughtSequence items={item.items.filter((t): t is Extract<StreamItem, { kind: "think" }> => t.kind === "think")} />
+              }><WorkFold items={item.items} /></Show>;
             case "user":
               // Only the turn still waiting for a reply animates: once anything
               // has been said or done after it, the work is visible on its own.

@@ -116,14 +116,14 @@ it("shows one card when a harness failure is followed by the node's generic stat
   expect(errors[0].kind === "error" && errors[0].text).toContain("Argument list too long");
 });
 
-it("collapses cancellation acknowledgements live and on replay without reporting failure", () => {
+it("keeps cancellation acknowledgements out of the transcript while preserving the final cancellation", () => {
   const request: StreamEvent = {type:"error",data:{message:"Parallel mission e0770656-1358-4fd9-b745-fdc9dd33d08a cancellation requested"}};
   const events = [resume("cancel-test"), request, request, request];
   const pending = buildTranscript(events);
   const view = render(() => <Transcript items={pending} />);
-  expect(view.container.textContent).toContain("Stopping mission");
+  expect(view.container.textContent).not.toContain("Stopping mission");
   expect(view.container.textContent).not.toContain("Mission failed");
-  expect(pending.filter(item => item.kind === "error")).toHaveLength(1);
+  expect(pending.filter(item => item.kind === "error")).toHaveLength(0);
   const final = applyStreamEvent(pending, cancelled(100));
   expect(final).toEqual(buildTranscript([...events, cancelled(100)]));
   const errors = final.filter(item => item.kind === "error");

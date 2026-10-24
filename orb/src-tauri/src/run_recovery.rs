@@ -440,7 +440,8 @@ mod protocol_tests {
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let mut requests = vec![];
-            for (index, (status, body)) in responses.into_iter().enumerate() {
+            let mut responses = responses.into_iter().enumerate().peekable();
+            while responses.peek().is_some() {
                 let Ok((mut socket, _)) = listener.accept() else {
                     break;
                 };
@@ -468,6 +469,17 @@ mod protocol_tests {
                 if socket.read_exact(&mut payload).is_err() {
                     break;
                 }
+                // Observation publication is independent of the launch receipt
+                // protocol and can race MCP preflight. Route it separately so
+                // it cannot consume the next scripted ownership response.
+                let mut request_line = headers.lines().next().unwrap_or("").split_whitespace();
+                if request_line.next() == Some("POST")
+                    && request_line.next().is_some_and(|path| path.ends_with("/agent-observation"))
+                {
+                    write!(socket, "HTTP/1.1 200 Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+                    continue;
+                }
+                let (index, (status, body)) = responses.next().unwrap();
                 requests.push(if payload.is_empty() {
                     Value::Null
                 } else {

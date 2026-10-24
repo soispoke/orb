@@ -32,7 +32,7 @@ describe("thinking fold", () => {
     expect(container.querySelector(".st-tool-name")?.textContent).toBe("read");
   });
 
-  it("auto-collapses completed standalone thoughts and formats inline code and bold when expanded", () => {
+  it("starts historical thoughts collapsed and formats inline code and bold when expanded", () => {
     const items = buildTranscript([
       ev("thinking", { content: "Checking `src/styles.css` and **MissionDock**.", done: true }),
     ]);
@@ -186,4 +186,66 @@ it('separates adjacent bold summary headings without changing source text',()=>{
  const {container}=render(()=><Transcript items={items}/>);
  expect(container.querySelector('.st-think-body')?.textContent).toBe('Checking the parser\n\nChecking the compiler\n\nPreserving evidence');
  expect(items[0]).toMatchObject({text:source});
+});
+
+
+it("keeps a displayed thought open when it finishes and preserves manual collapse", async () => {
+  const { createSignal } = await import("solid-js");
+  const [items, setItems] = createSignal(buildTranscript([
+    ev("thinking", { content: "Checking the estimate.", done: false }),
+  ]));
+  const { container } = render(() => <Transcript items={items()} />);
+  expect(container.querySelector(".st-think-body")?.textContent).toBe("Checking the estimate.");
+  setItems(current => current.map(item => item.kind === "think" ? {...item, done: true} : item));
+  expect(container.querySelector(".st-think-body")?.textContent).toBe("Checking the estimate.");
+  container.querySelector<HTMLButtonElement>(".st-think-head")!.click();
+  setItems(current => current.map(item => item.kind === "think" ? {...item, text: "Final estimate reasoning."} : item));
+  expect(container.querySelector(".st-think-body")).toBeNull();
+});
+
+it("labels tool-fold reasoning as thinking and keeps actual answers outside it", () => {
+  const items = buildTranscript([
+    ev("user_message", {id: "question", content: "When will the review finish?"}),
+    ev("thinking", {content: "I estimate thirty minutes.", done: true}),
+    ev("tool_call", {tool_call_id: "check", name: "Bash", args: {command: "check"}}),
+    ev("tool_result", {tool_call_id: "check", name: "Bash", result: "running"}),
+    ev("assistant_message", {id: "answer", content: "The review is running; about thirty minutes remain."}),
+    ev("tool_call", {tool_call_id: "next", name: "Bash", args: {command: "continue"}}),
+  ]);
+  const { container } = render(() => <Transcript items={items} />);
+  const answer = container.querySelector(".st-text")!;
+  expect(answer.textContent).toContain("about thirty minutes remain");
+  expect(answer.closest(".st-work-body")).toBeNull();
+  container.querySelector<HTMLButtonElement>(".st-work-head")!.click();
+  expect(container.querySelector('[role="note"][aria-label="Thinking"]')?.textContent).toContain("I estimate thirty minutes.");
+});
+
+
+it("retains visible reasoning when the first tool joins its work group", async () => {
+  const { createSignal } = await import("solid-js");
+  const [items, setItems] = createSignal(buildTranscript([
+    ev("thinking", {content:"Inspecting the result.", done:false}),
+  ]));
+  const {container} = render(() => <Transcript items={items()} />);
+  expect(container.querySelector(".st-think-body")?.textContent).toBe("Inspecting the result.");
+  setItems(current => [...current.map(item => item.kind === "think" ? {...item, done:true} : item),
+    {kind:"tool",key:"tool:check",callId:"check",name:"Read",args:{path:"receipt"},done:false}]);
+  expect(container.querySelector(".st-work-body .st-think-body")?.textContent).toBe("Inspecting the result.");
+  expect(container.querySelector(".st-tool-name")?.textContent).toBe("Read");
+});
+
+it("keeps displayed thoughts visible when the next thought starts and respects manual history collapse", async () => {
+  const { createSignal } = await import("solid-js");
+  const [items, setItems] = createSignal(buildTranscript([
+    ev("thinking", {content:"First live thought.", done:false}),
+  ]));
+  const {container} = render(() => <Transcript items={items()} />);
+  setItems(current => [...current.map(item => item.kind === "think" ? {...item, done:true} : item),
+    {kind:"think",key:"second",text:"Second live thought.",done:false}]);
+  expect([...container.querySelectorAll(".st-think-body")].map(el => el.textContent)).toEqual(["First live thought.", "Second live thought."]);
+  container.querySelector<HTMLButtonElement>(".st-think-fold .st-work-head")!.click();
+  setItems(current => [...current.map(item => item.kind === "think" ? {...item, done:true} : item),
+    {kind:"think",key:"third",text:"Third live thought.",done:false}]);
+  expect([...container.querySelectorAll(".st-think-body")].map(el => el.textContent)).toEqual(["Third live thought."]);
+  expect(container.querySelector(".st-think-fold .st-work-head")?.getAttribute("aria-expanded")).toBe("false");
 });

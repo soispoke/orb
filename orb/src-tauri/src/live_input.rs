@@ -196,7 +196,7 @@ impl ClaudeInput {
                 return Err("Claude finished before steering; message remains queued".into());
             }
             s.pending.insert(id);
-            s.unanswered.asked(text);
+            s.unanswered.asked(id, text);
             // A write error can be partial: keep the pending record and never replay it.
             writer.line(json!({"type":"user","uuid":id,"message":{"role":"user","content":claude_followup::midturn_text(&text)}}))
         })
@@ -206,9 +206,15 @@ impl ClaudeInput {
             return;
         }
         let mut s = self.state.lock().unwrap();
+        if event["type"] == "stream_event" && event["event"]["type"] == "message_start" {
+            if let Some(id) = event["event"]["message"]["id"].as_str() {
+                s.unanswered.response_started(id);
+            }
+        }
         if event["type"] == "user" {
             if let Some(id) = event["uuid"].as_str() {
                 s.pending.acknowledge(id);
+                s.unanswered.acknowledge(id);
             }
         }
         let blocks = event["message"]["content"].as_array().map(Vec::as_slice).unwrap_or_default();
@@ -290,6 +296,7 @@ mod tests {
         let input = Arc::new(ClaudeInput::default());
         let send = input.sender(SharedWriter::new(Wire(tx)));
         send("q", "status").unwrap();
+        input.consume(&json!({"type":"user","uuid":"q"}));
         assert!(rx.recv().unwrap()["message"]["content"].as_str().unwrap().starts_with("status"));
         let tool_result = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}});
         input.consume(&json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":"status: all fine"}]}}));
@@ -327,11 +334,44 @@ mod tests {
         let input = Arc::new(ClaudeInput::default());
         let send = input.sender(SharedWriter::new(Wire(tx)));
         send("q", "eta").unwrap();
+        input.consume(&json!({"type":"user","uuid":"q"}));
         rx.recv().unwrap();
         input.consume(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"About ten minutes."}]}}));
         let tool_result = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}});
         for _ in 0..4 { input.consume(&tool_result); }
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn claude_old_response_and_child_output_do_not_retire_a_new_message() {
+        struct Wire(mpsc::Sender<Value>);
+        impl Write for Wire {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(serde_json::from_slice(bytes).unwrap()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let (tx, rx) = mpsc::channel();
+        let input = Arc::new(ClaudeInput::default());
+        let send = input.sender(SharedWriter::new(Wire(tx)));
+        input.consume(&json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"old"}}}));
+        send("q", "Explain the current uncertainty.").unwrap();
+        rx.recv().unwrap();
+        input.consume(&json!({"type":"user","uuid":"q"}));
+        input.consume(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"Finishing the older step."}]}}));
+        input.consume(&json!({"type":"stream_event","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"child-response"}}}));
+        input.consume(&json!({"type":"assistant","parent_tool_use_id":"child","message":{"content":[{"type":"text","text":"Child result."}]}}));
+        let result = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t"}]}});
+        input.consume(&result);
+        input.consume(&result);
+        let reminder = rx.try_recv().expect("the coordinator still owes a visible reply");
+        assert!(reminder["message"]["content"].as_str().unwrap().contains("Explain the current uncertainty."));
+        input.consume(&json!({"type":"user","uuid":reminder["uuid"]}));
+        input.consume(&json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"answer"}}}));
+        input.consume(&json!({"type":"assistant","message":{"content":[{"type":"text","text":"The duration is uncertain until the check finishes."}]}}));
+        input.result();
+        assert!(input.close_if_idle());
     }
 
     #[test]
