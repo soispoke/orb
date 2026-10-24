@@ -372,3 +372,23 @@ test('streamed reasoning remains visible through history and tool regrouping', a
  await page.evaluate(() => (window as any).transcriptHarness.apply({type:'tool_result',data:{tool_call_id:'check',result:'checked'}}));
  await expect(page.locator('.st-think-body')).toHaveCount(0);
 });
+
+test('history refresh never duplicates buffered thinking and keeps the public answer in the main chat', async({page}) => {
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>{
+  const thought=(content:string,done=false)=>({type:'thinking',data:{content,done}});
+  const call=(id:string)=>({type:'tool_call',data:{tool_call_id:id,name:'Bash'}});
+  const question={type:'user_message',data:{id:'question',content:'Explain more simply, shorter.'}};
+  const history=[question,thought('Checking the first change.',true),call('one'),thought('Checking the second change.',true),call('two')];
+  const held=[thought('Checking the first'),thought('Checking the first change.'),call('one'),thought('Checking the second'),thought('Checking the second change.'),call('two')];
+  (window as any).transcriptHarness.reconcile(history,held);
+ });
+ await page.locator('.st-work-head').click();
+ await expect(page.locator('.st-think-body')).toHaveText(['Checking the first change.','Checking the second change.']);
+ await expect(page.getByRole('note',{name:'Thinking'})).toHaveCount(2);
+ await page.evaluate(()=> (window as any).transcriptHarness.apply({type:'text_delta',data:{content:'The check now falls back safely when names are ambiguous.'}}));
+ await expect(page.locator('.st-text')).toHaveText('The check now falls back safely when names are ambiguous.');
+ expect(await page.locator('.st-text').evaluate(el=>!!el.closest('.st-work'))).toBe(false);
+ await expect(page.locator('.st-think-body')).toHaveCount(2);
+});

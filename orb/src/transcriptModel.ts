@@ -351,7 +351,6 @@ export class TranscriptReducer {
       }
       case "thinking": {
         const text=str(d.content),done=d.done===true;
-        if(last?.kind==="think"&&!last.done){this.put(this.items.length-1,{...last,text,done});return;}
         if(!text)return;
         // A block's final copy can arrive after the tool call that followed it
         // (Claude finalizes at the end of the assistant message). Complete the
@@ -365,6 +364,10 @@ export class TranscriptReducer {
           if(item.done&&item.text===text)return;
           if(done&&!item.done&&(text.startsWith(item.text)||item.text.startsWith(text))){this.put(i,{...item,text,done});if(long)this.shownThinking.add(text.trim());return;}
         }
+        // A delayed final belongs to the matching streamed block, which may
+        // precede a tool and a newer thought. Never replace that newer thought
+        // merely because it happens to be the last row.
+        if(!done&&last?.kind==="think"&&!last.done){this.put(this.items.length-1,{...last,text});return;}
         this.items.push({kind:"think",key:this.key("think"),text,done});
         if(done&&long)this.shownThinking.add(text.trim());
         return;

@@ -180,3 +180,12 @@ Thinking. Public assistant text stays outside work details. Browser regressions
 exercise completion, grouping, manual collapse, turn order and replay in
 Chromium and WebKit. Synthetic harness event cases validate renderer contracts;
 they are not evidence that every live provider answers follow-ups correctly.
+
+Older workers omit thinking-block IDs. On transcript refresh, Orb reconciles
+buffered thinking prefixes against a saved final only when both precede the
+same identified tool call/result. A shared tool without a saved matching
+thought does not justify dropping output. Identical wording at a later tool
+boundary remains a distinct thought; public replies are never deduplicated by
+this rule. A delayed final thinking event completes its matching earlier block
+rather than overwriting a newer live block. Disclosure state follows displayed
+thoughts in both directions when moving into or out of an activity group.

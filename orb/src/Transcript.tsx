@@ -469,6 +469,13 @@ function WorkFold(p: { items: WorkItem[] }) {
   const initial = p.items.some(item => item.kind === "think" && state?.get(`think:${item.key}`) === true);
   if (state && !state.has(key)) state.set(key, initial);
   const [open, setOpen] = disclosure(key, initial);
+  // A public reply can move live tools to the bottom and leave this group as
+  // thoughts only. Carry its displayed/collapsed state back to those thoughts
+  // so that changing the container does not hide what the reader opened.
+  createEffect(() => {
+    const expanded = open();
+    for (const item of p.items) if (item.kind === "think") state?.set(`think:${item.key}`, expanded);
+  });
   const anchored=anchoredDisclosure();
   let toggle!:HTMLButtonElement;
   const current = () => {

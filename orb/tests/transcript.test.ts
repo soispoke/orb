@@ -245,3 +245,22 @@ it.each(['codex','antigravity'])('replays %s replies across steering without los
  expect(live).toEqual(buildTranscript(events));
  expect(live.filter(i=>i.kind==='text'||i.kind==='user').map(i=>i.text)).toEqual(['Audit running.','eta','Audit running.','More precise status.']);
 });
+
+it('does not replay partial thinking already persisted before the same tool boundary', () => {
+  const thought=(content:string,done=false)=>ev('thinking',{content,done});
+  const nextTool=ev('tool_call',{tool_call_id:'next',name:'Bash'});
+  const history=[thought('Checking the first change.',true),tool,result,thought('Checking the second change.',true),nextTool];
+  const held=[thought('Checking the first'),thought('Checking the first change.'),tool,result,thought('Checking the second'),thought('Checking the second change.'),nextTool];
+  expect(heldAfterHistory(history,held)).toEqual([]);
+  const items=buildTranscript([...history,...heldAfterHistory(history,held)]);
+  expect(items.filter(item=>item.kind==='think').map(item=>item.text)).toEqual(['Checking the first change.','Checking the second change.']);
+});
+
+it('keeps new thinking with the same words beyond a different tool boundary', () => {
+  const thought=ev('thinking',{content:'Checking again',done:false});
+  const old=ev('thinking',{content:'Checking again.',done:true});
+  const nextTool=ev('tool_call',{tool_call_id:'different',name:'Bash'});
+  expect(heldAfterHistory([old,tool],[thought,nextTool])).toEqual([thought,nextTool]);
+  expect(heldAfterHistory([old,tool],[thought])).toEqual([thought]);
+  expect(heldAfterHistory([old,tool],[ev('thinking',{content:'Different',done:false}),tool])).toEqual([ev('thinking',{content:'Different',done:false})]);
+});

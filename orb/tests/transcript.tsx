@@ -8,7 +8,7 @@ import type {LocalTranscriptBoundary} from '../src/localTranscript';
 import type {StreamItem} from '../src/transcriptModel';
 import {saveLocalTranscriptBoundary,loadLocalTranscriptBoundaries,localTranscriptBoundaries} from '../src/localTranscriptStorage';
 import type { StreamEvent } from "../src/stream";
-import {storedToStream, type StoredEvent} from '../src/stream';
+import {storedToStream, heldAfterHistory, type StoredEvent} from '../src/stream';
 import "../src/styles.css";
 const events: StreamEvent[] = [];
 for (let i=0;i<300;i++) events.push(
@@ -42,6 +42,7 @@ Object.assign(window,{transcriptHarness:{
   setItems(projectLocalTranscript(canonical,localTranscriptBoundaries('fixture'),current));
  },
  reset:(ev:StreamEvent[])=>setItems(buildTranscript(ev)),
+ reconcile:(history:StreamEvent[],held:StreamEvent[])=>setItems(buildTranscript([...history,...heldAfterHistory(history,held)])),
  apply:(ev:StreamEvent)=>setItems(v=>applyStreamEvent(v,ev)),
  benchmark:async()=>{
  const renderTimes:number[]=[], replayTimes:number[]=[];

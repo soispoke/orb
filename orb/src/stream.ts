@@ -242,6 +242,39 @@ export function streamMission(
 /** Trim only overlap proven by event identity/sequence or a tool boundary.
  * Text contents are deliberately never an identity: two real replies may match. */
 export function heldAfterHistory(history: StreamEvent[], held: StreamEvent[]): StreamEvent[] {
+  // Older workers do not identify thinking blocks. A final saved thought and
+  // buffered partial copies can therefore survive event-ID reconciliation.
+  // Match only inside the same identified tool boundary, and only when the
+  // saved final contains the entire streamed prefix. Equal wording elsewhere
+  // (or a tool without a saved thought) proves nothing about overlap.
+  const toolBoundary = (event: StreamEvent): string | undefined =>
+    (event.type === 'tool_call' || event.type === 'tool_result') && event.data.tool_call_id
+      ? `${event.type}:${event.data.tool_call_id}` : undefined;
+  const thinkingBeforeTool = new Map<string, string[]>();
+  let finishedThoughts: string[] = [];
+  for (const event of history) {
+    const boundary = toolBoundary(event);
+    if (boundary) {
+      thinkingBeforeTool.set(boundary, finishedThoughts);
+      finishedThoughts = [];
+    } else if (event.type === 'user_message' || event.type === 'assistant_message') {
+      finishedThoughts = [];
+    } else if (event.type === 'thinking' && event.data.done === true && typeof event.data.content === 'string') {
+      finishedThoughts.push(event.data.content);
+    }
+  }
+  const coveredThinking = new Set<number>();
+  let followingTool: string | undefined;
+  for (let index = held.length - 1; index >= 0; index--) {
+    const event = held[index];
+    const boundary = toolBoundary(event);
+    if (boundary) followingTool = boundary;
+    else if (event.type === 'user_message' || event.type === 'assistant_message') followingTool = undefined;
+    else if (event.type === 'thinking' && followingTool && typeof event.data.content === 'string' && event.data.content) {
+      const prefix = event.data.content;
+      if (thinkingBeforeTool.get(followingTool)?.some(final => final.startsWith(prefix))) coveredThinking.add(index);
+    }
+  }
   const identity = (event: StreamEvent): string | undefined => {
     // Mutable snapshots reuse a row ID; only the same revision overlaps.
     if (event.sequence != null) return `sequence:${event.sequence}:${event.type}`;
@@ -269,6 +302,7 @@ export function heldAfterHistory(history: StreamEvent[], held: StreamEvent[]): S
     if(event.type === 'assistant_message' && event.data.canonical !== true && key && known.has(key)) finalizedThrough=index;
   });
   return held.filter((event,index) => {
+    if (coveredThinking.has(index)) return false;
     if (event.type === 'user_message') return true;
     const key=identity(event);
     if(key && known.has(key)) return false;

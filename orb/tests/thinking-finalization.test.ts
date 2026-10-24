@@ -51,3 +51,17 @@ describe('thinking blocks', () => {
     expect(items.map(item => item.text)).toEqual([optimizing, clarifying]);
   });
 });
+
+it('finalizes the matching earlier block without overwriting a newer live thought', () => {
+  const items = thinks([
+    ev('thinking', {content: 'First thought', done: false}),
+    ev('tool_call', {tool_call_id: 'first', name: 'Bash'}),
+    ev('thinking', {content: 'Second thought', done: false}),
+    ev('thinking', {content: 'First thought complete.', done: true}),
+    ev('thinking', {content: 'Second thought complete.', done: true}),
+  ]);
+  expect(items.map(item => ({text: item.text, done: item.done}))).toEqual([
+    {text: 'First thought complete.', done: true},
+    {text: 'Second thought complete.', done: true},
+  ]);
+});
