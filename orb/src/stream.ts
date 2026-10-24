@@ -296,6 +296,26 @@ export function heldAfterHistory(history: StreamEvent[], held: StreamEvent[]): S
       if (op.type === 'snapshot' && typeof op.revision === 'number') revisions.set(bubble, Math.max(revisions.get(bubble) ?? 0, op.revision));
     }
   }
+  // A persisted final is also an overlap anchor when it arrived after a tool,
+  // or when no following tool has arrived yet. Consume only preceding prefixes
+  // of that exact final receipt, never equal text from an independent block.
+  let persistedFinal: string | undefined;
+  for (let index = held.length - 1; index >= 0; index--) {
+    const event = held[index];
+    if (event.type === 'user_message' || event.type === 'assistant_message') {
+      persistedFinal = undefined;
+    } else if (event.type === 'thinking') {
+      const content = event.data.content;
+      if (event.data.done === true) {
+        const key = identity(event);
+        persistedFinal = key && known.has(key) && typeof content === 'string' ? content : undefined;
+      } else if (persistedFinal && typeof content === 'string' && content && persistedFinal.startsWith(content)) {
+        coveredThinking.add(index);
+      } else {
+        persistedFinal = undefined;
+      }
+    }
+  }
   let finalizedThrough = -1;
   held.forEach((event,index) => {
     const key=identity(event);

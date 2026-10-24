@@ -392,3 +392,23 @@ test('history refresh never duplicates buffered thinking and keeps the public an
  expect(await page.locator('.st-text').evaluate(el=>!!el.closest('.st-work'))).toBe(false);
  await expect(page.locator('.st-think-body')).toHaveCount(2);
 });
+
+test('a saved thinking receipt absorbs buffered prefixes across a tool without duplicating on reopen',async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>{
+  const text='Reviewing the remaining changes before answering. '.repeat(6);
+  const question={type:'user_message',data:{id:'question',content:'What remains?'}};
+  const call={type:'tool_call',data:{tool_call_id:'check',name:'Bash'}};
+  const final={type:'thinking',eventId:'finished-thought',sequence:14,data:{content:text,done:true}};
+  const history=[question,call,final];
+  const held=[{type:'thinking',data:{content:text.slice(0,140),done:false}},call,final];
+  (window as any).transcriptHarness.reconcile(history,held);
+ });
+ await page.locator('.st-work-head').click();
+ await expect(page.locator('.st-think-body')).toHaveCount(1);
+ await page.evaluate(()=> (window as any).transcriptHarness.apply({type:'text_delta',data:{content:'Two checks remain.'}}));
+ await expect(page.locator('.st-text')).toHaveText('Two checks remain.');
+ expect(await page.locator('.st-text').evaluate(el=>!!el.closest('.st-work'))).toBe(false);
+ await expect(page.locator('.st-think-body')).toHaveCount(1);
+});

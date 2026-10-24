@@ -5,7 +5,7 @@ import { LiveInputUnavailable } from "./liveInputAvailability";
 export type LiveDelivery = "sending" | "accepted" | "queued" | "unavailable" | "unconfirmed";
 export const liveDeliveryLabel = (state: LiveDelivery) => ({
   sending: "Sending to the running session… Work continues.",
-  accepted: "Sent to the running session. The agent reads it after its current step; work continues.",
+  accepted: "Sent to the running session.",
   queued: "Queued for the next turn. Work continues.",
   unavailable: new LiveInputUnavailable().message,
   unconfirmed: "Message saved; live delivery is unconfirmed. It won’t be resent automatically.",
@@ -43,7 +43,7 @@ export function createMidrunDelivery(valid: () => boolean) {
 
 
 /** Pending/uncertain messages remain visible until resolved. An accepted receipt
- * stays until `isSettled` (the agent answered or the turn ended), else briefly. */
+ * expires after six seconds, or sooner when the agent answers or the turn ends. */
 export function createLiveDeliveryNotice(isDelivered: (id: string) => boolean = () => false, isSettled?: (id: string) => boolean){
   const [notice,setNotice]=createSignal<{id:string;state:LiveDelivery}>();
   createEffect(()=>{
@@ -55,8 +55,16 @@ export function createLiveDeliveryNotice(isDelivered: (id: string) => boolean = 
       setNotice({...current,state:"accepted"});
       return;
     }
+  });
+  createEffect(()=>{
+    const current=notice();
+    if(current?.state==="accepted" && isSettled?.(current.id))setNotice(undefined);
+  });
+  // Track only the receipt. Streaming transcript updates must not restart its
+  // lifetime, and an old receipt must never dismiss a newer pending message.
+  createEffect(()=>{
+    const current=notice();
     if(current?.state!=="accepted")return;
-    if(isSettled){if(isSettled(current.id))setNotice(undefined);return;}
     const timer=setTimeout(()=>setNotice(previous=>previous===current?undefined:previous),6000);
     onCleanup(()=>clearTimeout(timer));
   });

@@ -2965,7 +2965,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
   const [liveDelivery, setLiveDelivery] = createLiveDeliveryNotice(id =>
     items().some(item => item.kind === 'user' && item.messageId === id && !item.queued && !item.receipt)
     || acceptedLocalMessages(p.id).some(row => row.id === id),
-    // Keep the receipt until the agent writes back after the message, or the turn ends.
+    // Dismiss the brief delivery receipt early when the agent answers or the turn ends.
     id => {
       if (!busy()) return true;
       const list = items(), at = list.findIndex(item => item.kind === 'user' && item.messageId === id);

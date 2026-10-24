@@ -264,3 +264,17 @@ it('keeps new thinking with the same words beyond a different tool boundary', ()
   expect(heldAfterHistory([old,tool],[thought])).toEqual([thought]);
   expect(heldAfterHistory([old,tool],[ev('thinking',{content:'Different',done:false}),tool])).toEqual([ev('thinking',{content:'Different',done:false})]);
 });
+
+it.each([false,true])('reconciles thinking prefixes using the final receipt even when it follows a tool (%s)',(withTool)=>{
+ const text='A completed internal block. '.repeat(12);
+ const partial=ev('thinking',{content:text.slice(0,120),done:false});
+ const finished={...ev('thinking',{content:text,done:true}),eventId:'thought-final',sequence:21};
+ const history=withTool?[tool,finished]:[finished];
+ const held=withTool?[partial,tool,finished]:[partial,finished];
+ expect(heldAfterHistory(history,held)).toEqual([]);
+ const items=buildTranscript([...history,...heldAfterHistory(history,held)]);
+ expect(items.filter(item=>item.kind==='think')).toHaveLength(1);
+ // Identical wording without the final receipt's identity is not overlap.
+ const independent={...finished,eventId:'other-final',sequence:22};
+ expect(heldAfterHistory(history,[partial,independent])).toEqual([partial,independent]);
+});

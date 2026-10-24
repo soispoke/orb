@@ -76,3 +76,22 @@ it('settles late queued and uncertain notices only from matching delivered recei
   result.setDelivered('b');expect(notice()?.state).toBe('accepted');
  }finally{cleanup();}
 });
+
+it('expires accepted receipts even while the agent is working and transcript state keeps changing',async()=>{
+ const {createSignal}=await import('solid-js');
+ vi.useFakeTimers();
+ const {result,cleanup}=renderHook(()=>{
+  const [revision,setRevision]=createSignal(0);
+  const [settled,setSettled]=createSignal(false);
+  return {notice:createLiveDeliveryNotice(()=>false,()=>{revision();return settled();}),setRevision,setSettled};
+ });
+ try{
+  const [notice,setNotice]=result.notice;
+  setNotice({id:'a',state:'accepted'});
+  for(let i=1;i<=5;i++){vi.advanceTimersByTime(1000);result.setRevision(i);}
+  expect(notice()?.id).toBe('a');
+  vi.advanceTimersByTime(1000);expect(notice()).toBeUndefined();
+  setNotice({id:'b',state:'accepted'});result.setSettled(true);expect(notice()).toBeUndefined();
+  setNotice({id:'c',state:'queued'});vi.advanceTimersByTime(10000);expect(notice()?.state).toBe('queued');
+ }finally{cleanup();vi.useRealTimers();}
+});
