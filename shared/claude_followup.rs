@@ -1,12 +1,12 @@
 //! Shared follow-up policy and consumption tracking for Core and desktop Claude.
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read and address it at the next tool boundary. Answer direct questions in this chat before continuing unrelated edits or waits. In a turn that starts from or receives a user message, your last visible text must directly answer that message, not only report the last action you took; the user cannot see your thinking, so an answer given only there is lost. Automatic reminders and worker notices do not take precedence over an unanswered user question. A question does not cancel the ongoing objective: answer it directly, then continue authorized work. Preserve existing agents and builds. For long jobs, use the native background-task mechanism and completion notifications; do not block the conversation with foreground sleep/poll loops waiting on a background job. Do not restart, duplicate, or stop a job merely to answer a question. When a background notification (an interim agent notice, a monitor tick) changes nothing the user needs to know, end the turn without writing any text: no \"still waiting\" updates. Do not leave monitors running that only report progress.";
+pub const INSTRUCTIONS: &str = "When a user follow-up arrives during work, read and address it at the next tool boundary. Respond visibly to every human message in this chat before continuing unrelated edits or waits. Read the whole message: answer its questions, acknowledge its instructions or corrections, and address each part of a mixed request. Do not substitute a generic progress report for a response to what the user said. In a turn that starts from or receives a user message, your last visible text must directly answer that message, not only report the last action you took; the user cannot see your thinking, so an answer given only there is lost. Automatic reminders and worker notices do not take precedence over an unanswered human message. A question does not cancel the ongoing objective: answer it directly, then continue authorized work. Preserve existing agents and builds. For long jobs, use the native background-task mechanism and completion notifications; do not block the conversation with foreground sleep/poll loops waiting on a background job. Do not restart, duplicate, or stop a job merely to answer a question. When a background notification (an interim agent notice, a monitor tick) changes nothing the user needs to know, end the turn without writing any text: no \"still waiting\" updates. Do not leave monitors running that only report progress.";
 
 /// Every mid-turn message follows the same native conversation path. Remind
 /// the coordinator to respond visibly, without classifying the user's wording.
 pub fn midturn_text(text: &str) -> String {
-    format!("{text}\n\n<system-reminder>The user sent this while you were working and is waiting for an answer. The user cannot see your thinking. Before your next tool call, answer every question in this message in plain visible text, including questions alongside instructions, then continue the task. A plan or progress report alone does not answer those questions.</system-reminder>")
+    format!("{text}\n\n<system-reminder>The user sent this while you were working and is waiting for an answer. The user cannot see your thinking. Before your next tool call, respond to this whole message in plain visible text: answer questions, acknowledge instructions or corrections, and address each part of a mixed request. Do not substitute an unrelated plan or progress report. Then continue authorized work.</system-reminder>")
 }
 
 /// Tool results after a mid-turn message before Claude is reminded once more.
@@ -95,7 +95,7 @@ impl UnansweredMessage {
         if waiting.is_empty() {
             return None;
         }
-        Some(format!("<system-reminder>The user is still waiting for a visible reply to these messages: {}. They cannot see your thinking. Answer every question in these messages in plain visible text before unrelated tool calls, including questions alongside instructions. A plan or progress report alone does not answer those questions. Then continue the task.</system-reminder>",
+        Some(format!("<system-reminder>The user is still waiting for a visible reply to these messages: {}. They cannot see your thinking. Respond to each whole message in plain visible text before unrelated tool calls: answer questions, acknowledge instructions or corrections, and address each part of a mixed request. Do not substitute an unrelated plan or progress report. Then continue authorized work.</system-reminder>",
             waiting.iter().map(|text| format!("\"{text}\"")).collect::<Vec<_>>().join("; ")))
     }
 }
@@ -148,6 +148,28 @@ mod tests {
         assert!(text.starts_with("eta\n\n<system-reminder>"));
         assert!(text.contains("Before your next tool call"));
         assert!(text.contains("cannot see your thinking"));
+    }
+
+    #[test]
+    fn every_message_uses_the_same_visible_response_path() {
+        for message in [
+            "status",
+            "Use two workers",
+            "No, I meant the other file",
+            "Thanks",
+            "Why? Also keep the current build running.",
+            "Explique simplement",
+            "A statement without a question mark",
+        ] {
+            let delivered = midturn_text(message);
+            assert!(delivered.starts_with(&format!("{message}\n\n")));
+            assert!(delivered.contains("respond to this whole message in plain visible text"));
+            let mut waiting = UnansweredMessage::default();
+            waiting.asked("input", message);
+            waiting.acknowledge("input");
+            waiting.tool_result();
+            assert!(waiting.tool_result().unwrap().contains(message));
+        }
     }
 
     #[test]
