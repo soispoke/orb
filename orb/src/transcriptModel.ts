@@ -61,6 +61,23 @@ export class TranscriptReducer {
     return fallback;
   }
   private put(index: number, item: StreamItem) { this.items[index] = item; }
+  private dismissStaleCancellation() {
+    const remove = new Set<number>();
+    this.items.forEach((item, index) => { if (item.kind === "error" && item.cancelling) remove.add(index); });
+    if (!remove.size) return;
+    const positions = new Map<number, number>();
+    const next = this.items.filter((_, index) => {
+      if (remove.has(index)) return false;
+      positions.set(index, positions.size);
+      return true;
+    });
+    for (const map of [this.users, this.tools, this.bubbles]) for (const [key, index] of map) {
+      const position = positions.get(index);
+      if (position === undefined) map.delete(key); else map.set(key, position);
+    }
+    if (this.lastFinal !== undefined) this.lastFinal = positions.get(this.lastFinal);
+    this.items = next;
+  }
   /** A tool call or thought followed this bubble: the producer moved on to its next message. */
   private workSince(index: number) { return this.items.some((item, i) => i > index && (item.kind === "tool" || item.kind === "think")); }
   private placeText(bubble:string,item:Extract<StreamItem,{kind:'text'}>):number {
@@ -183,6 +200,12 @@ export class TranscriptReducer {
     if (ev.sequence != null) {
       if (ev.sequence < (this.seq.get(channel) ?? -1)) return;
       this.seq.set(channel, ev.sequence);
+    }
+    // A cancellation request is provisional. If the producer emits another
+    // tool/text/thinking event afterward, the run continued and the red
+    // "Stopping mission" card must not remain as a false terminal warning.
+    if (["tool_call", "tool_result", "text_delta", "thinking", "assistant_message", "subagent_update"].includes(ev.type)) {
+      this.dismissStaleCancellation();
     }
     const last = this.items.at(-1);
     switch (ev.type) {
@@ -366,8 +389,12 @@ export class TranscriptReducer {
       case "error": {
         const message = str(d.message);
         const cancelling = /^Parallel mission [0-9a-f-]+ cancellation requested$/i.test(message);
+        // This is an acknowledgement of a stop request, not a terminal
+        // failure. Rendering it as an error makes the red card reappear every
+        // time history is reconciled while the request is still being drained.
+        // A later cancelled/failed assistant result remains visible below.
+        if (cancelling) return;
         const previous = this.items.at(-1);
-        if (cancelling && previous?.kind === "error" && (previous.cancelling || previous.cancelled)) return;
         // A late generic transport notice must not hide the concrete final failure.
         if (previous?.kind === "error" && (previous.text === message || previous.terminal && /^unknown error$/i.test(message.trim()))) return;
         if (!cancelling) this.close();
