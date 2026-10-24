@@ -1,6 +1,6 @@
 import { describe,it,expect } from "vitest";
 import { buildTranscript,applyStreamEvent } from "../src/Transcript";
-import { storedToStream,heldAfterHistory,type StreamEvent } from "../src/stream";
+import { storedToStream,heldAfterHistory,createThinkingBoundaryTracker,type StreamEvent } from "../src/stream";
 const ev=(type:string,data:Record<string,unknown>):StreamEvent=>({type,data});
 const snap=(content:string)=>ev("text_delta",{content});
 const tool=ev("tool_call",{tool_call_id:"a",name:"read"});
@@ -277,4 +277,50 @@ it.each([false,true])('reconciles thinking prefixes using the final receipt even
  // Identical wording without the final receipt's identity is not overlap.
  const independent={...finished,eventId:'other-final',sequence:22};
  expect(heldAfterHistory(history,[partial,independent])).toEqual([partial,independent]);
+});
+
+it('keeps legacy thinking provenance when its tool anchor is pruned by an earlier refresh',()=>{
+ const track=createThinkingBoundaryTracker();
+ const text='The completed internal update is separate from the public answer. '.repeat(6);
+ const question=ev('user_message',{id:'q',content:'Explain the result simply.'});
+ const health=ev('tool_result',{tool_call_id:'health',name:'health',result:'ok'});
+ const partial=ev('thinking',{content:text.slice(0,-1),done:false});
+ const final=ev('thinking',{content:text,done:true}); // Real SSE carries no event ID.
+ const held=[question,health,partial].map(track);
+ const pending=heldAfterHistory([question,health],held).filter(e=>e.type==='thinking');
+ expect(pending).toHaveLength(1);
+ expect(pending[0].thinkingBoundary).toBe('tool_result:health');
+ // A later poll loads the final before the next tool arrives on SSE.
+ const remaining=heldAfterHistory([question,health,final],[...pending,track(final)]);
+ expect(remaining).toEqual([]);
+ const items=buildTranscript([question,health,final,...remaining]);
+ expect(items.filter(item=>item.kind==='think')).toHaveLength(1);
+});
+
+it('does not suppress an independent thought with the same words across another tool or response',()=>{
+ const track=createThinkingBoundaryTracker();
+ const text='The same wording can legitimately recur.';
+ const health=ev('tool_result',{tool_call_id:'health',result:'ok'});
+ const final=ev('thinking',{content:text,done:true});
+ const history=[health,final];
+ track(health);
+ track(ev('tool_call',{tool_call_id:'new',name:'Bash'}));
+ const later=track(ev('thinking',{content:text,done:false}));
+ expect(heldAfterHistory(history,[later])).toEqual([later]);
+ track(ev('assistant_message',{content:'Visible answer.'}));
+ const unanchored=track(final);
+ expect(unanchored.thinkingBoundary).toBeUndefined();
+ expect(heldAfterHistory(history,[unanchored])).toEqual([unanchored]);
+ expect(createThinkingBoundaryTracker()(final).thinkingBoundary).toBeUndefined();
+});
+
+it('distinguishes separate thinking blocks sharing the same boundary and prefix',()=>{
+ const track=createThinkingBoundaryTracker();
+ const tool=ev('tool_result',{tool_call_id:'health',result:'ok'});
+ const final=ev('thinking',{content:'Checking the result.',done:true});
+ const prefix=ev('thinking',{content:'Checking the',done:false});
+ track(tool);track(final);
+ const second=track(prefix);
+ expect(second.thinkingBoundaryIndex).toBe(1);
+ expect(heldAfterHistory([tool,final],[second])).toEqual([second]);
 });

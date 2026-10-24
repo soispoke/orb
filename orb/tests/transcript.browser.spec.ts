@@ -412,3 +412,28 @@ test('a saved thinking receipt absorbs buffered prefixes across a tool without d
  expect(await page.locator('.st-text').evaluate(el=>!!el.closest('.st-work'))).toBe(false);
  await expect(page.locator('.st-think-body')).toHaveCount(1);
 });
+
+test('legacy live thinking stays single across successive history polls before the next tool',async({page})=>{
+ await page.goto('/tests/transcript.html');
+ await page.waitForFunction(()=>!!(window as any).transcriptHarness);
+ await page.evaluate(()=>{
+  const h=(window as any).transcriptHarness;
+  const q={type:'user_message',data:{id:'q',content:'Explain the result simply.'}};
+  const tool={type:'tool_result',data:{tool_call_id:'health',name:'health',result:'ok'}};
+  const text='Checking the result before giving the public answer. '.repeat(6);
+  h.legacyStart();h.legacyLive(q);h.legacyLive(tool);
+  h.legacyLive({type:'thinking',data:{content:text.slice(0,-1),done:false}});
+  h.legacyRefresh([q,tool]);
+  const final={type:'thinking',data:{content:text,done:true}};
+  h.legacyLive(final);
+  h.legacyRefresh([q,tool,final]);
+  h.legacyLive({type:'tool_call',data:{tool_call_id:'agent',name:'Agent'}});
+  h.legacyRefresh([q,tool,final,{type:'tool_call',data:{tool_call_id:'agent',name:'Agent'}}]);
+ });
+ await page.locator('.st-work-head').click();
+ await expect(page.locator('.st-think-body')).toHaveCount(1);
+ await page.evaluate(()=> (window as any).transcriptHarness.legacyLive({type:'text_delta',data:{content:'The check is faster; review is still pending.'}}));
+ await expect(page.locator('.st-text')).toHaveText('The check is faster; review is still pending.');
+ expect(await page.locator('.st-text').evaluate(el=>!!el.closest('.st-work'))).toBe(false);
+ await expect(page.locator('.st-think-body')).toHaveCount(1);
+});

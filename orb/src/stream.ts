@@ -30,8 +30,34 @@ export interface StreamEvent {
   eventId?: string;
   sequence?: number;
   storedId?: number;
+  thinkingBoundary?: string;
+  thinkingBoundaryIndex?: number;
   type: string;
   data: Record<string, unknown>;
+}
+
+/** Legacy thinking frames have no durable ID. Preserve their position relative
+ * to an identified tool/message before history reconciliation prunes that anchor. */
+function conversationBoundary(event: StreamEvent): string | undefined {
+  if ((event.type === 'tool_call' || event.type === 'tool_result') && event.data.tool_call_id)
+    return `${event.type}:${event.data.tool_call_id}`;
+  if (event.type === 'user_message' && event.data.queued !== true && (event.data.id ?? event.eventId))
+    return `user_message:${event.data.id ?? event.eventId}`;
+  return undefined;
+}
+
+export function createThinkingBoundaryTracker() {
+  let boundary: string | undefined;
+  let index = 0;
+  return (event: StreamEvent): StreamEvent => {
+    const next = conversationBoundary(event);
+    if (next) { if (next !== boundary) index = 0; boundary = next; }
+    else if (event.type === 'assistant_message' || event.type === 'text_delta' || event.type === 'text_op' || event.type === 'error') boundary = undefined;
+    if (event.type !== 'thinking' || !boundary) return event;
+    const tracked = {...event, thinkingBoundary: boundary, thinkingBoundaryIndex: index};
+    if (event.data.done === true) index++;
+    return tracked;
+  };
 }
 
 async function apiRaw(path: string): Promise<Response> {
@@ -180,6 +206,7 @@ export function streamMission(
         onLagged();
       }
       retry = 0;
+      const trackThinkingBoundary = createThinkingBoundaryTracker();
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
@@ -206,7 +233,7 @@ export function streamMission(
           }
           try {
             const parsed = JSON.parse(data);
-            const event = { timestamp: parsed.timestamp ?? new Date().toISOString(), type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence };
+            const event = trackThinkingBoundary({ timestamp: parsed.timestamp ?? new Date().toISOString(), type: eventType, data: parsed, eventId: parsed.event_id ?? parsed.id, sequence: parsed.sequence });
             if (eventType === 'text_op' && parsed.bubble_id === 'text_delta_latest') {
               snapshots.invalidate();
             } else {
@@ -261,6 +288,18 @@ export function heldAfterHistory(history: StreamEvent[], held: StreamEvent[]): S
       finishedThoughts = [];
     } else if (event.type === 'thinking' && event.data.done === true && typeof event.data.content === 'string') {
       finishedThoughts.push(event.data.content);
+    }
+  }
+  const thinkingAfterBoundary = new Map<string, string[]>();
+  let precedingBoundary: string | undefined;
+  for (const event of history) {
+    const boundary = conversationBoundary(event);
+    if (boundary) precedingBoundary = boundary;
+    else if (event.type === 'assistant_message' || event.type === 'text_delta' || event.type === 'text_op' || event.type === 'error') precedingBoundary = undefined;
+    else if (event.type === 'thinking' && event.data.done === true && precedingBoundary && typeof event.data.content === 'string') {
+      const contents = thinkingAfterBoundary.get(precedingBoundary) ?? [];
+      contents.push(event.data.content);
+      thinkingAfterBoundary.set(precedingBoundary, contents);
     }
   }
   const coveredThinking = new Set<number>();
@@ -323,6 +362,11 @@ export function heldAfterHistory(history: StreamEvent[], held: StreamEvent[]): S
   });
   return held.filter((event,index) => {
     if (coveredThinking.has(index)) return false;
+    if (event.type === 'thinking' && event.thinkingBoundary && typeof event.data.content === 'string' && event.data.content) {
+      const prefix = event.data.content;
+      const final = thinkingAfterBoundary.get(event.thinkingBoundary)?.[event.thinkingBoundaryIndex ?? 0];
+      if (final?.startsWith(prefix)) return false;
+    }
     if (event.type === 'user_message') return true;
     const key=identity(event);
     if(key && known.has(key)) return false;

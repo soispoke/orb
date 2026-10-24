@@ -8,7 +8,7 @@ import type {LocalTranscriptBoundary} from '../src/localTranscript';
 import type {StreamItem} from '../src/transcriptModel';
 import {saveLocalTranscriptBoundary,loadLocalTranscriptBoundaries,localTranscriptBoundaries} from '../src/localTranscriptStorage';
 import type { StreamEvent } from "../src/stream";
-import {storedToStream, heldAfterHistory, type StoredEvent} from '../src/stream';
+import {storedToStream, heldAfterHistory, createThinkingBoundaryTracker, type StoredEvent} from '../src/stream';
 import "../src/styles.css";
 const events: StreamEvent[] = [];
 for (let i=0;i<300;i++) events.push(
@@ -23,6 +23,8 @@ const [items,setItems]=createSignal(buildTranscript(events));
 // transcript deliberately renders every turn for non-scrolling embeddings.
 render(()=><main id="transcript" class="scroll" style={{height:'100vh',overflow:'auto'}}><Transcript items={items()}/></main>,document.getElementById("root")!);
 const projectAcrossRuns=createLocalTranscriptProjection();
+let trackThinking=createThinkingBoundaryTracker();
+let bufferedThinking:StreamEvent[]=[];
 Object.assign(window,{transcriptHarness:{
  storedLocal:(rows:StoredEvent[],boundaries:LocalTranscriptBoundary[],current:Parameters<typeof projectLocalTranscript>[2])=>setItems(projectAcrossRuns(buildTranscript(rows.map(storedToStream).filter((event):event is StreamEvent=>event!==null)),boundaries,current)),
  transition:(canonical:StreamItem[],boundaries:LocalTranscriptBoundary[],current:Parameters<typeof projectLocalTranscript>[2])=>setItems(projectAcrossRuns(canonical,boundaries,current)),
@@ -42,6 +44,9 @@ Object.assign(window,{transcriptHarness:{
   setItems(projectLocalTranscript(canonical,localTranscriptBoundaries('fixture'),current));
  },
  reset:(ev:StreamEvent[])=>setItems(buildTranscript(ev)),
+ legacyStart:()=>{trackThinking=createThinkingBoundaryTracker();bufferedThinking=[];setItems(buildTranscript([]));},
+ legacyLive:(event:StreamEvent)=>{const tracked=trackThinking(event);bufferedThinking.push(tracked);setItems(items=>applyStreamEvent(items,tracked));},
+ legacyRefresh:(history:StreamEvent[])=>{bufferedThinking=heldAfterHistory(history,bufferedThinking);setItems(buildTranscript([...history,...bufferedThinking]));},
  reconcile:(history:StreamEvent[],held:StreamEvent[])=>setItems(buildTranscript([...history,...heldAfterHistory(history,held)])),
  apply:(ev:StreamEvent)=>setItems(v=>applyStreamEvent(v,ev)),
  benchmark:async()=>{
