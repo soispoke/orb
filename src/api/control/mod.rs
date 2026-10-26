@@ -16,6 +16,7 @@ pub(crate) mod deferred_messages;
 pub(crate) mod dispatch_admission;
 #[cfg(test)]
 pub(crate) mod dispatch_admission_tests;
+mod dispatch_capacity;
 pub(crate) mod execution_ownership;
 pub(crate) mod goal_continuation;
 pub mod fork;
@@ -5352,6 +5353,8 @@ pub struct ControlState {
     pub(crate) assignment_owners: Arc<RwLock<HashSet<Uuid>>>,
     /// Max parallel missions allowed
     pub max_parallel: usize,
+    /// Fresh actor slot usage for nonblocking read-side diagnostics.
+    dispatch_capacity: Arc<RwLock<Option<dispatch_capacity::DispatchCapacity>>>,
     /// Mission persistence (SQLite-backed)
     pub mission_store: Arc<dyn MissionStore>,
     /// Cache for semantic mission search results keyed by normalized query hash
@@ -6929,7 +6932,7 @@ pub async fn get_queue(
 
 /// Run slots as the scheduler counts them: a turn in progress holds one of the
 /// `max_parallel_missions` slots, and a mission without a live turn waits for one.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SlotUsage {
     pub busy: usize,
     pub max: usize,
@@ -8165,6 +8168,7 @@ async fn populate_activity(control: &ControlState, missions: &mut [Mission]) {
         }
     };
     let now = chrono::Utc::now();
+    let capacity = control.dispatch_capacity.read().await.clone();
     for mission in missions.iter_mut() {
         if let Some((last_event, last_output)) = activity.get(&mission.id) {
             mission.activity.last_agent_event_at = last_event.clone();
@@ -8191,8 +8195,16 @@ async fn populate_activity(control: &ControlState, missions: &mut [Mission]) {
             .map(|ts| (now - ts.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64);
         mission.activity.idle_seconds = idle_seconds;
         mission.activity.idle_for = idle_seconds.map(humanize_idle);
+        mission.activity.queue_wait =
+            dispatch_capacity::queue_wait(control, mission, capacity.as_ref(), now).await;
         mission.activity.health_verdict = idle_seconds
-            .and_then(|idle| mission_health_verdict(mission.status, idle))
+            .and_then(|idle| {
+                dispatch_capacity::activity_verdict(
+                    mission.status,
+                    idle,
+                    mission.activity.queue_wait.as_ref(),
+                )
+            })
             .map(str::to_string);
     }
 }
@@ -9361,11 +9373,16 @@ pub async fn get_mission_digest(
         }
     }
     let goal = mission_goal_digest(&mission);
+    let capacity = control.dispatch_capacity.read().await.clone();
+    let queue_wait =
+        dispatch_capacity::queue_wait(&control, &mission, capacity.as_ref(), chrono::Utc::now())
+            .await;
     Ok(Json(serde_json::json!({
         "fork_source_mission_id": observation_source,
         "children": child_status,
         "children_omitted": children_omitted,
         "native_agents": native_agents,
+        "queue_wait": queue_wait,
         "id": mission.id,
         "title": mission.title,
         "status": mission.status,
@@ -22131,6 +22148,7 @@ fn spawn_control_session(
         progress: Arc::clone(&progress),
         running_missions: Arc::clone(&running_missions),
         assignment_owners: Arc::new(RwLock::new(HashSet::new())),
+        dispatch_capacity: Arc::new(RwLock::new(None)),
         max_parallel,
         mission_store: Arc::clone(&mission_store),
         mission_search_cache,
@@ -22201,6 +22219,7 @@ fn spawn_control_session(
         user_id,
         Arc::clone(&background_tasks),
         Arc::clone(&state.assignment_owners),
+        Arc::clone(&state.dispatch_capacity),
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -24535,6 +24554,7 @@ async fn control_actor_loop(
     // here from the `ToolResult` event arm; read by the auto-resume watcher.
     background_tasks: super::mission_runner::BackgroundTaskRegistry,
     assignment_owners: Arc<RwLock<HashSet<Uuid>>>,
+    dispatch_capacity: Arc<RwLock<Option<dispatch_capacity::DispatchCapacity>>>,
 ) {
     // A process-local actor cannot reattach a harness JoinHandle after restart.
     // Close any inherited execution lease before accepting new work; durable
@@ -25123,6 +25143,24 @@ async fn control_actor_loop(
                 .map(|(id, _)| *id),
         );
         *assignment_owners.write().await = owners;
+        let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
+        // An idle runner still waits for a slot like any
+        // other mission; a live or parked turn does not.
+        let mut with_runner: HashSet<Uuid> = parallel_runners
+            .iter()
+            .filter(|(_, r)| r.is_running())
+            .map(|(id, _)| *id)
+            .collect();
+        if running.is_some() {
+            with_runner.extend(running_mission_id);
+        }
+        let usage = SlotUsage {
+            busy: parallel_running + usize::from(running.is_some()),
+            max: crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions),
+            with_runner,
+        };
+        *dispatch_capacity.write().await =
+            Some(dispatch_capacity::DispatchCapacity::new(usage.clone()));
         // Persist the pending queue whenever it changes so a restart doesn't
         // lose queued messages. Debounced by snapshot comparison — the DB is
         // written only when the queue actually changed (no per-iteration churn
@@ -28749,27 +28787,7 @@ async fn control_actor_loop(
                                 let _ = respond.send(interrupted_ids);
                             }
                             ControlCommand::SlotUsage { respond } => {
-                                let parallel_running = parallel_runners
-                                    .values()
-                                    .filter(|r| r.is_running())
-                                    .count();
-                                // An idle runner still waits for a slot like any
-                                // other mission; a live or parked turn does not.
-                                let mut with_runner: HashSet<Uuid> = parallel_runners
-                                    .iter()
-                                    .filter(|(_, r)| r.is_running())
-                                    .map(|(id, _)| *id)
-                                    .collect();
-                                if running.is_some() {
-                                    with_runner.extend(running_mission_id);
-                                }
-                                let _ = respond.send(SlotUsage {
-                                    busy: parallel_running + usize::from(running.is_some()),
-                                    max: crate::settings::max_parallel_missions_cached_or(
-                                        config.max_parallel_missions,
-                                    ),
-                                    with_runner,
-                                });
+                                let _ = respond.send(usage.clone());
                             }
                             ControlCommand::GetQueue { respond } => {
                                 // Collect queued messages from main runner with their target mission IDs

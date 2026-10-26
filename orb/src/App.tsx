@@ -1,3 +1,4 @@
+import { queueWaitLabel } from "./queueWait";
 import {createLocalTranscriptProjection} from './localTranscript';
 import {recoverLocalTranscript} from './localTranscriptRecovery';
 import {localTranscriptBoundaries,loadLocalTranscriptBoundaries} from './localTranscriptStorage';
@@ -3406,7 +3407,7 @@ export function NativeMissionView(p: { id: string; launch?:LaunchReceipt; launch
     if (id && (sendError() || answered(id) || (!busy() && !optimisticList().some(item => item.id === id && !item.failed)))) setAwaitingReply(undefined);
   });
   const showPending = () => pending() || awaitingAnswer();
-  const phaseLabel = () => mission()?.backend === "claudecode" ? "Waiting for Claude Code" : "Working";
+  const phaseLabel = () => queueWaitLabel(mission()) ?? (mission()?.backend === "claudecode" ? "Waiting for Claude Code" : "Working");
 
   const [localProjectionRunId, setLocalProjectionRunId] = createSignal<string>();
   createEffect(() => {

@@ -3,7 +3,7 @@ import { test, expect, type Page } from "@playwright/test";
 
 const MISSION = "9f2a91c4-8b7d-4e21-9a0c-5d6e7f801234";
 
-type Options = { status?: string; events?: unknown[]; remoteJob?: Record<string, unknown>; hold?: boolean };
+type Options = { status?: string; events?: unknown[]; remoteJob?: Record<string, unknown>; queueWait?: Record<string, unknown>; hold?: boolean };
 
 async function setup(page: Page, o: Options = {}) {
   let released = !o.hold;
@@ -16,6 +16,7 @@ async function setup(page: Page, o: Options = {}) {
     backend: "codex",
     created_at: "",
     updated_at: "",
+    ...(o.queueWait ? { queue_wait: o.queueWait } : {}),
     ...(o.remoteJob ? { remote_job: { job_id: "j1", node_id: "dgx-spark", ...o.remoteJob } } : {}),
   };
   await page.addInitScript(() => {
@@ -158,4 +159,11 @@ test("a remote track follow-up opens its admitted replacement instead of showing
   await page.reload();
   await expect(page.locator('.user').first()).toContainText('Original request');
   await expect(page.locator('.user').last()).toContainText('Read the public vanity status');
+});
+
+
+test("a pending Core mission explains occupied slots instead of saying Working", async ({page}) => {
+  await setup(page, {status:"pending", events:[evUser], queueWait:{reason:"waiting_for_slot", slots_used:1, slots_max:1, running_mission_ids:["holder"]}});
+  await expect(page.locator('.scroll [role="status"]').filter({hasText:"Waiting for a free slot (1/1 in use)"})).toBeVisible();
+  await expect(page.locator('.scroll [role="status"]').filter({hasText:/Working on/})).toHaveCount(0);
 });

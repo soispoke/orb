@@ -214,6 +214,10 @@ impl Harness {
             .route("/missions", axum::routing::post(create_mission))
             .route("/missions/:id", axum::routing::get(get_mission))
             .route(
+                "/missions/:id/digest",
+                axum::routing::get(get_mission_digest),
+            )
+            .route(
                 "/missions/:id/automations",
                 axum::routing::post(create_automation),
             )
@@ -13604,4 +13608,164 @@ async fn the_queue_says_why_a_followup_has_not_started() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// The Orb "my prompt stays queued" report: with the only parallel slot held,
+/// a mission created with a prompt sat `pending` with an empty queue, verdict
+/// `queued` (then `stuck_queued`) and nothing saying why. Drives the real
+/// actor: the scheduler pass must publish slot usage, reads must explain the
+/// wait, and the mission must still start once the slot frees.
+#[tokio::test]
+async fn pending_mission_behind_a_full_slot_reports_waiting_for_slot_then_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::with_capacity(
+        FixtureDir {
+            path: dir.path().to_path_buf(),
+            _cleanup: Some(dir),
+        },
+        Vec::new(),
+        true,
+        1,
+    )
+    .await;
+    let holder = h
+        .control
+        .mission_store
+        .create_mission(
+            Some("slot holder"),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            None,
+        )
+        .await
+        .unwrap();
+    let holder_dir = install_native_fixture(&h, holder.id, "before").await;
+    assert!(h
+        .request(
+            false,
+            holder.id,
+            json!({"content":"/goal hold the only slot"})
+        )
+        .await
+        .status()
+        .is_success());
+    wait_native_file(&holder_dir.join("started")).await;
+
+    h.state
+        .backend_registry
+        .write()
+        .await
+        .register(Arc::new(crate::backend::codex::CodexBackend::new()));
+    let response = h
+        .state
+        .http_client
+        .post(format!("{}/missions", h.url))
+        .json(&json!({"title":"queued behind the slot", "backend":"codex", "prompt":"Say ACK"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let created: Value = response.json().await.unwrap();
+    let queued = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    let queued_dir = install_native_fixture(&h, queued, "before").await;
+
+    let get = |path: String| {
+        let client = h.state.http_client.clone();
+        async move {
+            client
+                .get(path)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    // The actor publishes capacity as it processes commands.
+    let mission = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let mission = get(format!("{}/missions/{queued}", h.url)).await;
+            if mission["health_verdict"] == "waiting_for_slot" {
+                return mission;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a pending mission behind a full slot must say it is waiting for a slot");
+    assert_eq!(mission["status"], "pending");
+    let expected_wait = json!({
+        "reason": "waiting_for_slot",
+        "slots_used": 1,
+        "slots_max": 1,
+        "running_mission_ids": [holder.id],
+    });
+    assert_eq!(mission["queue_wait"], expected_wait);
+    let digest = get(format!("{}/missions/{queued}/digest", h.url)).await;
+    assert_eq!(digest["queue_wait"], expected_wait);
+    // A pending draft has no dispatch ticket, even with every Core slot held.
+    let draft = h
+        .control
+        .mission_store
+        .create_mission(
+            Some("empty draft"),
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            None,
+        )
+        .await
+        .unwrap();
+    let draft_read = get(format!("{}/missions/{}", h.url, draft.id)).await;
+    assert!(draft_read.get("queue_wait").is_none(), "{draft_read}");
+    // A usage-limit/scheduled wait takes priority over capacity.
+    let mut scheduling = h
+        .control
+        .mission_store
+        .get_mission(queued)
+        .await
+        .unwrap()
+        .unwrap()
+        .scheduling;
+    scheduling.not_before = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+    h.control
+        .mission_store
+        .set_mission_scheduling(queued, &scheduling)
+        .await
+        .unwrap();
+    let held = get(format!("{}/missions/{queued}", h.url)).await;
+    assert!(held.get("queue_wait").is_none(), "{held}");
+    scheduling.not_before = None;
+    h.control
+        .mission_store
+        .set_mission_scheduling(queued, &scheduling)
+        .await
+        .unwrap();
+
+    assert!(
+        !queued_dir.join("requests.jsonl").exists(),
+        "the queued prompt must not run while the slot is held"
+    );
+
+    // Free the slot: the same mission dispatches and the wait disappears.
+    std::fs::write(holder_dir.join("release"), "").unwrap();
+    wait_native_status(&h, holder.id, MissionStatus::Blocked).await;
+    wait_native_file(&queued_dir.join("requests.jsonl")).await;
+    wait_native_status(&h, queued, MissionStatus::AwaitingUser).await;
+    let mission = get(format!("{}/missions/{queued}", h.url)).await;
+    assert!(mission.get("queue_wait").is_none(), "{mission}");
+    assert_ne!(mission["health_verdict"], "waiting_for_slot");
+
+    NATIVE_FIXTURES.lock().unwrap().remove(&holder.id);
+    NATIVE_FIXTURES.lock().unwrap().remove(&queued);
 }

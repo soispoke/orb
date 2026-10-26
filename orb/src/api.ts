@@ -243,6 +243,8 @@ export interface RemoteJob {
 }
 
 export type CodexServiceTier = 'standard' | 'fast' | 'ultrafast';
+export type QueueWait = { reason: "waiting_for_slot"; slots_used: number; slots_max: number; running_mission_ids: string[] };
+
 export interface Mission {
   /** Core will not start the mission before this time (e.g. a usage-limit wait). */
   not_before?: string | null;
@@ -275,6 +277,8 @@ export interface Mission {
   status_message?: string | null;
   execution?: { state?: string; terminal_reason?: string | null; generation?: number };
   remote_job?: RemoteJob | null;
+  /** Fresh Core capacity diagnostic for a pending dispatch. */
+  queue_wait?: QueueWait | null;
   workspace_name?: string | null;
   workspace_id?: string | null;
   agent?: string | null;

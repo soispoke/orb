@@ -201,3 +201,19 @@ describe("usage-limit wait", () => {
     expect(missionPhase({ status: "pending" } as Mission, false)).toMatchObject({ label: "Queued", moving: true });
   });
 });
+
+import { queueWaitLabel } from "../src/queueWait";
+it("explains Core slot waits and clears stale diagnostics after dispatch",()=>{
+ const queue_wait = {reason:"waiting_for_slot" as const,slots_used:1,slots_max:1,running_mission_ids:["holder"]};
+ const m = mission({status:"pending",queue_wait});
+ expect(queueWaitLabel(m)).toBe("Waiting for a free slot (1/1 in use)");
+ expect(missionPhase(m,false).label).toBe(queueWaitLabel(m));
+ m.status="active";
+ expect(queueWaitLabel(m)).toBeNull();
+ expect(missionPhase(m,true).label).toBe("Running");
+ m.status="pending";m.queue_wait=null;
+ expect(missionPhase(m,false).label).toBe("Queued");
+ m.queue_wait=queue_wait;m.not_before=new Date(Date.now()+3600000).toISOString();m.terminal_reason="usage_limit_wait";
+ expect(queueWaitLabel(m)).toBeNull();
+ expect(missionPhase(m,false).label).toBe("Waiting for the usage limit");
+});

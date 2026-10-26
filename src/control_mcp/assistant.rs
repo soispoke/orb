@@ -3636,7 +3636,9 @@ impl AssistantMcp {
         let analysis = analyze_trace_events(events);
         let last_assistant = self.last_assistant_message(&id).await;
         let backend = mission.get("backend").and_then(Value::as_str);
-        let mut recommendation = build_recommendation(&status, backend, &live, &analysis);
+        let queue_wait = mission.get("queue_wait").cloned().unwrap_or(Value::Null);
+        let mut recommendation =
+            build_recommendation_with_queue_wait(&status, backend, &live, &analysis, &queue_wait);
         if let Some(warning) = &live_warning {
             recommendation =
                 format!("{recommendation} (Note: live runner state unavailable — {warning})");
@@ -3653,6 +3655,7 @@ impl AssistantMcp {
             "model_effort": mission.get("model_effort").cloned().unwrap_or(Value::Null),
             "live": live,
             "live_warning": live_warning,
+            "queue_wait": queue_wait,
             "signals": analysis.signals_json(),
             "recent_errors": analysis.recent_errors,
             "suspected_loop": analysis.loop_json(),
@@ -4645,11 +4648,58 @@ fn analyze_trace_events(events: &[Value]) -> TraceAnalysis {
 }
 
 /// Synthesize a single actionable next-step hint for the babysitter.
+/// A pending mission waiting for a parallel slot is not stuck and not
+/// healthy-and-running: say which missions hold the slots and how to get more.
+fn queue_wait_recommendation(status: &str, queue_wait: &Value) -> Option<String> {
+    if status != "pending"
+        || queue_wait.get("reason").and_then(Value::as_str) != Some("waiting_for_slot")
+    {
+        return None;
+    }
+    let used = queue_wait
+        .get("slots_used")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let max = queue_wait
+        .get("slots_max")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let holders: Vec<&str> = queue_wait
+        .get("running_mission_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let held_by = if holders.is_empty() {
+        String::new()
+    } else {
+        format!(" by {}", holders.join(", "))
+    };
+    Some(format!(
+        "Waiting for a free parallel slot ({used}/{max} in use{held_by}). The scheduler will \
+         retry when capacity is available. If this persists, inspect the slot holders. \
+         max_parallel_missions (PUT /api/settings) controls the limit; raise it only if \
+         the host has capacity."
+    ))
+}
+
+#[cfg(test)]
 fn build_recommendation(
     status: &str,
     backend: Option<&str>,
     live: &Value,
     analysis: &TraceAnalysis,
+) -> String {
+    build_recommendation_with_queue_wait(status, backend, live, analysis, &Value::Null)
+}
+
+fn build_recommendation_with_queue_wait(
+    status: &str,
+    backend: Option<&str>,
+    live: &Value,
+    analysis: &TraceAnalysis,
+    queue_wait: &Value,
 ) -> String {
     let live_state = live.get("state").and_then(Value::as_str);
     if status == "pending"
@@ -4727,6 +4777,12 @@ fn build_recommendation(
             "Mission is quiet ({seconds}s since last activity) but a tool may still be running. \
              Watch it; only intervene if it stays stalled."
         );
+    }
+
+    if live_state != Some("running") {
+        if let Some(wait) = queue_wait_recommendation(status, queue_wait) {
+            return wait;
+        }
     }
 
     // Only interrupted/blocked/failed are resumable server-side (see
@@ -6039,6 +6095,56 @@ mod tests {
         assert!(analysis.signals.contains("rate_limited"));
         assert_eq!(analysis.recent_errors.len(), 1);
         assert!(analysis.loop_tool.is_none());
+    }
+
+    #[test]
+    fn recommendation_explains_a_pending_mission_waiting_for_a_slot() {
+        let wait = json!({
+            "reason": "waiting_for_slot",
+            "slots_used": 1,
+            "slots_max": 1,
+            "running_mission_ids": ["6d25e770-cae3-4606-8a99-850ab70710ec"],
+        });
+        let rec = queue_wait_recommendation("pending", &wait).expect("slot wait");
+        assert!(rec.contains("Waiting for a free parallel slot (1/1 in use by 6d25e770"));
+        assert!(rec.contains("max_parallel_missions"));
+        assert!(!rec.contains("healthy"));
+        // Once it starts, or with no capacity data, the normal checks apply.
+        assert!(queue_wait_recommendation("active", &wait).is_none());
+        assert!(queue_wait_recommendation("pending", &Value::Null).is_none());
+    }
+
+    #[test]
+    fn capacity_does_not_hide_assignment_or_provider_failures() {
+        let wait = json!({"reason":"waiting_for_slot","slots_used":1,"slots_max":1});
+        let assignment = analyze_trace_events(&[
+            json!({"event_type":"error", "content":"queued_assignment_unowned: claim lost"}),
+        ]);
+        let rec =
+            build_recommendation_with_queue_wait("pending", None, &Value::Null, &assignment, &wait);
+        assert!(rec.contains("track assignment"), "{rec}");
+        let mut auth = TraceAnalysis::default();
+        auth.signals.insert("auth_error");
+        assert!(
+            build_recommendation_with_queue_wait("pending", None, &Value::Null, &auth, &wait)
+                .contains("Auth/credential")
+        );
+        assert!(build_recommendation_with_queue_wait(
+            "pending",
+            None,
+            &Value::Null,
+            &TraceAnalysis::default(),
+            &wait
+        )
+        .contains("Waiting for a free parallel slot"));
+        assert!(!build_recommendation_with_queue_wait(
+            "pending",
+            None,
+            &json!({"state":"running"}),
+            &TraceAnalysis::default(),
+            &wait
+        )
+        .contains("Waiting for a free parallel slot"));
     }
 
     #[test]

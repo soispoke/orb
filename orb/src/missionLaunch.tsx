@@ -1,3 +1,4 @@
+import { queueWaitLabel } from "./queueWait";
 import type { DraftImage } from "./imageAttachments";
 import { remoteContinuation } from "./remoteContinuation";
 import { ErrorNotice } from "./ErrorNotice";
@@ -268,6 +269,8 @@ export function missionPhase(mission: Mission | null, activity: boolean): {label
       const when = at.toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
       return {label:"Waiting for the usage limit", moving:false, detail:`Resumes automatically on ${when}. To continue now, switch to another account or model.`};
     }
+    const slotWait = queueWaitLabel(mission);
+    if (slotWait) return {label:slotWait,moving:true,detail:"Every parallel slot on Core is busy. The scheduler retries when capacity is available."};
     return {label:"Queued",moving:true,detail:"Request accepted. Waiting for the runner to start."};
   }
   if (["active","running","starting"].includes(status)) return {label:activity?"Running":"Starting",moving:true,detail:activity?"":"Request accepted. Waiting for the first output."};
